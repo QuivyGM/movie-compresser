@@ -1,0 +1,10 @@
+{
+  "streams": [
+    {"index": 0, "codec_name": "hevc", "profile": "Main", "codec_type": "video", "width": 1920, "height": 800,
+     "disposition": {"default": 1}},
+    {"index": 1, "codec_name": "truehd", "codec_type": "audio", "sample_rate": "48000", "channels": 8, "channel_layout": "7.1",
+     "disposition": {"default": 1}, "tags": {"language": "eng"}},
+    {"index": 2, "codec_name": "subrip", "codec_type": "subtitle", "disposition": {"default": 0}}
+  ],
+  "format": {"filename": "nometa.mkv", "format_name": "matroska,webm", "size": "1234567890", "bit_rate": "N/A"}
+}

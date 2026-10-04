@@ -1,0 +1,14 @@
+{
+  "streams": [
+    {"index": 0, "codec_name": "h264", "profile": "High", "codec_type": "video", "width": 1920, "height": 1080,
+     "pix_fmt": "yuv420p", "bit_rate": "9010000", "duration": "6512.480000",
+     "disposition": {"default": 1, "attached_pic": 0}, "tags": {"language": "und", "handler_name": "VideoHandler"}},
+    {"index": 1, "codec_name": "ac3", "codec_type": "audio", "sample_rate": "48000", "channels": 6, "channel_layout": "5.1(side)",
+     "bit_rate": "448000", "duration": "6512.480000", "disposition": {"default": 1, "attached_pic": 0},
+     "tags": {"language": "eng", "handler_name": "SoundHandler"}},
+    {"index": 2, "codec_name": "mjpeg", "codec_type": "video", "width": 600, "height": 900,
+     "disposition": {"default": 0, "attached_pic": 1}, "tags": {}}
+  ],
+  "format": {"filename": "movie.mp4", "format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": "6512.480000",
+             "size": "7713467392", "bit_rate": "9475000"}
+}

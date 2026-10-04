@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Movie Files</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>Movie Compressor</h1>
+    <nav><span class="tab active">Files</span></nav>
+    <button id="check-stale" title="Find leftover .part files from interrupted transfers">Check for stale files</button>
+    <button id="add-pane" title="Add another pane">+ Pane</button>
+  </header>
+  <div id="banner" hidden></div>
+
+  <main>
+    <section id="panes"></section>
+
+    <section id="selection" class="panel">
+      <h2>Selection</h2>
+      <div id="selection-body" class="muted">Click a file or folder to see details.</div>
+    </section>
+
+    <section id="transfers" class="panel">
+      <h2>Transfers</h2>
+      <table class="grid">
+        <thead><tr>
+          <th>Name</th><th>Route</th><th class="w-progress">Progress</th><th>Done / total</th>
+          <th>Speed</th><th>ETA</th><th>State</th><th></th>
+        </tr></thead>
+        <tbody id="transfer-rows"><tr><td colspan="8" class="muted">No transfers yet.</td></tr></tbody>
+      </table>
+    </section>
+  </main>
+
+  <dialog id="conflict-dialog">
+    <form method="dialog">
+      <p id="conflict-text"></p>
+      <menu>
+        <button value="overwrite">Overwrite</button>
+        <button value="skip">Skip</button>
+        <button value="rename" id="conflict-rename">Rename</button>
+        <button value="cancel">Cancel</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <dialog id="stale-dialog">
+    <h3>Leftover .part files</h3>
+    <p class="muted">These are partial files from interrupted transfers. Nothing is deleted unless you choose to.</p>
+    <div id="stale-body"></div>
+    <menu>
+      <button id="stale-delete-selected">Delete selected</button>
+      <button id="stale-delete-all">Delete all</button>
+      <button id="stale-ignore">Ignore</button>
+    </menu>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

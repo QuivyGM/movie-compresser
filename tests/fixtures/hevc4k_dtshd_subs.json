@@ -1,0 +1,25 @@
+{
+  "streams": [
+    {"index": 0, "codec_name": "hevc", "codec_long_name": "H.265 / HEVC (High Efficiency Video Coding)", "profile": "Main 10",
+     "codec_type": "video", "width": 3840, "height": 2160, "pix_fmt": "yuv420p10le", "color_transfer": "smpte2084",
+     "r_frame_rate": "24000/1001", "disposition": {"default": 1, "forced": 0, "attached_pic": 0},
+     "tags": {"BPS": "58123456", "DURATION": "02:24:33.302000000", "NUMBER_OF_BYTES": "63019381245", "_STATISTICS_WRITING_APP": "mkvmerge v80.0"}},
+    {"index": 1, "codec_name": "dts", "codec_long_name": "DCA (DTS Coherent Acoustics)", "profile": "DTS-HD MA",
+     "codec_type": "audio", "sample_rate": "48000", "channels": 8, "channel_layout": "7.1", "bits_per_raw_sample": "24",
+     "disposition": {"default": 1, "forced": 0, "comment": 0, "attached_pic": 0},
+     "tags": {"language": "eng", "title": "DTS-HD MA 7.1", "BPS": "4523000", "DURATION": "02:24:33.302000000"}},
+    {"index": 2, "codec_name": "ac3", "profile": null, "codec_type": "audio", "sample_rate": "48000", "channels": 6,
+     "channel_layout": "5.1(side)", "bit_rate": "640000",
+     "disposition": {"default": 0, "forced": 0, "comment": 0, "attached_pic": 0},
+     "tags": {"language": "kor", "title": "AC-3 5.1"}},
+    {"index": 3, "codec_name": "hdmv_pgs_subtitle", "codec_type": "subtitle", "disposition": {"default": 1, "forced": 0},
+     "tags": {"language": "eng"}},
+    {"index": 4, "codec_name": "hdmv_pgs_subtitle", "codec_type": "subtitle", "disposition": {"default": 0, "forced": 1},
+     "tags": {"language": "eng", "title": "Forced"}},
+    {"index": 5, "codec_name": "subrip", "codec_type": "subtitle", "disposition": {"default": 0, "forced": 0},
+     "tags": {"language": "kor"}},
+    {"index": 6, "codec_name": "ttf", "codec_type": "attachment", "tags": {"filename": "font.ttf", "mimetype": "font/ttf"}}
+  ],
+  "format": {"filename": "movie.mkv", "nb_streams": 7, "format_name": "matroska,webm", "duration": "8673.302000",
+             "size": "65432109876", "bit_rate": "60353000", "tags": {"title": "Movie"}}
+}

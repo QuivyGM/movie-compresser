@@ -1,0 +1,26 @@
+# Copy to config.toml and edit. Paths may use forward slashes on Windows.
+
+[app]
+port = 5000              # always bound to 127.0.0.1
+max_transfers = 2        # concurrent transfers (total, all servers)
+probe_concurrency = 4    # concurrent fast probes / folder-size jobs per location
+
+[local]
+ffprobe = "C:/ffmpeg/bin/ffprobe.exe"
+roots = ["D:/Movies", "E:/Incoming"]
+temp_dir = "D:/Temp/compress-relay"   # used for server -> server relay copies
+
+[[servers]]
+name = "milab"
+host = "milab.example.org"   # hostname, IP, or a Host alias from ~/.ssh/config
+# port = 22                  # omit to use ~/.ssh/config (or 22)
+# user = "me"                # omit to use ~/.ssh/config (or your Windows user name)
+key_file = "C:/Users/me/.ssh/id_ed25519"   # omit to use ssh-agent / default keys
+ffprobe = "ffprobe"          # absolute path recommended (non-interactive SSH PATH is minimal), "~/bin/ffprobe" ok
+roots = ["~/compress/in", "~/compress/out"]
+
+[[servers]]
+name = "milabserver"
+host = "milabserver.example.org"
+ffprobe = "~/bin/ffprobe"
+roots = ["~/compress/in", "~/compress/out"]
