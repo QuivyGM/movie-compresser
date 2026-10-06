@@ -85,9 +85,10 @@ while true; do
 
     SOURCE_TOTAL_BYTES=$(file_bytes "$IN")
 
-    # One packet scan for both video and audio sizes.
-    read -r SOURCE_VIDEO_BYTES SOURCE_AUDIO_BYTES \
-        <<< "$(media_stream_totals "$IN")"
+    # Stored MKV statistics when they pass the checks, otherwise one
+    # packet scan (media_stats.sh: stats_load).
+    STATS_PROGRESS=1 stats_load "$IN" "$DURATION" exact
+    read -r SOURCE_VIDEO_BYTES SOURCE_AUDIO_BYTES _ _ <<< "$(stats_totals "$VIDX")"
 
     SOURCE_VIDEO_MBPS=$(bytes_to_mbps "$SOURCE_VIDEO_BYTES" "$DURATION")
     SOURCE_VIDEO_GIB=$(bytes_to_gib "$SOURCE_VIDEO_BYTES")
@@ -123,6 +124,9 @@ while true; do
     echo "Video:        ${SOURCE_VIDEO_MBPS} Mb/s / ${SOURCE_VIDEO_GIB} GiB"
     echo "Audio:        ${SOURCE_AUDIO_GIB} GiB / ${AUDIO_TRACKS} track(s)"
     echo "File size:    ${SOURCE_TOTAL_GIB} GiB"
+    echo "Values from:  ${STATS_SOURCE}"
+    [[ -n "$STATS_REJECTED" ]] &&
+        echo "              (stored statistics rejected: ${STATS_REJECTED})"
 
     probe_hdr "$IN" "$VIDX"
 

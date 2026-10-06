@@ -15,6 +15,9 @@
 #     / multi-language names / segment reference restored and verified
 #  7. needs dovi_tool + mkvtoolnix: synthetic Dolby Vision profile 8.1,
 #     DV preserved and downscaled, L5 offsets rescaled
+#  8. stream statistics: stored MKV tags used when valid, rejected when
+#     missing / incomplete / inconsistent / stale, packet scan fallback;
+#     verify.sh Validate + update (needs mkvtoolnix)
 #
 # Runs in a temporary copy of work/ so real logs/jobs are untouched.
 # Everything here is synthetic: it proves the mechanics, not behaviour
@@ -831,6 +834,169 @@ vrate() {
 check "verify: size of the target, not link"   "[[ -n \"\$(vrate Link.mkv)\" && \"\$(vrate Link.mkv)\" == \"\$(vrate Real.mkv)\" && \"\$(vrate Link.mkv)\" != 0.00 ]]"
 check "verify: symlink never updated"          "grep -q 'Symlink: statistics tags not updated' '$T/verify.log'"
 eq    "verify: link target unchanged"          "$(md5sum < "$VH/store/Target.mkv")" "$sum_before"
+
+echo
+echo "== stream statistics: stored MKV tags first, packet scan as fallback"
+ST="$T/stats"
+mkdir -p "$ST"
+
+# count packet scans: stats_load calls stream_packet_bytes for every scan
+eval "$(declare -f stream_packet_bytes | sed '1s/stream_packet_bytes/_real_stream_packet_bytes/')"
+stream_packet_bytes() { echo scan >> "$ST/scans"; _real_stream_packet_bytes "$@"; }
+scans_during() {   # CMD...  ->  number of packet scans the command did
+    : > "$ST/scans"
+    "$@" >/dev/null
+    wc -l < "$ST/scans" | tr -d ' '
+}
+# exact per-stream bytes, for comparison
+pk() { _real_stream_packet_bytes "$1" | awk -v s="$2" '$1 == s { print $2 }'; }
+
+# with_stats IN OUT  ->  OUT = IN with statistics tags matching its streams
+# (mkvpropedit when available, otherwise the same values written by ffmpeg)
+with_stats() {
+    cp "$1" "$2"
+    if (( HAVE_MKV == 1 )); then
+        mkvpropedit -q "$2" --add-track-statistics-tags >/dev/null
+        return
+    fi
+    local d args=() line i b
+    d=$(get_duration "$1")
+    while read -r i b; do
+        args+=(-metadata:s:$i "NUMBER_OF_BYTES=$b"
+               -metadata:s:$i "BPS=$(awk -v b="$b" -v d="$d" 'BEGIN { printf "%.0f", b * 8 / d }')")
+    done < <(_real_stream_packet_bytes "$1")
+    ffmpeg -v error -y -i "$1" -map 0 -c copy "${args[@]}" "$2"
+}
+# remux IN OUT FFMPEG_ARGS...  ->  stream copy with metadata edits
+remux() { local i="$1" o="$2"; shift 2; ffmpeg -v error -y -i "$i" -map 0 -c copy "$@" "$o"; }
+
+# 2 video (main + a second, smaller one) + 2 AC-3 audio (640k / 192k) + subtitles
+printf '1\n00:00:01,000 --> 00:00:03,000\nHello\n' > "$ST/sub.srt"
+ffmpeg -v error -y -f lavfi -i testsrc2=size=640x360:rate=24 -f lavfi -i testsrc=size=320x180:rate=24 \
+    -f lavfi -i sine=f=440:sample_rate=48000 -i "$ST/sub.srt" -t 12 \
+    -map 0:v -map 1:v -map 2:a -map 2:a -map 3:s \
+    -c:v:0 libx264 -b:v:0 2M -c:v:1 libx264 -b:v:1 300k \
+    -c:a ac3 -ac:a:0 6 -b:a:0 640k -ac:a:1 2 -b:a:1 192k -c:s srt "$ST/raw.mkv"
+with_stats "$ST/raw.mkv" "$ST/valid.mkv"
+
+# 1 valid statistics: used directly, no scan
+eq    "stats 1: valid tags, no packet scan"     "$(scans_during stats_load "$ST/valid.mkv" "" exact)" 0
+stats_load "$ST/valid.mkv" "" exact
+eq    "stats 1: source = stored tags"            "$STATS_KIND/$STATS_REJECTED" "tags/"
+eq    "stats 1: video bytes = packets"           "$(stats_field 0 bytes)" "$(pk "$ST/valid.mkv" 0)"
+eq    "stats 1: totals = packets"                "$(stats_totals 0)" \
+    "$(pk "$ST/valid.mkv" 0) $(( $(pk "$ST/valid.mkv" 2) + $(pk "$ST/valid.mkv" 3) )) 2 1"
+
+# 2 missing statistics: packet scan
+eq    "stats 2: no tags -> packet scan"          "$(scans_during stats_load "$ST/raw.mkv" "" exact)" 1
+stats_load "$ST/raw.mkv" "" exact
+eq    "stats 2: source = packet scan, no reject" "$STATS_KIND/$STATS_REJECTED" "packets/"
+eq    "stats 2: scanned bytes exact"             "$(stats_field 2 bytes)" "$(pk "$ST/raw.mkv" 2)"
+
+# 3 incomplete statistics (one stream lost NUMBER_OF_BYTES)
+remux "$ST/valid.mkv" "$ST/incomplete.mkv" -metadata:s:3 NUMBER_OF_BYTES= -metadata:s:3 NUMBER_OF_BYTES-eng=
+eq    "stats 3: incomplete -> packet scan"       "$(scans_during stats_load "$ST/incomplete.mkv" "" exact)" 1
+stats_load "$ST/incomplete.mkv" "" exact
+check "stats 3: reason names the stream"         "[[ '$STATS_REJECTED' == 'statistics incomplete for stream 3 (audio)' ]]"
+
+# 4 BPS inconsistent with NUMBER_OF_BYTES / duration
+remux "$ST/valid.mkv" "$ST/badbps.mkv" -metadata:s:0 "BPS=$(( $(stats_field 0 kbps) * 2000 + 5 ))"
+eq    "stats 4: bad BPS -> packet scan"          "$(scans_during stats_load "$ST/badbps.mkv" "" exact)" 1
+stats_load "$ST/badbps.mkv" "" exact
+check "stats 4: rejected: BPS mismatch"          "[[ '$STATS_REJECTED' == 'BPS does not match NUMBER_OF_BYTES/duration for stream 0 (video)' ]]"
+eq    "stats 4: fallback value exact"            "$(stats_field 0 bytes)" "$(pk "$ST/badbps.mkv" 0)"
+
+# 5 statistics copied from the source onto a re-encoded stream
+ffmpeg -v error -y -i "$ST/valid.mkv" -map 0 -c copy -c:v:0 libx264 -b:v:0 400k "$ST/reenc.mkv"
+check "stats 5: re-encode kept the old tags"     "[[ \$(ffprobe -v error -select_streams 0 -show_entries stream_tags=NUMBER_OF_BYTES -of default=nw=1:nk=1 '$ST/reenc.mkv') == \$(pk '$ST/valid.mkv' 0) ]]"
+eq    "stats 5: stale tags -> packet scan"       "$(scans_during stats_load "$ST/reenc.mkv" "" exact)" 1
+stats_load "$ST/reenc.mkv" "" exact
+check "stats 5: rejected as stale"               "[[ '$STATS_REJECTED' == *stale* ]]"
+eq    "stats 5: real (re-encoded) size used"     "$(stats_field 0 bytes)" "$(pk "$ST/reenc.mkv" 0)"
+# stale stats with an older date than the file
+remux "$ST/valid.mkv" "$ST/olddate.mkv" -metadata creation_time=2030-01-01T00:00:00Z \
+    -metadata:s:0 _STATISTICS_WRITING_DATE_UTC="2020-01-01 00:00:00"
+stats_load "$ST/olddate.mkv" "" exact
+check "stats 5: statistics older than the file"  "[[ '$STATS_REJECTED' == 'statistics are older than the file for stream 0 (video) (copied from the source?)' ]]"
+
+# 7 several video / audio streams: each value belongs to its stream
+stats_load "$ST/valid.mkv" "" exact
+for s in 0 1 2 3 4; do
+    eq "stats 7: stream $s bytes = its packets"  "$(stats_field "$s" bytes)" "$(pk "$ST/valid.mkv" "$s")"
+done
+check "stats 7: audio kb/s per stream"         "awk -v s=\"\$(stats_audio_kbps)\" 'BEGIN { split(s, k, \" \"); exit !(k[1] >= 634 && k[1] <= 646 && k[2] >= 190 && k[2] <= 194) }'"
+b2=$(stats_field 2 bytes); b3=$(stats_field 3 bytes)
+remux "$ST/valid.mkv" "$ST/swapped.mkv" \
+    -metadata:s:2 "NUMBER_OF_BYTES=$b3" -metadata:s:2 "BPS=192000" \
+    -metadata:s:3 "NUMBER_OF_BYTES=$b2" -metadata:s:3 "BPS=640000"
+stats_load "$ST/swapped.mkv" "" exact
+check "stats 7: swapped audio stats rejected"    "[[ '$STATS_REJECTED' == 'BPS does not match the ac3 bit rate for stream 2 (audio) (statistics of another stream?)' ]]"
+
+# 8 symlink input: read through the link
+ln -s "$ST/valid.mkv" "$ST/link.mkv"
+eq    "stats 8: symlink, no packet scan"         "$(scans_during stats_load "$ST/link.mkv" "" exact)" 0
+stats_load "$ST/link.mkv" "" exact
+eq    "stats 8: symlink values = target"         "$STATS_KIND $(stats_totals 0)" \
+    "tags $(stats_load "$ST/valid.mkv" "" exact; stats_totals 0)"
+
+# 9 MP4: exact mode scans (as before); estimate mode uses ffprobe bit rates
+ffmpeg -v error -y -i "$ST/raw.mkv" -map 0:v:0 -map 0:a -c copy "$ST/clip.mp4"
+eq    "stats 9: mp4 exact -> packet scan"        "$(scans_during stats_load "$ST/clip.mp4" "" exact)" 1
+eq    "stats 9: mp4 estimate -> no scan"         "$(scans_during stats_load "$ST/clip.mp4" "" estimate)" 0
+stats_load "$ST/clip.mp4" "" estimate
+eq    "stats 9: mp4 estimate source"             "$STATS_KIND" meta
+check "stats 9: mp4 video estimate within 1%"    "awk -v a=\$(stats_field 0 bytes) -v b=\$(pk '$ST/clip.mp4' 0) 'BEGIN { exit !(a > b * 0.99 && a < b * 1.01) }'"
+
+# 10 good mkvmerge statistics: same values as the exact scan / old stream_kbps
+if (( HAVE_MKV == 1 )); then
+    mkvmerge -q -o "$ST/mkvmerge.mkv" "$ST/raw.mkv"
+    eq    "stats 10: mkvmerge file, no packet scan"  "$(scans_during stats_load "$ST/mkvmerge.mkv" "" estimate)" 0
+    stats_load "$ST/mkvmerge.mkv" "" exact
+    exact=$(_real_stream_packet_bytes "$ST/mkvmerge.mkv" | tr '\n' ' ')
+    eq    "stats 10: bytes = packet scan"            "$(awk '$4 != "N/A" { printf "%s %s ", $1, $4 }' <<< "$STATS_LINES")" "$exact"
+    # stream_kbps used to report the stream bit_rate (AC-3 header) or BPS / 1000
+    eq    "stats 10: kb/s as before"                 "$(stats_field 0 kbps) $(stats_audio_kbps)" \
+        "$(ffprobe -v error -select_streams 0 -show_entries stream_tags=BPS -of default=nw=1:nk=1 "$ST/mkvmerge.mkv" | awk '{ printf "%.0f", $1 / 1000 }') 640 192 "
+else
+    SKIPPED+=("stats 10: mkvmerge-written statistics (needs mkvtoolnix)")
+fi
+
+# 6 / 8 verify.sh Validate + update writes the tags; later reads skip the scan
+if (( HAVE_MKV == 1 )); then
+    SH="$T/shome"
+    mkdir -p "$SH/compress/in" "$SH/compress/out" "$SH/store"
+    cp -r "$WORK_DIR" "$SH/compress/work"
+    cp "$ROOT/verify.sh" "$SH/compress/"
+    cp "$ST/raw.mkv" "$SH/compress/in/Plain.mkv"
+    cp "$ST/reenc.mkv" "$SH/compress/in/Stale.mkv"
+    cp "$ST/raw.mkv" "$SH/store/Target.mkv"
+    ln -s "$SH/store/Target.mkv" "$SH/compress/in/Linked.mkv"
+    tsum=$(md5sum < "$SH/store/Target.mkv")
+
+    printf '1\n1\n' | HOME="$SH" bash "$SH/compress/verify.sh" > "$T/sverify1.log" 2>&1
+    check "stats 6: Verify scans files without tags" "grep -q 'Packet scanned: *3' '$T/sverify1.log'"
+    check "stats 6: Verify shows the stale reason"   "grep -q 'Stored statistics rejected: .*stale' '$T/sverify1.log'"
+
+    printf '1\n2\ny\n' | HOME="$SH" bash "$SH/compress/verify.sh" > "$T/sverify2.log" 2>&1
+    check "stats 6: Validate + update wrote tags"    "grep -q 'Tags updated: *2' '$T/sverify2.log'"
+    check "stats 6: metadata-first read matches"     "[[ \$(grep -c 'Metadata-first read *MATCH' '$T/sverify2.log') == 2 ]]"
+    check "stats 6: both VERIFIED"                   "grep -q 'Verified: *2' '$T/sverify2.log'"
+    for f in Plain Stale; do
+        eq "stats 6: $f.mkv now read without a scan" "$(scans_during stats_load "$SH/compress/in/$f.mkv" "" exact)" 0
+    done
+    stats_load "$SH/compress/in/Stale.mkv" "" exact
+    eq    "stats 6: Stale.mkv tags now correct"      "$(stats_field 0 bytes)" "$(pk "$SH/compress/in/Stale.mkv" 0)"
+
+    printf '1\n1\n' | HOME="$SH" bash "$SH/compress/verify.sh" > "$T/sverify3.log" 2>&1
+    check "stats 6: Verify afterwards: 1 scan (link)" "grep -q 'Packet scanned: *1' '$T/sverify3.log'"
+    check "stats 6: values from stored tags"          "grep -q 'Values from *stored MKV statistics tags' '$T/sverify3.log'"
+    check "stats 8: Validate never wrote the link"    "grep -q 'Symlink: statistics tags not updated' '$T/sverify2.log'"
+    eq    "stats 8: link target unchanged"            "$(md5sum < "$SH/store/Target.mkv")" "$tsum"
+else
+    SKIPPED+=("stats 6: verify.sh Validate + update (needs mkvtoolnix)")
+fi
+
+stream_packet_bytes() { _real_stream_packet_bytes "$@"; }
 
 echo
 echo "== HDR10 (audio -> AAC)"

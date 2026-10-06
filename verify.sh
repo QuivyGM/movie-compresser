@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Inspect / validate media files under ~/compress/in or ~/compress/out.
 #
-#   Verify             fast: reads stored MKV statistics tags (BPS,
-#                      NUMBER_OF_BYTES) or container bit rates. An MKV
-#                      without them is packet-scanned automatically.
+#   Verify             fast: stored MKV statistics tags (BPS,
+#                      NUMBER_OF_BYTES, DURATION) when they pass the
+#                      sanity checks in media_stats.sh, or stream bit
+#                      rates for non-MKV. Missing / rejected statistics
+#                      are replaced by a packet scan of that file.
 #   Validate + update  full packet scan of every file, refreshes MKV
-#                      statistics with mkvpropedit and checks the stored
-#                      NUMBER_OF_BYTES tags against the scan.
+#                      statistics with mkvpropedit, checks the stored
+#                      NUMBER_OF_BYTES tags against the scan and that a
+#                      normal metadata-first read now returns the same
+#                      values without scanning.
 #
 # Recursive, so series folders are included. Non-MKV files are only
 # inspected; mkvpropedit is never run on them.
@@ -81,7 +85,7 @@ inspect_file() {
     local validate="$3"
 
     local rel dur bytes res codec vidx
-    local vbytes abytes acount complete est approx="" how
+    local vbytes abytes acount complete approx="" how
     local scan=0 update=0 totals
 
     rel="${file#"$root"/}"
@@ -113,39 +117,37 @@ inspect_file() {
         -show_entries stream=codec_name,pix_fmt -of csv=p=0 "$file" 2>/dev/null |
         head -n 1 | sed 's/,/ \/ /')
 
-    read -r vbytes abytes acount complete est <<< "$(stored_totals "$file" "$vidx" "$dur")"
-
     if (( validate == 1 )); then
+        # Authoritative: always scan, whatever is stored.
         scan=1
         is_mkv "$file" && ! [[ -L "$file" ]] && update=1
-    elif (( complete == 0 )); then
-        # Required metadata missing: validate only this file.
-        scan=1
-
-        if is_mkv "$file"; then
-            if [[ "$root" == "$OUT" && ! -L "$file" ]]; then
-                update=1
-                echo "  Statistics tags missing: validating this file."
-            else
-                echo "  Statistics tags missing: packet scan (source files are not modified;"
-                echo "  use Validate + update to store the tags)."
-            fi
-        fi
-    fi
-
-    if (( scan == 1 )); then
         echo "  Scanning packets..."
         totals=$(media_stream_totals "$file")
         read -r vbytes abytes <<< "$totals"
         acount=$(stream_info "$file" | awk -F'\t' '$2 == "audio"' | wc -l)
         how="packet scan"
-        ((SCANNED++))
-    elif (( est == 1 )); then
-        approx="~"
-        how="stored bit rates (sizes estimated)"
     else
-        how="stored MKV statistics tags"
+        # Metadata first; stats_load scans only when it has to.
+        STATS_PROGRESS=1 STATS_INDENT="  " stats_load "$file" "$dur" estimate
+        read -r vbytes abytes acount complete <<< "$(stats_totals "$vidx")"
+        how="$STATS_SOURCE"
+        [[ "$STATS_KIND" == "meta" ]] && approx="~"
+
+        if (( STATS_SCANNED == 1 )); then
+            scan=1
+            if is_mkv "$file"; then
+                if [[ "$root" == "$OUT" && ! -L "$file" ]]; then
+                    update=1
+                    echo "  Statistics tags missing or rejected: validating this file."
+                else
+                    echo "  Source files are not modified; use Validate + update to"
+                    echo "  store correct statistics tags."
+                fi
+            fi
+        fi
     fi
+
+    (( scan == 1 )) && ((SCANNED++))
 
     local other
     other=$(awk -v t="$bytes" -v v="$vbytes" -v a="$abytes" 'BEGIN {
@@ -162,6 +164,8 @@ inspect_file() {
     row "Other / container" "$approx$(bytes_to_gib "$other") GiB"
     row "Total bitrate" "$(bytes_to_mbps "$bytes" "$dur") Mb/s"
     row "Values from" "$how"
+    [[ -n "${STATS_REJECTED:-}" ]] && (( validate == 0 )) &&
+        row "" "(stored statistics rejected: $STATS_REJECTED)"
 
     if [[ "$root" == "$OUT" ]]; then
         show_source "$file" "$bytes"
@@ -241,6 +245,22 @@ update_and_check() {
     printf '  %-20s %-14s %-14s %s\n' "" "PACKETS" "TAG" ""
     printf '  %-20s %-14s %-14s %s\n' "Video bytes" "$vbytes" "$tv" "$cv"
     printf '  %-20s %-14s %-14s %s\n' "Audio bytes" "$abytes" "$ta" "$ca"
+
+    # A normal (menu) read must now use the tags, without a scan, and
+    # return the scanned values.
+    local mv ma
+    stats_load "$file" "" exact
+    read -r mv ma _ _ <<< "$(stats_totals "$vidx")"
+
+    if [[ "$STATS_KIND" == "tags" && "$mv" == "$vbytes" && "$ma" == "$abytes" ]]; then
+        row "Metadata-first read" "MATCH (stored MKV statistics tags, no packet scan needed)"
+    elif [[ "$STATS_KIND" == "tags" ]]; then
+        row "Metadata-first read" "DIFFERENT (video $mv, audio $ma bytes)"
+        cv="DIFFERENT"
+    else
+        row "Metadata-first read" "still falls back to a packet scan${STATS_REJECTED:+ ($STATS_REJECTED)}"
+        cv="DIFFERENT"
+    fi
 
     if [[ "$cv" == "MATCH" && "$ca" == "MATCH" ]]; then
         echo "  Metadata: VERIFIED"

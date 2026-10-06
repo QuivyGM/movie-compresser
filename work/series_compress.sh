@@ -100,8 +100,8 @@ FILE_COUNT=${#FILES[@]}
 # ANALYZE EPISODES
 #
 # Per episode: duration, main video stream, source bitrates per
-# stream (container bit_rate, MKV BPS tag, or a packet scan when
-# neither exists), dynamic range.
+# stream (media_stats.sh stats_load: valid stored MKV statistics tags,
+# stream bit rates for non-MKV, or a packet scan), dynamic range.
 # ============================================================
 
 echo
@@ -126,13 +126,13 @@ for i in "${!FILES[@]}"; do
     fi
 
     dur=$(get_duration "$file")
-    kbps=$(stream_kbps "$file" "$dur")
+    STATS_PROGRESS=1 STATS_INDENT="      " stats_load "$file" "$dur" estimate
 
     EP_DUR[$i]="$dur"
     EP_VIDX[$i]="$vidx"
-    EP_VKBPS[$i]=$(awk -v v="$vidx" '$1 == v { print $4 }' <<< "$kbps")
-    EP_HOW[$i]=$(awk -v v="$vidx" '$1 == v { print $5 }' <<< "$kbps")
-    EP_AKBPS[$i]=$(awk '$2 == "audio" { printf "%s ", $4 }' <<< "$kbps")
+    EP_VKBPS[$i]=$(stats_field "$vidx" kbps)
+    EP_HOW[$i]="$STATS_SOURCE"
+    EP_AKBPS[$i]=$(stats_audio_kbps)
 
     EP_ACH[$i]=$(awk -F'\t' '$2 == "audio" { printf "%s ", $5 }' <<< "$info")
     EP_ACODEC[$i]=$(awk -F'\t' '$2 == "audio" { printf "%s ", $3 }' <<< "$info")
@@ -258,6 +258,8 @@ echo "Resolution:    ${WIDTH}x${HEIGHT}"
 echo "Video:         ${EP_VCODEC[0]} / ${EP_PIX[0]}"
 echo "Frame rate:    ${EP_FPS[0]}"
 echo "Audio tracks:  ${#AUDIO_CHANNELS[@]}"
+printf "%s\n" "${EP_HOW[@]}" | sort | uniq -c |
+    awk '{ n = $1; $1 = ""; printf "%s%s%s (%d file%s)\n", (NR == 1 ? "Values from:   " : "               "), "", substr($0, 2), n, (n == 1 ? "" : "s") }'
 echo "------------------------------------------------------------"
 
 if ! confirm_dynamic_range "this series"; then

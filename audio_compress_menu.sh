@@ -219,8 +219,13 @@ echo
 echo "Analyzing audio tracks..."
 echo
 
-# One packet scan for all tracks (index -> bytes).
-PACKET_BYTES=$(stream_packet_bytes "$IN")
+# Track sizes: stored MKV statistics when they pass the checks,
+# otherwise one packet scan for all tracks (media_stats.sh: stats_load).
+STATS_PROGRESS=1 stats_load "$IN" "$DURATION" exact
+PACKET_BYTES=$(awk '$4 != "N/A" { print $1, $4 }' <<< "$STATS_LINES")
+echo "Values from: $STATS_SOURCE"
+[[ -n "$STATS_REJECTED" ]] && echo "  (stored statistics rejected: $STATS_REJECTED)"
+echo
 
 for ((i=0; i<AUDIO_COUNT; i++)); do
 
