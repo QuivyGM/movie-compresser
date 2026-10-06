@@ -10,9 +10,17 @@ source "$WORK_DIR/lib/media_probe.sh"
 source "$WORK_DIR/lib/media_stats.sh"
 source "$WORK_DIR/lib/bitrate.sh"
 source "$WORK_DIR/lib/encode_common.sh"
+source "$WORK_DIR/lib/hdr_dovi.sh"
+source "$WORK_DIR/lib/policy.sh"
 
-HIGH_TRIGGER_KBPS=2000
-COMPACT_LIMIT_GIB="0.95"
+# Policy values: ~/compress/compress.conf (AUDIO_* settings)
+if ! load_policy; then
+    exit 1
+fi
+
+echo "Policy: $(policy_conf_path)"
+printf "  High above %s kb/s; Compact for tracks >= %s GiB, result < %s GiB\n" \
+    "$AUDIO_HIGH_TRIGGER_KBPS" "$AUDIO_COMPACT_TRIGGER_GIB" "$AUDIO_COMPACT_LIMIT_GIB"
 
 # ============================================================
 # HELPERS
@@ -25,41 +33,17 @@ size_from_kbps() {
 }
 
 compact_ceiling_kbps() {
-    awk -v d="$1" -v g="$COMPACT_LIMIT_GIB" 'BEGIN {
+    awk -v d="$1" -v g="$AUDIO_COMPACT_LIMIT_GIB" 'BEGIN {
         printf "%.0f", (g * 1073741824 * 8) / d / 1000
     }'
 }
 
 high_target() {
-    local ch="$1"
-
-    if (( ch <= 1 )); then
-        echo 128
-    elif (( ch == 2 )); then
-        echo 320
-    elif (( ch <= 4 )); then
-        echo 640
-    elif (( ch <= 6 )); then
-        echo 1024
-    else
-        echo 1280
-    fi
+    audio_menu_high_kbps "$1"
 }
 
 compact_target() {
-    local ch="$1"
-
-    if (( ch <= 1 )); then
-        echo 96
-    elif (( ch == 2 )); then
-        echo 192
-    elif (( ch <= 4 )); then
-        echo 384
-    elif (( ch <= 6 )); then
-        echo 640
-    else
-        echo 768
-    fi
+    audio_menu_compact_kbps "$1"
 }
 
 codec_display() {
@@ -159,11 +143,8 @@ display_encoder() {
 # MOVIE SELECTION
 # ============================================================
 
-mapfile -t files < <(
-    find "$OUT_DIR" -maxdepth 1 -type f \
-        \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.m4v' \) |
-    sort
-)
+# regular files and valid symlinks (see discover_paths)
+mapfile -t files < <(video_files_in_dir "$OUT_DIR")
 
 if (( ${#files[@]} == 0 )); then
     echo "No movies found in:"
@@ -425,6 +406,7 @@ while true; do
     H_KBPS=$(high_target "${CHANNELS[$idx]}")
     H_CODEC=$(high_encoder "${CODEC[$idx]}" "${CHANNELS[$idx]}")
 
+    # AC-3 format limit (not a policy value)
     if [[ "$H_CODEC" == "ac3" ]] && (( H_KBPS > 640 )); then
         H_KBPS=640
     fi
@@ -458,13 +440,13 @@ while true; do
 
     HIGH_DOES_COMPRESS=0
 
-    if (( ${TRACK_KBPS[$idx]} > HIGH_TRIGGER_KBPS )); then
+    if (( ${TRACK_KBPS[$idx]} > AUDIO_HIGH_TRIGGER_KBPS )); then
         HIGH_DOES_COMPRESS=1
     fi
 
     COMPACT_DOES_COMPRESS=$(
-        awk -v s="${TRACK_GIB[$idx]}" 'BEGIN {
-            print (s >= 1.0) ? 1 : 0
+        awk -v s="${TRACK_GIB[$idx]}" -v t="$AUDIO_COMPACT_TRIGGER_GIB" 'BEGIN {
+            print (s >= t) ? 1 : 0
         }'
     )
 
@@ -494,9 +476,9 @@ while true; do
 
     if (( COMPACT_DOES_COMPRESS == 1 )); then
         echo "   $C_CODEC_NAME | ${C_KBPS} kb/s -> ~${C_SIZE} GiB"
-        echo "   Target: < 1 GiB"
+        echo "   Target: < ${AUDIO_COMPACT_LIMIT_GIB} GiB"
     else
-        echo "   Already below 1 GiB; copy unchanged"
+        echo "   Below ${AUDIO_COMPACT_TRIGGER_GIB} GiB; copy unchanged"
         echo "   ${TRACK_KBPS[$idx]} kb/s -> ${TRACK_GIB[$idx]} GiB"
     fi
 
@@ -569,19 +551,31 @@ while true; do
         echo "  ${TRACK_KBPS[$idx]} kb/s / ${TRACK_GIB[$idx]} GiB"
         echo "  -> $target_name ${TARGET_KBPS[$idx]} kb/s / ~$(size_from_kbps "${TARGET_KBPS[$idx]}" "$DURATION") GiB"
 
+        # ffmpeg reports object audio in the profile ("Dolby TrueHD +
+        # Dolby Atmos", "Dolby Digital Plus + Dolby Atmos", "DTS-HD MA +
+        # DTS:X"); the track title is a fallback for older ffmpeg.
         case "${CODEC[$idx]}" in
-            truehd)
-                if [[ "${DISPLAY_NAME[$idx],,}" == *"atmos"* ]]; then
-                    echo "  WARNING: Atmos metadata will not be preserved."
+            truehd|eac3)
+                if [[ "${PROFILE[$idx]}" == *"Atmos"* ]] ||
+                   [[ "${DISPLAY_NAME[$idx],,}" == *"atmos"* ]]; then
+                    echo "  WARNING: Dolby Atmos object metadata will be LOST (re-encoded as channel-based audio)."
                 fi
                 ;;
             dts)
                 if [[ "${PROFILE[$idx]}" == *"DTS:X"* ]] ||
                    [[ "${DISPLAY_NAME[$idx],,}" == *"dts:x"* ]]; then
-                    echo "  WARNING: DTS:X metadata will not be preserved."
+                    echo "  WARNING: DTS:X object metadata will be LOST (re-encoded as channel-based audio)."
                 fi
                 ;;
         esac
+
+        if [[ -n "${TITLE[$idx]}" ]]; then
+            new_title=$(audio_title_rewrite "${TITLE[$idx]}" \
+                "$(encoder_codec "${TARGET_CODEC[$idx]}")" "${CHANNELS[$idx]}")
+            if [[ "$new_title" != "${TITLE[$idx]}" ]]; then
+                echo "  Title: \"${TITLE[$idx]}\" -> \"$new_title\" (codec/object-audio claims no longer true)"
+            fi
+        fi
     fi
 
     echo
@@ -652,7 +646,8 @@ OUT="$OUT_DIR/${NAME} AudioCompressed.mkv"
 
 counter=2
 
-while [[ -e "$OUT" || -e "$OUT.part" ]]; do
+# a symlink (valid or broken) at a name counts as taken
+while path_taken "$OUT" || path_taken "$OUT.part"; do
     OUT="$OUT_DIR/${NAME} AudioCompressed ${counter}.mkv"
     ((counter++))
 done
@@ -678,12 +673,27 @@ JOB_TIER=$(
 VIDX=$(main_video_index "$IN")
 STREAM_MAP_ARGS=$(printf '%q ' -map 0)
 MAP_CODEC_ARGS=""
+MAP_META_ARGS=""
 MAP_COVERS=()
 
 if [[ -n "$VIDX" ]]; then
     build_stream_map "$IN" "$VIDX"
     STREAM_MAP_ARGS="$MAP_ARGS"
 fi
+
+# Stale statistics of the re-encoded tracks (refreshed after the mux)
+# and their titles (codec / object-audio claims that are no longer true).
+STALE_ARGS=""
+AUDIO_SPEC=""
+ATRANS=""
+for ((i=0; i<AUDIO_COUNT; i++)); do
+    if [[ "${ACTION[$i]:-}" == "encode" ]]; then
+        STALE_ARGS+=$(stale_stats_args "a:$i")
+        AUDIO_SPEC+="-c:a:$i ${TARGET_CODEC[$i]} "
+        ATRANS+="${ATRANS:+,}$i"
+    fi
+done
+TITLE_ARGS=$(audio_title_args "$IN" "$AUDIO_SPEC")
 
 # ============================================================
 # GENERATE JOB
@@ -693,6 +703,7 @@ fi
     emit_job_header "$SESSION" audio 1
 
     printf 'if item_begin 1 %q %q %q 0 "" &&\n' "$IN" "$OUT" "Audio ${JOB_TIER}"
+    printf '   item_expect vidx=%q video=copy atrans=%q &&\n' "$VIDX" "$ATRANS"
     printf '   item_run mux ffmpeg -y -i %q \\\n' "$IN"
     printf '      %s\\\n' "$STREAM_MAP_ARGS"
     printf '      -c copy %s\\\n' "$MAP_CODEC_ARGS"
@@ -714,8 +725,11 @@ fi
             "$i" "$codec" "$i" "$bitrate"
     done
 
+    [[ -n "$MAP_META_ARGS" ]] && printf '      %s\\\n' "$MAP_META_ARGS"
+    [[ -n "$TITLE_ARGS" ]] && printf '      %s\\\n' "$TITLE_ARGS"
+    [[ -n "$STALE_ARGS" ]] && printf '      %s\\\n' "$STALE_ARGS"
     printf '      -map_metadata 0 -map_chapters 0 \\\n'
-    printf '      -max_muxing_queue_size 4096 \\\n'
+    printf '      -max_muxing_queue_size 4096 %s\\\n' "$(matroska_mux_args)"
     emit_part_and_covers "$IN"
     printf 'then\n'
     printf '    if item_succeeded; then\n'

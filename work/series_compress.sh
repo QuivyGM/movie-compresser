@@ -10,21 +10,18 @@ source "$WORK_DIR/lib/media_probe.sh"
 source "$WORK_DIR/lib/media_stats.sh"
 source "$WORK_DIR/lib/bitrate.sh"
 source "$WORK_DIR/lib/encode_common.sh"
+source "$WORK_DIR/lib/hdr_dovi.sh"
+source "$WORK_DIR/lib/policy.sh"
 
 # ============================================================
-# POLICY
+# POLICY  (values: ~/compress/compress.conf, loaded by policy.sh)
 #
-# Base:
-#   ~1.5 GiB/hour total
-#
-# High:
-#   ~4 GiB/hour total
-#
-# Custom:
-#   user-entered GiB/hour, High audio rates
+# Base / High: SERIES_*_TOTAL_GIB_PER_HOUR
+# Custom:      user-entered GiB/hour, High audio rates
 #
 # The same fixed video/audio bitrates are used for every episode,
-# with 1% reserved for container/subtitles/metadata, except:
+# with SERIES_CONTAINER_RESERVE_PCT reserved for container/subtitles/
+# metadata, except:
 #   - an episode whose source video bitrate is lower than the fixed
 #     video bitrate is encoded at its source bitrate (never increased)
 #   - an audio track whose source bitrate is already at or below the
@@ -33,54 +30,26 @@ source "$WORK_DIR/lib/encode_common.sh"
 # All audio tracks and subtitles are retained.
 # ============================================================
 
+if ! load_policy; then
+    exit 1
+fi
+
+echo "Policy: $(policy_conf_path)"
+printf "  Base %s GiB/hour, High %s GiB/hour, %s%% reserve, video >= %s kb/s\n" \
+    "$SERIES_BASE_TOTAL_GIB_PER_HOUR" "$SERIES_HIGH_TOTAL_GIB_PER_HOUR" \
+    "$SERIES_CONTAINER_RESERVE_PCT" "$SERIES_MIN_VIDEO_KBPS"
+
+# audio_rate TIER CHANNELS  ->  AAC kb/s (compress.conf SERIES_*_AAC_KBPS_*)
 audio_rate() {
-    local tier="$1"
-    local channels="$2"
-
-    [[ "$channels" =~ ^[0-9]+$ ]] || channels=2
-
-    if [[ "$tier" == "High" || "$tier" == "Custom" ]]; then
-        if (( channels >= 7 )); then
-            echo 768
-        elif (( channels == 6 )); then
-            echo 640
-        elif (( channels >= 3 )); then
-            echo 384
-        elif (( channels == 2 )); then
-            echo 192
-        else
-            echo 96
-        fi
-    else
-        if (( channels >= 7 )); then
-            echo 320
-        elif (( channels == 6 )); then
-            echo 256
-        elif (( channels >= 3 )); then
-            echo 192
-        elif (( channels == 2 )); then
-            echo 128
-        else
-            echo 64
-        fi
-    fi
+    series_aac_kbps "$@"
 }
 
 # ============================================================
 # FIND SERIES FOLDERS
 # ============================================================
 
-mapfile -t SERIES_DIRS < <(
-    find "$IN_DIR" -mindepth 1 -maxdepth 1 -type d -print |
-    while IFS= read -r dir; do
-        if find "$dir" -maxdepth 1 -type f \
-            \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.m4v' \) \
-            -print -quit | grep -q .; then
-            printf '%s\n' "$dir"
-        fi
-    done |
-    sort
-)
+# folders and valid folder symlinks (see discover_paths)
+mapfile -t SERIES_DIRS < <(series_dirs "$IN_DIR")
 
 if (( ${#SERIES_DIRS[@]} == 0 )); then
     echo
@@ -95,7 +64,7 @@ echo
 
 for i in "${!SERIES_DIRS[@]}"; do
 
-    COUNT=$(video_files_in_dir "${SERIES_DIRS[$i]}" | wc -l)
+    COUNT=$(DISCOVERY_QUIET=1 video_files_in_dir "${SERIES_DIRS[$i]}" | wc -l)
 
     printf "%2d) %s [%d files]\n" \
         "$((i+1))" \
@@ -134,7 +103,7 @@ echo
 echo "Analyzing ${FILE_COUNT} files..."
 
 declare -a EP_DUR EP_VIDX EP_VKBPS EP_AKBPS EP_ACH EP_ACODEC EP_ASR
-declare -a EP_RES EP_VCODEC EP_PIX EP_FPS EP_RANGE EP_SUBS EP_OTHER EP_HOW
+declare -a EP_RES EP_VCODEC EP_PIX EP_FPS EP_RANGE EP_SUBS EP_OTHER EP_HOW EP_H10P
 
 for i in "${!FILES[@]}"; do
     file="${FILES[$i]}"
@@ -172,6 +141,7 @@ for i in "${!FILES[@]}"; do
 
     probe_hdr "$file" "$vidx"
     EP_RANGE[$i]="$HDR_KIND"
+    EP_H10P[$i]="$HDR_HDR10PLUS"
     if (( HDR_DV == 1 )); then
         EP_RANGE[$i]="$HDR_KIND+DV${HDR_DV_PROFILE}"
     fi
@@ -225,6 +195,8 @@ for i in "${!FILES[@]}"; do
         soft+=("subtitles [$(describe_list "${EP_SUBS[$i]}")] vs [$(describe_list "${EP_SUBS[0]}")]")
     [[ "${EP_OTHER[$i]}" == "${EP_OTHER[0]}" ]] ||
         soft+=("${EP_OTHER[$i]} attachment/cover/data stream(s) vs ${EP_OTHER[0]}")
+    [[ "${EP_H10P[$i]}" == "${EP_H10P[0]}" ]] ||
+        soft+=("HDR10+ $( (( EP_H10P[$i] == 1 )) && echo present || echo absent)")
 
     if (( ${#hard[@]} )); then
         printf "MISMATCH  %s\n" "$(basename "${FILES[$i]}")"
@@ -265,6 +237,13 @@ IFS=x read -r WIDTH HEIGHT <<< "${EP_RES[0]}"
 read -ra AUDIO_CHANNELS <<< "${EP_ACH[0]}"
 
 probe_hdr "$REFERENCE" "${EP_VIDX[0]}"
+
+# HDR10+ may differ per episode: decide once if any episode has it.
+for i in "${!FILES[@]}"; do
+    if (( EP_H10P[$i] == 1 )); then
+        HDR_HDR10PLUS=1
+    fi
+done
 
 echo
 echo "------------------------------------------------------------"
@@ -355,7 +334,7 @@ plan_tier() {
     done
 
     P_TOTAL_KBPS=$(gib_per_hour_to_kbps "$gib_per_hour")
-    P_MEDIA_KBPS=$(awk -v x="$P_TOTAL_KBPS" 'BEGIN { printf "%.0f", x * 0.99 }')
+    P_MEDIA_KBPS=$(series_media_kbps "$P_TOTAL_KBPS")
     P_VIDEO_KBPS=$((P_MEDIA_KBPS - P_AUDIO_KBPS))
 
     P_CAPPED=0
@@ -404,8 +383,8 @@ plan_tier() {
         P_EP_AARGS[$i]="${tokens% }"
         P_EP_ADESC[$i]="${desc% }"
 
-        P_EP_GIB[$i]=$(awk -v v="$v" -v a="$a_kbps" -v s="${EP_DUR[$i]}" 'BEGIN {
-            printf "%.2f", (v + a) * 1000 * s / 8 / 0.99 / 1073741824 }')
+        P_EP_GIB[$i]=$(awk -v v="$v" -v a="$a_kbps" -v s="${EP_DUR[$i]}" -v f="$(series_size_factor)" 'BEGIN {
+            printf "%.2f", (v + a) * 1000 * s / 8 / f / 1073741824 }')
 
         video_kb_total=$(awk -v t="$video_kb_total" -v k="$v" -v s="${EP_DUR[$i]}" \
             'BEGIN { printf "%.0f", t + k * s }')
@@ -415,8 +394,8 @@ plan_tier() {
 
     P_VIDEO_GIB=$(awk -v k="$video_kb_total" 'BEGIN { printf "%.2f", k * 1000 / 8 / 1073741824 }')
     P_AUDIO_GIB=$(awk -v k="$audio_kb_total" 'BEGIN { printf "%.2f", k * 1000 / 8 / 1073741824 }')
-    P_TOTAL_GIB=$(awk -v v="$video_kb_total" -v a="$audio_kb_total" \
-        'BEGIN { printf "%.2f", (v + a) * 1000 / 8 / 0.99 / 1073741824 }')
+    P_TOTAL_GIB=$(awk -v v="$video_kb_total" -v a="$audio_kb_total" -v f="$(series_size_factor)" \
+        'BEGIN { printf "%.2f", (v + a) * 1000 / 8 / f / 1073741824 }')
 }
 
 TOTAL_SECONDS=$(printf '%s\n' "${EP_DUR[@]}" | awk '{ s += $1 } END { printf "%.3f", s }')
@@ -456,10 +435,10 @@ show_preview() {
 echo
 echo "Compression tier:"
 
-show_preview "1) Base  [~1.5 GiB/hour]" "Base" "1.5"
+show_preview "1) Base  [~${SERIES_BASE_TOTAL_GIB_PER_HOUR} GiB/hour]" "Base" "$SERIES_BASE_TOTAL_GIB_PER_HOUR"
 echo
 
-show_preview "2) High  [~4 GiB/hour]" "High" "4"
+show_preview "2) High  [~${SERIES_HIGH_TOTAL_GIB_PER_HOUR} GiB/hour]" "High" "$SERIES_HIGH_TOTAL_GIB_PER_HOUR"
 echo
 
 echo "3) Custom GiB/hour"
@@ -471,13 +450,13 @@ while true; do
     case "$t" in
         1)
             TIER="Base"
-            GIB_PER_HOUR="1.5"
+            GIB_PER_HOUR="$SERIES_BASE_TOTAL_GIB_PER_HOUR"
             break
             ;;
 
         2)
             TIER="High"
-            GIB_PER_HOUR="4"
+            GIB_PER_HOUR="$SERIES_HIGH_TOTAL_GIB_PER_HOUR"
             break
             ;;
 
@@ -515,11 +494,10 @@ done
 # ============================================================
 # FIXED BITRATES
 #
-# 1.5 GiB/hour = ~3579 kb/s total
-# 4 GiB/hour   = ~9544 kb/s total
-# Custom       = calculated from requested GiB/hour
+# From the tier GiB/hour in compress.conf, or the Custom value;
+# SERIES_CONTAINER_RESERVE_PCT is kept for container/subtitles/
+# metadata.
 #
-# Reserve 1% for container/subtitles/metadata.
 # ============================================================
 
 plan_tier "$TIER" "$GIB_PER_HOUR"
@@ -527,7 +505,7 @@ plan_tier "$TIER" "$GIB_PER_HOUR"
 VIDEO_KBPS="$P_VIDEO_KBPS"
 AUDIO_TOTAL_KBPS="$P_AUDIO_KBPS"
 
-if (( VIDEO_KBPS < 500 )); then
+if awk -v v="$VIDEO_KBPS" -v m="$SERIES_MIN_VIDEO_KBPS" 'BEGIN { exit !(v < m) }'; then
     echo
     echo "Audio uses too much of the selected size budget."
     echo "Total target: ${P_TOTAL_KBPS} kb/s"
@@ -542,6 +520,15 @@ echo "Tier:                 $TIER"
 echo "Target:               ~${GIB_PER_HOUR} GiB/hour"
 echo "Resolution:           ${WIDTH}x${HEIGHT} -> ${OUT_WIDTH}x${OUT_HEIGHT}"
 echo "Dynamic range:        $(hdr_description)"
+
+HDR_POLICY_LINE=$(hdr_policy_summary)
+if [[ -n "$HDR_POLICY_LINE" ]]; then
+    echo "HDR metadata:         $HDR_POLICY_LINE"
+fi
+
+if [[ "$DV_POLICY" == "preserve" ]] && (( DOWNSCALED == 1 )); then
+    echo "Dolby Vision:         L5 active-area offsets rescaled to ${OUT_WIDTH}x${OUT_HEIGHT}"
+fi
 echo "Fixed video bitrate:  ${VIDEO_KBPS} kb/s"
 echo "Fixed audio total:    ${AUDIO_TOTAL_KBPS} kb/s"
 
@@ -598,6 +585,39 @@ for i in "${!FILES[@]}"; do
     fi
 done
 
+LOSS_SHOWN=0
+
+for i in "${!FILES[@]}"; do
+    while IFS= read -r note; do
+        [[ -n "$note" ]] || continue
+
+        if (( LOSS_SHOWN == 0 )); then
+            echo
+            echo "WARNING: object audio metadata is lost by re-encoding:"
+            LOSS_SHOWN=1
+        fi
+
+        printf "  %s: %s\n" "$(basename "${FILES[$i]}")" "$note"
+    done < <(audio_loss_notes "${FILES[$i]}" "${P_EP_AARGS[$i]}")
+done
+
+# Stream / title / chapter handling, shown for the first episode (the
+# same rules apply to every episode; each output is verified).
+build_stream_map "$REFERENCE" "${EP_VIDX[0]}"
+REF_NOTES=("${MAP_NOTES[@]+"${MAP_NOTES[@]}"}")
+
+while IFS= read -r note; do
+    [[ -n "$note" ]] && REF_NOTES+=("$note")
+done < <(audio_title_notes "$REFERENCE" "${P_EP_AARGS[0]}"; chapter_notes "$REFERENCE")
+
+if (( ${#REF_NOTES[@]} )); then
+    echo
+    echo "Stream handling ($(basename "$REFERENCE"); same rules for every episode):"
+    for note in "${REF_NOTES[@]}"; do
+        printf "  %s\n" "$note"
+    done
+fi
+
 echo
 echo "Total runtime:        $TOTAL_HOURS hours"
 echo "Files:                ${FILE_COUNT}"
@@ -638,7 +658,8 @@ for i in "${!FILES[@]}"; do
     EP_OVERWRITE[$i]=0
     EP_SKIP[$i]=0
 
-    if [[ -e "${EP_OUT[$i]}" || -e "${EP_OUT[$i]}.part" ]]; then
+    # a symlink (valid or broken) at the output name counts as existing
+    if path_taken "${EP_OUT[$i]}" || path_taken "${EP_OUT[$i]}.part"; then
         ((EXISTING += 1))
     fi
 done
@@ -646,6 +667,14 @@ done
 if (( EXISTING > 0 )); then
     echo "$EXISTING of ${FILE_COUNT} outputs already exist in:"
     echo "  $OUT_SERIES"
+
+    for i in "${!FILES[@]}"; do
+        if [[ -L "${EP_OUT[$i]}" ]] && ! path_taken "${EP_OUT[$i]}.part"; then
+            echo
+            output_symlink_notice "${EP_OUT[$i]}"
+        fi
+    done
+    echo
     echo "1) Keep both (new files get a \" (2)\" suffix)"
     echo "2) Overwrite existing files when the new encodes complete"
     echo "3) Skip episodes that already have an output"
@@ -659,14 +688,14 @@ if (( EXISTING > 0 )); then
     done
 
     for i in "${!FILES[@]}"; do
-        if [[ -e "${EP_OUT[$i]}.part" ]]; then
+        if path_taken "${EP_OUT[$i]}.part"; then
             # Possibly being written by another job: never touch it.
             if [[ "$oc" == "3" ]]; then
                 EP_SKIP[$i]=1
             else
                 EP_OUT[$i]=$(unique_output_path "${EP_OUT[$i]}")
             fi
-        elif [[ -e "${EP_OUT[$i]}" ]]; then
+        elif path_taken "${EP_OUT[$i]}"; then
             case "$oc" in
                 1) EP_OUT[$i]=$(unique_output_path "${EP_OUT[$i]}") ;;
                 2) EP_OVERWRITE[$i]=1 ;;

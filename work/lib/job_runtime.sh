@@ -11,6 +11,11 @@
 #
 # State for progress-check.sh is written to work/<session>.state
 # (key=value lines) and ffmpeg progress to work/<session>.progress.
+#
+# Each item has a scratch directory ($ITEM_TMP, under the job log dir)
+# for Dolby Vision / HDR10+ intermediates and the metadata report. It is
+# removed when the item succeeds and kept (RPU, raw HEVC, tool logs) when
+# it fails.
 
 job_init() {
     JOB_SESSION="$1"
@@ -41,6 +46,8 @@ job_init() {
     ITEM_LOG=""
     ITEM_FAIL_REASON=""
     ITEM_CHILD=""
+    ITEM_TMP=""
+    declare -gA ITEM_EXP=()
 
     mkdir -p "$JOB_LOG_DIR"
 
@@ -88,6 +95,8 @@ job_signal() {
     trap '' HUP INT TERM
 
     if [[ -n "${ITEM_CHILD:-}" ]] && kill -0 "$ITEM_CHILD" 2>/dev/null; then
+        # item_step children are subshells running pipelines
+        pkill -TERM -P "$ITEM_CHILD" 2>/dev/null
         kill -TERM "$ITEM_CHILD" 2>/dev/null
         wait "$ITEM_CHILD" 2>/dev/null
     fi
@@ -103,6 +112,11 @@ job_on_exit() {
     # Killed (tmux kill-session, Ctrl-C, ...) before job_finish.
     if [[ -n "$ITEM_PART" && -e "$ITEM_PART" ]]; then
         rm -f -- "$ITEM_PART"
+    fi
+
+    # Large intermediates are not useful after an interruption.
+    if [[ -n "${ITEM_TMP:-}" && -d "$ITEM_TMP" ]]; then
+        rm -f -- "$ITEM_TMP"/*.hevc "$ITEM_TMP"/video_dv.mkv
     fi
 
     JOB_STATUS="interrupted"
@@ -128,6 +142,8 @@ item_begin() {
     ITEM_FAIL_REASON=""
     ITEM_DURATION=""
     ITEM_FINAL=""
+    ITEM_TMP="$JOB_LOG_DIR/item-$ITEM_INDEX.tmp"
+    ITEM_EXP=()
     JOB_STATUS="running"
 
     echo
@@ -148,6 +164,17 @@ item_begin() {
 
     if [[ ! -f "$ITEM_INPUT" ]]; then
         ITEM_FAIL_REASON="input file not found"
+        if [[ -L "$ITEM_INPUT" ]]; then
+            ITEM_FAIL_REASON="input is a broken symlink ($ITEM_INPUT -> $(readlink -- "$ITEM_INPUT"))"
+        fi
+        job_write_state
+        return 1
+    fi
+
+    # ffmpeg/mkvpropedit would write THROUGH a symlink at the .part name
+    if [[ -L "$ITEM_PART" ]]; then
+        ITEM_FAIL_REASON="$(basename "$ITEM_PART") is a symlink; refusing to write through it"
+        ITEM_PART=""
         job_write_state
         return 1
     fi
@@ -160,7 +187,67 @@ item_begin() {
     fi
 
     ITEM_DURATION=$(get_duration "$ITEM_INPUT" 2>/dev/null || true)
+    mkdir -p "$ITEM_TMP"
     job_write_state
+}
+
+# item_expect KEY=VALUE...
+#
+# What the generated job intends for this item, used by the output
+# verification: vidx (source main video index), video (encode|copy),
+# dv (none|preserve|drop), dv_profile, dv_compat, hdr10p
+# (none|preserve|drop), scaled (0|1).
+item_expect() {
+    local kv
+
+    for kv in "$@"; do
+        ITEM_EXP[${kv%%=*}]="${kv#*=}"
+    done
+
+    return 0
+}
+
+# item_step LABEL FUNCTION ARGS...
+#
+# Runs a shell function (Dolby Vision / HDR10+ steps, verification) as
+# a waited background child like item_run, output to the pane and the
+# item log. The function leaves a failure reason in $ITEM_TMP/reason.
+item_step() {
+    local label="$1"
+    local rc
+
+    shift
+
+    ITEM_PASS="$label"
+    job_write_state
+    : > "$JOB_PROGRESS"
+    rm -f -- "$ITEM_TMP/reason"
+
+    echo
+    echo "STEP $label"
+
+    {
+        echo
+        echo "===== $(date '+%F %T')  step $label"
+        printf '%q ' "$@"
+        echo
+    } >> "$ITEM_LOG"
+
+    "$@" 0<&0 > >(tee -a "$ITEM_LOG") 2>&1 &
+    ITEM_CHILD=$!
+    wait "$ITEM_CHILD"
+    rc=$?
+    ITEM_CHILD=""
+
+    if (( rc != 0 )); then
+        if [[ -s "$ITEM_TMP/reason" ]]; then
+            ITEM_FAIL_REASON="$label: $(head -n 1 "$ITEM_TMP/reason")"
+        else
+            ITEM_FAIL_REASON="step $label failed (exit $rc)"
+        fi
+    fi
+
+    return "$rc"
 }
 
 # item_run PASS_LABEL ffmpeg ARGS...
@@ -234,6 +321,91 @@ item_add_cover() {
     return 0
 }
 
+# item_restore_mkv_chapters SOURCE  (item step)
+#
+# FFmpeg keeps only a flat chapter list of one edition (no further
+# editions, ordered/hidden flags, nesting, edition UIDs or chapter
+# languages). For Matroska sources the complete chapter XML is copied
+# from the source into "$ITEM_PART" with mkvpropedit. Chapter times are
+# moved by the same offset FFmpeg applied to the media (none with
+# -copyts). When ordered chapters reference segment UIDs, or the file is
+# part of a linked set, the source segment UIDs are kept as well.
+#
+# Writes $ITEM_TMP/chapters_state: none | restored | unverified:<why>.
+# Fails the item when the restore itself fails.
+item_restore_mkv_chapters() {
+    local src="$1"
+    local xml="$ITEM_TMP/chapters_source.xml"
+    local fixed="$ITEM_TMP/chapters_restore.xml"
+    local offset=0 uid prev next rc
+    local args=()
+
+    if ! is_matroska "$src"; then
+        echo none > "$ITEM_TMP/chapters_state"
+        return 0
+    fi
+
+    if ! command -v mkvextract >/dev/null 2>&1 || ! command -v mkvpropedit >/dev/null 2>&1; then
+        echo "mkvtoolnix missing: chapters left as FFmpeg mapped them (flat list)"
+        echo "unverified:mkvtoolnix missing" > "$ITEM_TMP/chapters_state"
+        return 0
+    fi
+
+    if ! mkv_chapters_xml "$src" "$xml"; then
+        echo none > "$ITEM_TMP/chapters_state"
+        return 0
+    fi
+
+    [[ "${ITEM_EXP[copyts]:-0}" == "1" ]] || offset=$(format_start_time "$src")
+
+    # shift ChapterTimeStart/End by -offset seconds (clamped at 0)
+    awk -v off="$offset" '
+        function ns(t,   a) { split(t, a, ":"); return ((a[1] * 60 + a[2]) * 60 + a[3]) * 1e9 }
+        function fmt(n,   h, m, s) {
+            if (n < 0) n = 0
+            h = int(n / 3.6e12); n -= h * 3.6e12
+            m = int(n / 6e10);   n -= m * 6e10
+            s = int(n / 1e9);    n -= s * 1e9
+            return sprintf("%02d:%02d:%02d.%09d", h, m, s, n)
+        }
+        off + 0 != 0 && match($0, /<ChapterTime(Start|End)>[0-9:.]+</) {
+            pre = substr($0, 1, RSTART - 1); tag = substr($0, RSTART, RLENGTH)
+            post = substr($0, RSTART + RLENGTH - 1)
+            name = tag; sub(/>.*/, ">", name)
+            v = tag; sub(/^[^>]*>/, "", v); sub(/<$/, "", v)
+            print pre name fmt(ns(v) - off * 1e9) post
+            next
+        }
+        { print }' "$xml" > "$fixed"
+
+    if awk -v o="$offset" 'BEGIN { exit !(o + 0 != 0) }'; then
+        echo "Chapter times moved by -${offset}s (source start offset, same as the media)."
+    fi
+
+    args=(--chapters "$fixed")
+
+    read -r uid prev next <<< "$(mkv_segment_uids "$src")"
+    if grep -q '<ChapterSegment' "$fixed" || [[ "$prev" != "-" || "$next" != "-" ]]; then
+        [[ "$uid" != "-" ]] && args+=(--edit info --set "segment-uid=0x$uid")
+        [[ "$prev" != "-" ]] && args+=(--edit info --set "prev-uid=0x$prev")
+        [[ "$next" != "-" ]] && args+=(--edit info --set "next-uid=0x$next")
+        echo "Keeping source segment UIDs (referenced by ordered chapters / linked files)."
+        echo "$uid" > "$ITEM_TMP/segment_uid_kept"
+    fi
+
+    echo "Restoring chapters: $(chapter_xml_describe "$fixed")"
+    mkvpropedit "$ITEM_PART" "${args[@]}" > "$ITEM_TMP/mkvpropedit_chapters.log" 2>&1
+    rc=$?
+
+    if (( rc > 1 )); then
+        cat "$ITEM_TMP/mkvpropedit_chapters.log"
+        printf '%s\n' "chapter restore failed (mkvpropedit exit $rc)" > "$ITEM_TMP/reason"
+        return 1
+    fi
+
+    echo restored > "$ITEM_TMP/chapters_state"
+}
+
 item_succeeded() {
     local out_dur final short
 
@@ -257,15 +429,30 @@ item_succeeded() {
         return 1
     fi
 
+    # Metadata verification before the output gets its final name: a
+    # Dolby Vision / HDR10+ preservation that did not survive, or lost
+    # colour signalling, fails the item.
+    if ! item_step verify item_verify_output; then
+        [[ -s "$ITEM_TMP/report.txt" ]] && cat "$ITEM_TMP/report.txt"
+        item_failed
+        return 1
+    fi
+
     final="$ITEM_OUTPUT"
 
-    if [[ -e "$final" ]] && (( ITEM_OVERWRITE != 1 )); then
+    # A symlink (valid or broken) at the output name is "taken" too.
+    if path_taken "$final" && (( ITEM_OVERWRITE != 1 )); then
         final=$(unique_output_path "$final")
         echo "WARNING: $(basename "$ITEM_OUTPUT") already exists."
         echo "         Saved as $(basename "$final") instead."
+    elif [[ -L "$final" ]]; then
+        echo "Replacing the symlink $(basename "$final") (its target is not modified)."
     fi
 
-    if ! mv -f -- "$ITEM_PART" "$final"; then
+    # Rename only: an existing entry (also a symlink) is replaced, never
+    # written through. -T: a symlink to a directory is replaced too,
+    # instead of moving the file into that directory.
+    if ! mv -fT -- "$ITEM_PART" "$final"; then
         item_failed "could not rename the finished .part file"
         return 1
     fi
@@ -286,6 +473,12 @@ item_succeeded() {
 
     report_output_stats "$final"
 
+    if [[ -s "$ITEM_TMP/report.txt" ]]; then
+        echo
+        cat "$ITEM_TMP/report.txt"
+    fi
+
+    rm -rf -- "$ITEM_TMP"
     rm -f -- "$ITEM_LOG"
     ((JOB_OK += 1))
     job_write_state
@@ -310,6 +503,12 @@ item_failed() {
     fi
 
     echo "FAILED: $reason" >> "$ITEM_LOG"
+
+    # Keep DV / HDR10+ intermediates (RPU, raw HEVC, tool logs) for
+    # diagnosis; drop the directory if nothing was written.
+    if [[ -n "${ITEM_TMP:-}" ]]; then
+        rmdir -- "$ITEM_TMP" 2>/dev/null || true
+    fi
     printf '%s\t%s\n' "$ITEM_NAME" "$reason" >> "$JOB_LOG_DIR/failed.tsv"
 
     ((JOB_FAILED += 1))
@@ -321,6 +520,9 @@ item_failed() {
     echo "FAILED: $ITEM_NAME"
     echo "  Reason: $reason"
     echo "  Log:    $ITEM_LOG"
+    if [[ -n "${ITEM_TMP:-}" && -d "$ITEM_TMP" ]]; then
+        echo "  Files:  $ITEM_TMP"
+    fi
     echo "  No output was kept for this item. Continuing with the queue."
     echo "############################################################"
 }
@@ -331,7 +533,7 @@ report_output_stats() {
     local dur bytes totals vbytes abytes
 
     dur=$(get_duration "$out" 2>/dev/null || true)
-    bytes=$(stat -c %s "$out")
+    bytes=$(file_bytes "$out")
     totals=$(media_stream_totals "$out")
     read -r vbytes abytes <<< "$totals"
 

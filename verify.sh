@@ -91,8 +91,14 @@ inspect_file() {
     echo "$rel"
     echo "============================================================"
 
+    # Symlinks are read through (sizes/metadata of the target) but never
+    # written to: the target may belong to another library.
+    if [[ -L "$file" ]]; then
+        row "Symlink to" "$(readlink -f -- "$file")"
+    fi
+
     dur=$(get_duration "$file" 2>/dev/null || true)
-    bytes=$(stat -c %s "$file")
+    bytes=$(file_bytes "$file")
     vidx=$(main_video_index "$file")
 
     if [[ -z "$vidx" ]]; then
@@ -111,13 +117,13 @@ inspect_file() {
 
     if (( validate == 1 )); then
         scan=1
-        is_mkv "$file" && update=1
+        is_mkv "$file" && ! [[ -L "$file" ]] && update=1
     elif (( complete == 0 )); then
         # Required metadata missing: validate only this file.
         scan=1
 
         if is_mkv "$file"; then
-            if [[ "$root" == "$OUT" ]]; then
+            if [[ "$root" == "$OUT" && ! -L "$file" ]]; then
                 update=1
                 echo "  Statistics tags missing: validating this file."
             else
@@ -149,6 +155,8 @@ inspect_file() {
     row "Duration" "$(format_hms "$dur")"
     row "Resolution" "${res:-N/A}"
     row "Video codec" "${codec:-N/A}"
+    probe_hdr "$file" "$vidx"
+    row "Dynamic range" "$(hdr_description)"
     row "Video" "$(rate_size "$vbytes" "$dur" "$approx")"
     row "Audio ($acount track$( ((acount == 1)) || echo s))" "$(rate_size "$abytes" "$dur" "$approx")"
     row "Other / container" "$approx$(bytes_to_gib "$other") GiB"
@@ -163,6 +171,8 @@ inspect_file() {
         update_and_check "$file" "$vidx" "$vbytes" "$abytes"
     elif (( scan == 1 )) && ! is_mkv "$file"; then
         echo "  Not MKV: statistics tags not updated."
+    elif (( scan == 1 )) && [[ -L "$file" ]]; then
+        echo "  Symlink: statistics tags not updated (the link target is never modified)."
     fi
 
     ((CHECKED++))
@@ -179,7 +189,7 @@ show_source() {
     case "$kind" in
         OK)
             src="${result#*$'\t'}"
-            sbytes=$(stat -c %s "$src")
+            sbytes=$(file_bytes "$src")
             row "Source" "${src#"$IN"/}"
             row "" "$(bytes_to_gib "$sbytes") GiB -> $(bytes_to_gib "$bytes") GiB  ($(awk -v s="$sbytes" -v o="$bytes" 'BEGIN { printf "%+.1f%%", (s > 0 ? (o - s) / s * 100 : 0) }'))"
             row "Tier" "$(output_tier "$(basename "$file")")"

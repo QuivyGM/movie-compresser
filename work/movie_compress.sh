@@ -11,132 +11,29 @@ source "$WORK_DIR/lib/media_probe.sh"
 source "$WORK_DIR/lib/media_stats.sh"
 source "$WORK_DIR/lib/bitrate.sh"
 source "$WORK_DIR/lib/encode_common.sh"
+source "$WORK_DIR/lib/hdr_dovi.sh"
+source "$WORK_DIR/lib/policy.sh"
 
 declare -a INPUTS OUTPUTS BITRATES FILTERS TIERS AUDIO_ARGS OVERWRITES
+declare -a DV_POLICIES DV_MODES HDR10P_POLICIES
 
-# ============================================================
-# POLICY
-#
-# QUALITY = QUALITY-FIRST
-#   Video:
-#     preferred: 20 Mb/s
-#     floor:     12 Mb/s
-#     max:       20 GiB video
-#
-#   Target = as high as possible up to:
-#       min(20 Mb/s, bitrate required for 20 GiB video)
-#
-#   Audio:
-#     copied unchanged
-#
-# HIGH = EFFICIENCY-FIRST
-#   Video:
-#     target:    ~7 GiB
-#     floor:      6 Mb/s
-#     upper cap: 12 Mb/s
-#
-#   Audio:
-#     target <= 2 GiB
-#
-# BASE = SIZE/EFFICIENCY-FIRST
-#   Video:
-#     target:    ~2 GiB
-#     floor:     2.5 Mb/s
-#     upper cap: 5 Mb/s
-#
-#   Audio:
-#     choose <=1 GiB or <=0.5 GiB
-#
-# High/Base size targets are soft targets:
-# bitrate floors take priority for long movies.
-# ============================================================
+# Compression policy: ~/compress/compress.conf (loaded and validated
+# by work/lib/policy.sh). The policy math lives there as well
+# (movie_video_plan, build_audio_args).
+if ! load_policy; then
+    exit 1
+fi
 
-build_audio_args() {
-    local budget="$1"
-    local channels_string="$2"
-    local tier="$3"
-
-    read -ra CHANNELS <<< "$channels_string"
-
-    if (( ${#CHANNELS[@]} == 0 )); then
-        echo "-c:a copy"
-        return
-    fi
-
-    local recommendations=()
-    local total=0
-
-    for ch in "${CHANNELS[@]}"; do
-        [[ "$ch" =~ ^[0-9]+$ ]] || ch=2
-
-        local kbps
-
-        if [[ "$tier" == "High" ]]; then
-            if (( ch >= 7 )); then
-                kbps=768
-            elif (( ch == 6 )); then
-                kbps=640
-            elif (( ch >= 3 )); then
-                kbps=448
-            elif (( ch == 2 )); then
-                kbps=256
-            else
-                kbps=128
-            fi
-        else
-            if (( ch >= 7 )); then
-                kbps=512
-            elif (( ch == 6 )); then
-                kbps=448
-            elif (( ch >= 3 )); then
-                kbps=320
-            elif (( ch == 2 )); then
-                kbps=192
-            else
-                kbps=96
-            fi
-        fi
-
-        recommendations+=("$kbps")
-        total=$((total + kbps))
-    done
-
-    local args="-c:a aac"
-
-    if (( total <= budget )); then
-        for i in "${!recommendations[@]}"; do
-            args+=" -b:a:${i} ${recommendations[$i]}k"
-        done
-    else
-        for i in "${!recommendations[@]}"; do
-            local kbps
-
-            kbps=$(
-                awk \
-                    -v r="${recommendations[$i]}" \
-                    -v t="$total" \
-                    -v b="$budget" '
-                    BEGIN {
-                        x=int(r/t*b)
-                        if (x < 64) x=64
-                        printf "%d",x
-                    }'
-            )
-
-            args+=" -b:a:${i} ${kbps}k"
-        done
-    fi
-
-    echo "$args"
-}
+echo "Policy: $(policy_conf_path)"
+for t in Quality High Base; do
+    printf "  %-8s %s
+" "$t" "$(movie_policy_line "$t")"
+done
 
 while true; do
 
-    mapfile -t files < <(
-        find "$IN_DIR" -maxdepth 1 -type f \
-        \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.m4v' \) |
-        sort
-    )
+    # regular files and valid symlinks (see discover_paths)
+    mapfile -t files < <(video_files_in_dir "$IN_DIR")
 
     if (( ${#files[@]} == 0 )); then
         echo "No movies found in $IN_DIR"
@@ -182,7 +79,7 @@ while true; do
 
     DURATION=$(get_duration "$IN")
 
-    SOURCE_TOTAL_BYTES=$(stat -c %s "$IN")
+    SOURCE_TOTAL_BYTES=$(file_bytes "$IN")
 
     # One packet scan for both video and audio sizes.
     read -r SOURCE_VIDEO_BYTES SOURCE_AUDIO_BYTES \
@@ -302,139 +199,61 @@ while true; do
     done
 
     # ========================================================
-    # VIDEO TARGET
+    # VIDEO TARGET  (values: compress.conf, math: movie_video_plan)
     # ========================================================
 
-    case "$TIER" in
+    movie_video_plan "$TIER" "$DURATION"
+    TARGET_MBPS="$PLAN_TARGET_MBPS"
 
-        Quality)
+    if (( PLAN_BELOW_FLOOR == 1 )); then
 
-            VIDEO_MAX_GIB=20
-            VIDEO_FLOOR=12.0
-            VIDEO_PREFERRED=20.0
+        FLOOR_SIZE=$(video_size_gib "$PLAN_FLOOR_MBPS" "$DURATION")
 
-            SIZE_LIMIT_MBPS=$(
-                bitrate_for_gib \
-                    "$VIDEO_MAX_GIB" \
-                    "$DURATION"
-            )
+        echo
+        echo "------------------------------------------------------------"
+        echo "Quality conflict:"
+        echo
 
-            TARGET_MBPS=$(
-                min_value \
-                    "$VIDEO_PREFERRED" \
-                    "$SIZE_LIMIT_MBPS"
-            )
+        printf "%-18s | %-18s | %-18s\n" \
+            "" \
+            "1. Quality floor" \
+            "2. ${MOVIE_QUALITY_VIDEO_MAX_GIB} GiB max"
 
-            BELOW_FLOOR=$(
-                awk -v x="$TARGET_MBPS" -v f="$VIDEO_FLOOR" \
-                    'BEGIN {print (x<f)?1:0}'
-            )
+        printf "%-18s-+-%-18s-+-%-18s\n" \
+            "------------------" \
+            "------------------" \
+            "------------------"
 
-            if (( BELOW_FLOOR == 1 )); then
+        printf "%-18s | %-18s | %-18s\n" \
+            "Video bitrate" \
+            "${PLAN_FLOOR_MBPS} Mb/s" \
+            "${PLAN_TARGET_MBPS} Mb/s"
 
-                FLOOR_SIZE=$(
-                    video_size_gib \
-                        "$VIDEO_FLOOR" \
-                        "$DURATION"
-                )
+        printf "%-18s | %-18s | %-18s\n" \
+            "Video size" \
+            "~${FLOOR_SIZE} GiB" \
+            "~$(video_size_gib "$PLAN_TARGET_MBPS" "$DURATION") GiB"
 
-                echo
-                echo "------------------------------------------------------------"
-                echo "Quality conflict:"
-                echo
+        echo "------------------------------------------------------------"
 
-                printf "%-18s | %-18s | %-18s\n" \
-                    "" \
-                    "1. Quality floor" \
-                    "2. 20 GiB max"
+        while true; do
+            read -rp "Select [1-2]: " qc
 
-                printf "%-18s-+-%-18s-+-%-18s\n" \
-                    "------------------" \
-                    "------------------" \
-                    "------------------"
-
-                printf "%-18s | %-18s | %-18s\n" \
-                    "Video bitrate" \
-                    "${VIDEO_FLOOR} Mb/s" \
-                    "${SIZE_LIMIT_MBPS} Mb/s"
-
-                printf "%-18s | %-18s | %-18s\n" \
-                    "Video size" \
-                    "~${FLOOR_SIZE} GiB" \
-                    "~20.000 GiB"
-
-                echo "------------------------------------------------------------"
-
-                while true; do
-                    read -rp "Select [1-2]: " qc
-
-                    case "$qc" in
-                        1)
-                            TARGET_MBPS="$VIDEO_FLOOR"
-                            break
-                            ;;
-                        2)
-                            TARGET_MBPS="$SIZE_LIMIT_MBPS"
-                            break
-                            ;;
-                        *)
-                            echo "Invalid selection."
-                            ;;
-                    esac
-                done
-            fi
-            ;;
-
-        High)
-
-            VIDEO_TARGET_GIB=7
-            VIDEO_FLOOR=6.0
-            VIDEO_UPPER=12.0
-
-            SIZE_TARGET_MBPS=$(
-                bitrate_for_gib \
-                    "$VIDEO_TARGET_GIB" \
-                    "$DURATION"
-            )
-
-            TARGET_MBPS=$(
-                min_value \
-                    "$VIDEO_UPPER" \
-                    "$SIZE_TARGET_MBPS"
-            )
-
-            TARGET_MBPS=$(
-                max_value \
-                    "$VIDEO_FLOOR" \
-                    "$TARGET_MBPS"
-            )
-            ;;
-
-        Base)
-
-            VIDEO_TARGET_GIB=2
-            VIDEO_FLOOR=2.5
-            VIDEO_UPPER=5.0
-
-            SIZE_TARGET_MBPS=$(
-                bitrate_for_gib \
-                    "$VIDEO_TARGET_GIB" \
-                    "$DURATION"
-            )
-
-            TARGET_MBPS=$(
-                min_value \
-                    "$VIDEO_UPPER" \
-                    "$SIZE_TARGET_MBPS"
-            )
-
-            TARGET_MBPS=$(
-                max_value \
-                    "$VIDEO_FLOOR" \
-                    "$TARGET_MBPS"
-            )
-            ;;
-    esac
+            case "$qc" in
+                1)
+                    TARGET_MBPS="$PLAN_FLOOR_MBPS"
+                    break
+                    ;;
+                2)
+                    TARGET_MBPS="$PLAN_TARGET_MBPS"
+                    break
+                    ;;
+                *)
+                    echo "Invalid selection."
+                    ;;
+            esac
+        done
+    fi
 
     # Never intentionally encode above source bitrate.
     TARGET_MBPS=$(
@@ -464,96 +283,56 @@ while true; do
     # ========================================================
 
     AUDIO_MODE="copy"
-    AUDIO_CAP_GIB=0
+    AUDIO_CAP_GIB=$(movie_audio_cap_gib "$TIER")
     AUDIO_FFMPEG_ARGS="-c:a copy"
     EXPECTED_AUDIO_GIB="$SOURCE_AUDIO_GIB"
 
-    case "$TIER" in
+    if [[ "$TIER" == "Base" ]]; then
+        read -ra BASE_CHOICES <<< "$MOVIE_BASE_AUDIO_MAX_GIB_CHOICES"
 
-        Quality)
-            ;;
+        echo
+        echo "Base audio target:"
+        for i in "${!BASE_CHOICES[@]}"; do
+            echo "$((i + 1))) ${BASE_CHOICES[$i]} GiB"
+        done
 
-        High)
+        while true; do
+            read -rp "Select [1-${#BASE_CHOICES[@]}]: " ac
 
-            AUDIO_CAP_GIB=2
-
-            TOO_BIG=$(
-                awk -v s="$SOURCE_AUDIO_GIB" -v c="$AUDIO_CAP_GIB" \
-                    'BEGIN {print (s>c)?1:0}'
-            )
-
-            if (( TOO_BIG == 1 )); then
-
-                AUDIO_MODE="aac"
-
-                AUDIO_BUDGET=$(
-                    audio_kbps_for_gib \
-                        "$AUDIO_CAP_GIB" \
-                        "$DURATION"
-                )
-
-                AUDIO_FFMPEG_ARGS=$(
-                    build_audio_args \
-                        "$AUDIO_BUDGET" \
-                        "$AUDIO_CHANNELS" \
-                        "$TIER"
-                )
-
-                EXPECTED_AUDIO_GIB="$AUDIO_CAP_GIB"
+            if [[ "$ac" =~ ^[0-9]+$ ]] && (( ac >= 1 && ac <= ${#BASE_CHOICES[@]} )); then
+                AUDIO_CAP_GIB="${BASE_CHOICES[$((ac - 1))]}"
+                break
             fi
-            ;;
 
-        Base)
+            echo "Invalid selection."
+        done
+    fi
 
-            echo
-            echo "Base audio target:"
-            echo "1) 1.0 GiB"
-            echo "2) 0.5 GiB"
+    # 0 = no audio limit: copied unchanged
+    TOO_BIG=$(
+        awk -v s="$SOURCE_AUDIO_GIB" -v c="$AUDIO_CAP_GIB" \
+            'BEGIN {print (c > 0 && s > c) ? 1 : 0}'
+    )
 
-            while true; do
-                read -rp "Select [1-2]: " ac
+    if (( TOO_BIG == 1 )); then
 
-                case "$ac" in
-                    1)
-                        AUDIO_CAP_GIB=1
-                        break
-                        ;;
-                    2)
-                        AUDIO_CAP_GIB=0.5
-                        break
-                        ;;
-                    *)
-                        echo "Invalid selection."
-                        ;;
-                esac
-            done
+        AUDIO_MODE="aac"
 
-            TOO_BIG=$(
-                awk -v s="$SOURCE_AUDIO_GIB" -v c="$AUDIO_CAP_GIB" \
-                    'BEGIN {print (s>c)?1:0}'
-            )
+        AUDIO_BUDGET=$(
+            audio_kbps_for_gib \
+                "$AUDIO_CAP_GIB" \
+                "$DURATION"
+        )
 
-            if (( TOO_BIG == 1 )); then
+        AUDIO_FFMPEG_ARGS=$(
+            build_audio_args \
+                "$AUDIO_BUDGET" \
+                "$AUDIO_CHANNELS" \
+                "$TIER"
+        )
 
-                AUDIO_MODE="aac"
-
-                AUDIO_BUDGET=$(
-                    audio_kbps_for_gib \
-                        "$AUDIO_CAP_GIB" \
-                        "$DURATION"
-                )
-
-                AUDIO_FFMPEG_ARGS=$(
-                    build_audio_args \
-                        "$AUDIO_BUDGET" \
-                        "$AUDIO_CHANNELS" \
-                        "$TIER"
-                )
-
-                EXPECTED_AUDIO_GIB="$AUDIO_CAP_GIB"
-            fi
-            ;;
-    esac
+        EXPECTED_AUDIO_GIB="$AUDIO_CAP_GIB"
+    fi
 
     EXPECTED_TOTAL_GIB=$(
         awk \
@@ -594,6 +373,9 @@ while true; do
     TIERS+=("$TIER")
     AUDIO_ARGS+=("$AUDIO_FFMPEG_ARGS")
     OVERWRITES+=("$RESOLVED_OVERWRITE")
+    DV_POLICIES+=("$DV_POLICY")
+    DV_MODES+=("$DV_MODE")
+    HDR10P_POLICIES+=("$HDR10P_POLICY")
 
     # ========================================================
     # SUMMARY
@@ -618,17 +400,10 @@ while true; do
         "$SOURCE_VIDEO_GIB" \
         "$EXPECTED_VIDEO_GIB"
 
-    case "$TIER" in
-        Quality)
-            echo "  Video policy:      quality-first [12 Mb/s floor / 20 Mb/s preferred / 20 GiB max]"
-            ;;
-        High)
-            echo "  Video policy:      efficiency-first [~7 GiB target / 6 Mb/s floor]"
-            ;;
-        Base)
-            echo "  Video policy:      size-first [~2 GiB target / 2.5 Mb/s floor]"
-            ;;
-    esac
+    printf "  Policy:            %s
+" "$(movie_policy_line "$TIER")"
+    printf "                     (%s)
+" "$(policy_conf_path)"
 
     if [[ "$AUDIO_MODE" == "copy" ]]; then
         printf "  Audio size:        ~%s GiB -> copied unchanged\n" \
@@ -648,6 +423,26 @@ while true; do
         "$EXPECTED_TOTAL_GIB"
 
     printf "  Dynamic range:     %s\n" "$(hdr_description)"
+
+    HDR_POLICY_LINE=$(hdr_policy_summary)
+    [[ -n "$HDR_POLICY_LINE" ]] &&
+        printf "  HDR metadata:      %s\n" "$HDR_POLICY_LINE"
+
+    if [[ "$DV_POLICY" == "preserve" ]] && (( DOWNSCALED == 1 )); then
+        echo "  Dolby Vision:      L5 active-area offsets rescaled to ${OUT_WIDTH}x${OUT_HEIGHT}"
+    fi
+
+    while IFS= read -r note; do
+        [[ -n "$note" ]] && printf "  WARNING:           %s\n" "$note"
+    done < <(audio_loss_notes "$IN" "$AUDIO_FFMPEG_ARGS")
+
+    while IFS= read -r note; do
+        [[ -n "$note" ]] && printf "  Audio title:       %s\n" "$note"
+    done < <(audio_title_notes "$IN" "$AUDIO_FFMPEG_ARGS")
+
+    while IFS= read -r note; do
+        [[ -n "$note" ]] && printf "  Chapters:          %s\n" "${note#chapters: }"
+    done < <(chapter_notes "$IN")
 
     for note in "${MAP_NOTES[@]+"${MAP_NOTES[@]}"}"; do
         printf "  Streams:           %s\n" "$note"
@@ -687,6 +482,10 @@ mkdir -p "$PASS_DIR"
     emit_job_header "$SESSION" movie "${#INPUTS[@]}"
 
     for i in "${!INPUTS[@]}"; do
+        DV_POLICY="${DV_POLICIES[$i]}"
+        DV_MODE="${DV_MODES[$i]}"
+        HDR10P_POLICY="${HDR10P_POLICIES[$i]}"
+
         emit_encode_item \
             "$((i + 1))" \
             "${INPUTS[$i]}" \

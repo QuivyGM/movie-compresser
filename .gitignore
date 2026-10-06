@@ -21,3 +21,6 @@ work/logs/
 work/*.bak
 work/*.bak2
 work/*.log
+
+# optional static tools (dovi_tool, hdr10plus_tool) dropped in by the user
+work/bin/
