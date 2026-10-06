@@ -17,7 +17,7 @@ POLICY_KEYS_POSITIVE=(
     MOVIE_BASE_AAC_KBPS_7PLUS MOVIE_BASE_AAC_KBPS_6 MOVIE_BASE_AAC_KBPS_3TO5
     MOVIE_BASE_AAC_KBPS_2 MOVIE_BASE_AAC_KBPS_1
     MOVIE_AAC_MIN_KBPS
-    SERIES_HIGH_TOTAL_GIB_PER_HOUR SERIES_BASE_TOTAL_GIB_PER_HOUR
+    SERIES_HIGH_VIDEO_GIB_PER_HOUR SERIES_BASE_VIDEO_GIB_PER_HOUR
     SERIES_HIGH_AAC_KBPS_7PLUS SERIES_HIGH_AAC_KBPS_6 SERIES_HIGH_AAC_KBPS_3TO5
     SERIES_HIGH_AAC_KBPS_2 SERIES_HIGH_AAC_KBPS_1
     SERIES_BASE_AAC_KBPS_7PLUS SERIES_BASE_AAC_KBPS_6 SERIES_BASE_AAC_KBPS_3TO5
@@ -35,7 +35,8 @@ POLICY_KEYS_NONNEG=(
     MOVIE_QUALITY_AUDIO_MAX_GIB
     MOVIE_HIGH_VIDEO_FLOOR_MBPS MOVIE_HIGH_VIDEO_MAX_MBPS MOVIE_HIGH_AUDIO_MAX_GIB
     MOVIE_BASE_VIDEO_FLOOR_MBPS MOVIE_BASE_VIDEO_MAX_MBPS
-    SERIES_MIN_VIDEO_KBPS
+    SERIES_HIGH_VIDEO_FLOOR_MBPS SERIES_HIGH_VIDEO_MAX_MBPS
+    SERIES_BASE_VIDEO_FLOOR_MBPS SERIES_BASE_VIDEO_MAX_MBPS
 )
 
 policy_conf_path() {
@@ -74,8 +75,8 @@ validate_policy() {
     done
 
     # floor <= max (when a max is set)
-    for f in QUALITY HIGH BASE; do
-        local fl="MOVIE_${f}_VIDEO_FLOOR_MBPS" mx="MOVIE_${f}_VIDEO_MAX_MBPS"
+    for f in MOVIE_QUALITY MOVIE_HIGH MOVIE_BASE SERIES_HIGH SERIES_BASE; do
+        local fl="${f}_VIDEO_FLOOR_MBPS" mx="${f}_VIDEO_MAX_MBPS"
         if _policy_is_num "${!fl:-}" && _policy_is_num "${!mx:-}" &&
            awk -v a="${!fl}" -v b="${!mx}" 'BEGIN { exit !(b > 0 && a > b) }'; then
             errs+=("$fl (${!fl}) is greater than $mx (${!mx})")
@@ -395,14 +396,119 @@ movie_video_policy_lines() {
 
 # ------------------------------------------------------------
 # Series
+#
+# One fixed video bitrate for every episode, from a video-only size per
+# hour of runtime (audio is added on top, never taken from it):
+#   fixed = kb/s of SERIES_<TIER>_VIDEO_GIB_PER_HOUR
+#   fixed = min(fixed, SERIES_<TIER>_VIDEO_MAX_MBPS)   (0 = no max)
+# Per episode (never above the source):
+#   source below the floor   -> source bitrate (not reduced further)
+#   source below fixed       -> source bitrate
+#   otherwise                -> fixed
+# Episode runtime changes only the expected size, not the bitrate.
 # ------------------------------------------------------------
 
-# series_gib_per_hour TIER  ->  configured GiB/hour (Base / High)
+# _mbps_to_kbps MBPS  ->  whole kb/s
+_mbps_to_kbps() {
+    awk -v x="$1" 'BEGIN { printf "%.0f", x * 1000 }'
+}
+
+# series_gib_per_hour TIER  ->  configured video GiB/hour (Base / High)
 series_gib_per_hour() {
     case "$1" in
-        Base) echo "$SERIES_BASE_TOTAL_GIB_PER_HOUR" ;;
-        High) echo "$SERIES_HIGH_TOTAL_GIB_PER_HOUR" ;;
+        Base) echo "$SERIES_BASE_VIDEO_GIB_PER_HOUR" ;;
+        High) echo "$SERIES_HIGH_VIDEO_GIB_PER_HOUR" ;;
     esac
+}
+
+# series_video_policy_lines TIER  ->  the tier's video settings, one per line
+series_video_policy_lines() {
+    local u="${1^^}"
+    local rk="SERIES_${u}_VIDEO_GIB_PER_HOUR" fk="SERIES_${u}_VIDEO_FLOOR_MBPS" mk="SERIES_${u}_VIDEO_MAX_MBPS"
+
+    echo "$1 video policy:"
+    echo "  ${!rk} GiB/hour"
+    echo "  bitrate floor: ${!fk} Mb/s"
+    awk -v m="${!mk}" 'BEGIN { print "  bitrate max: " ((m > 0) ? m " Mb/s" : "none") }'
+}
+
+# series_video_plan TIER [CUSTOM_GIB_PER_HOUR]
+#
+# Reads EP_VKBPS (source video kb/s per episode; "N/A" when unknown).
+# Custom: the entered GiB/hour, no floor and no max.
+#
+# Sets:
+#   SPLAN_GIB_PER_HOUR    video GiB/hour of the tier
+#   SPLAN_RATE_KBPS       that GiB/hour as kb/s
+#   SPLAN_TARGET_KBPS     fixed video bitrate after the max
+#   SPLAN_FLOOR_KBPS      floor (0 = none)
+#   SPLAN_MAX_KBPS        max (0 = none)
+#   SPLAN_MAX_LIMITED     1 when the max lowered the fixed bitrate
+#   SPLAN_BELOW_FLOOR     1 when the fixed bitrate is below the floor
+#                         and an episode's source is at or above it
+#                         (or unknown): the menu asks floor vs target.
+#                         Episodes whose source is below the floor keep
+#                         their source bitrate and cause no conflict.
+series_video_plan() {
+    local tier="$1" u s
+
+    SPLAN_MAX_LIMITED=0
+    SPLAN_BELOW_FLOOR=0
+
+    case "$tier" in
+        High|Base)
+            u="${tier^^}"
+            local rk="SERIES_${u}_VIDEO_GIB_PER_HOUR" fk="SERIES_${u}_VIDEO_FLOOR_MBPS" mk="SERIES_${u}_VIDEO_MAX_MBPS"
+            SPLAN_GIB_PER_HOUR="${!rk}"
+            SPLAN_FLOOR_KBPS=$(_mbps_to_kbps "${!fk}")
+            SPLAN_MAX_KBPS=$(_mbps_to_kbps "${!mk}")
+            ;;
+        Custom)
+            SPLAN_GIB_PER_HOUR="$2"
+            SPLAN_FLOOR_KBPS=0
+            SPLAN_MAX_KBPS=0
+            ;;
+        *)
+            echo "series_video_plan: unknown tier $tier" >&2
+            return 1
+            ;;
+    esac
+
+    SPLAN_RATE_KBPS=$(gib_per_hour_to_kbps "$SPLAN_GIB_PER_HOUR")
+    SPLAN_TARGET_KBPS="$SPLAN_RATE_KBPS"
+
+    if (( SPLAN_MAX_KBPS > 0 && SPLAN_TARGET_KBPS > SPLAN_MAX_KBPS )); then
+        SPLAN_TARGET_KBPS="$SPLAN_MAX_KBPS"
+        SPLAN_MAX_LIMITED=1
+    fi
+
+    if (( SPLAN_TARGET_KBPS < SPLAN_FLOOR_KBPS )); then
+        for s in "${EP_VKBPS[@]+"${EP_VKBPS[@]}"}"; do
+            if [[ ! "$s" =~ ^[0-9]+$ ]] || (( s == 0 || s >= SPLAN_FLOOR_KBPS )); then
+                SPLAN_BELOW_FLOOR=1
+                break
+            fi
+        done
+    fi
+}
+
+# series_episode_video_kbps FIXED_KBPS SOURCE_KBPS FLOOR_KBPS  ->  "KBPS NOTE"
+# NOTE: "-" (fixed), "src" (source below fixed), "floor" (source below
+# the floor: kept at the source bitrate)
+series_episode_video_kbps() {
+    local fixed="$1" src="$2" floor="$3"
+
+    if [[ "$src" =~ ^[0-9]+$ ]] && (( src > 0 )); then
+        if (( floor > 0 && src < floor )); then
+            echo "$src floor"
+            return
+        elif (( src < fixed )); then
+            echo "$src src"
+            return
+        fi
+    fi
+
+    echo "$fixed -"
 }
 
 # series_aac_kbps TIER CHANNELS  (High rates for High and Custom)
@@ -413,14 +519,107 @@ series_aac_kbps() {
     esac
 }
 
-# series_media_kbps TOTAL_KBPS  ->  total minus the container reserve
-series_media_kbps() {
-    awk -v x="$1" -v r="$SERIES_CONTAINER_RESERVE_PCT" 'BEGIN { printf "%.0f", x * (100 - r) / 100 }'
-}
-
 # series_size_factor  ->  1 - reserve, for size estimates
 series_size_factor() {
     awk -v r="$SERIES_CONTAINER_RESERVE_PCT" 'BEGIN { printf "%.6f", (100 - r) / 100 }'
+}
+
+# series_plan TIER FIXED_VIDEO_KBPS FLOOR_KBPS
+#
+# Reads EP_DUR, EP_VKBPS, EP_AKBPS (source audio kb/s per track,
+# space separated) and AUDIO_CHANNELS.
+#
+# Sets:
+#   P_VIDEO_KBPS        the fixed video bitrate
+#   P_AUDIO_KBPS        fixed audio total (all tracks re-encoded)
+#   P_EP_VKBPS[i]       video kb/s per episode
+#   P_EP_VNOTE[i]       "-", "src" or "floor" (see series_episode_video_kbps)
+#   P_EP_AARGS[i]       shell-quoted audio args per episode
+#   P_EP_ADESC[i]       short audio description per episode
+#   P_EP_VGIB[i] P_EP_AGIB[i] P_EP_GIB[i]   expected video / audio / total
+#   P_CAPPED            episodes at their source bitrate (below fixed)
+#   P_SRC_BELOW_FLOOR   episodes kept at a source bitrate below the floor
+#   P_COPIED            audio tracks copied (all episodes)
+#   P_TOTAL_SECONDS
+#   P_VIDEO_GIB P_AUDIO_GIB P_TOTAL_GIB     totals
+# Total sizes add SERIES_CONTAINER_RESERVE_PCT for container/subtitles.
+series_plan() {
+    local tier="$1" fixed="$2" floor="$3"
+    local i t rate src v note a_kbps tokens desc f
+    local -a src_rates
+
+    f=$(series_size_factor)
+
+    P_VIDEO_KBPS="$fixed"
+    P_AUDIO_KBPS=0
+    for t in "${!AUDIO_CHANNELS[@]}"; do
+        rate=$(series_aac_kbps "$tier" "${AUDIO_CHANNELS[$t]}")
+        P_AUDIO_KBPS=$((P_AUDIO_KBPS + rate))
+    done
+
+    P_CAPPED=0
+    P_SRC_BELOW_FLOOR=0
+    P_COPIED=0
+    P_EP_VKBPS=()
+    P_EP_VNOTE=()
+    P_EP_AARGS=()
+    P_EP_ADESC=()
+    P_EP_VGIB=()
+    P_EP_AGIB=()
+    P_EP_GIB=()
+
+    local video_kb_total=0 audio_kb_total=0 seconds=0
+
+    for i in "${!EP_DUR[@]}"; do
+        read -r v note <<< "$(series_episode_video_kbps "$fixed" "${EP_VKBPS[$i]:-N/A}" "$floor")"
+        case "$note" in
+            src)   ((P_CAPPED += 1)) ;;
+            floor) ((P_SRC_BELOW_FLOOR += 1)) ;;
+        esac
+
+        P_EP_VKBPS[$i]="$v"
+        P_EP_VNOTE[$i]="$note"
+
+        read -ra src_rates <<< "${EP_AKBPS[$i]:-}"
+        tokens=""
+        desc=""
+        a_kbps=0
+
+        for t in "${!AUDIO_CHANNELS[@]}"; do
+            rate=$(series_aac_kbps "$tier" "${AUDIO_CHANNELS[$t]}")
+            src="${src_rates[$t]:-N/A}"
+
+            if [[ "$src" =~ ^[0-9]+$ ]] && (( src > 0 && src <= rate )); then
+                # Already at or below the target: no lossy re-encode.
+                a_kbps=$((a_kbps + src))
+                desc+="copy "
+                ((P_COPIED += 1))
+            else
+                tokens+=$(printf '%q ' "-c:a:$t" aac "-b:a:$t" "${rate}k")
+                a_kbps=$((a_kbps + rate))
+                desc+="${rate}k "
+            fi
+        done
+
+        P_EP_AARGS[$i]="${tokens% }"
+        P_EP_ADESC[$i]="${desc% }"
+
+        read -r P_EP_VGIB[$i] P_EP_AGIB[$i] P_EP_GIB[$i] < <(
+            awk -v v="$v" -v a="$a_kbps" -v s="${EP_DUR[$i]}" -v f="$f" 'BEGIN {
+                g = 1000 * s / 8 / 1073741824
+                printf "%.2f %.2f %.2f\n", v * g, a * g, (v + a) * g / f }')
+
+        read -r video_kb_total audio_kb_total seconds < <(
+            awk -v vt="$video_kb_total" -v at="$audio_kb_total" -v st="$seconds" \
+                -v v="$v" -v a="$a_kbps" -v s="${EP_DUR[$i]}" \
+                'BEGIN { printf "%.0f %.0f %.3f\n", vt + v * s, at + a * s, st + s }')
+    done
+
+    P_TOTAL_SECONDS="$seconds"
+    read -r P_VIDEO_GIB P_AUDIO_GIB P_TOTAL_GIB < <(
+        awk -v v="$video_kb_total" -v a="$audio_kb_total" -v f="$f" 'BEGIN {
+            g = 1000 / 8 / 1073741824
+            printf "%.2f %.2f %.2f\n", v * g, a * g, (v + a) * g / f }')
 }
 
 # ------------------------------------------------------------

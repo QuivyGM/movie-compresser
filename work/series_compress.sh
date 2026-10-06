@@ -14,16 +14,16 @@ source "$WORK_DIR/lib/hdr_dovi.sh"
 source "$WORK_DIR/lib/policy.sh"
 
 # ============================================================
-# POLICY  (values: ~/compress/work/lib/compress.conf, loaded by policy.sh)
+# POLICY  (values: ~/compress/work/lib/compress.conf; math: policy.sh
+# series_video_plan / series_plan)
 #
-# Base / High: SERIES_*_TOTAL_GIB_PER_HOUR
-# Custom:      user-entered GiB/hour, High audio rates
+# Base / High: SERIES_*_VIDEO_GIB_PER_HOUR (video only), floor, max
+# Custom:      user-entered video GiB/hour, no floor / max, High audio
 #
-# The same fixed video/audio bitrates are used for every episode,
-# with SERIES_CONTAINER_RESERVE_PCT reserved for container/subtitles/
-# metadata, except:
-#   - an episode whose source video bitrate is lower than the fixed
-#     video bitrate is encoded at its source bitrate (never increased)
+# One fixed video bitrate for every episode; audio is added on top of
+# the video size, never taken from it. Per episode:
+#   - a source video bitrate below the fixed bitrate is kept (never
+#     increased); one below the tier floor is kept as well (not reduced)
 #   - an audio track whose source bitrate is already at or below the
 #     fixed audio rate for its channel count is copied unchanged
 #
@@ -35,9 +35,14 @@ if ! load_policy; then
 fi
 
 echo "Policy: $(policy_conf_path)"
-printf "  Base %s GiB/hour, High %s GiB/hour, %s%% reserve, video >= %s kb/s\n" \
-    "$SERIES_BASE_TOTAL_GIB_PER_HOUR" "$SERIES_HIGH_TOTAL_GIB_PER_HOUR" \
-    "$SERIES_CONTAINER_RESERVE_PCT" "$SERIES_MIN_VIDEO_KBPS"
+for t in High Base; do
+    echo
+    series_video_policy_lines "$t"
+done
+echo
+echo "Audio:"
+echo "  separate from video size target"
+echo "  (AAC per track by channel count; tracks already at or below it are copied)"
 
 # audio_rate TIER CHANNELS  ->  AAC kb/s (compress.conf SERIES_*_AAC_KBPS_*)
 audio_rate() {
@@ -306,118 +311,42 @@ if (( WIDTH > 1920 || HEIGHT > 1080 )); then
 fi
 
 # ============================================================
-# PLAN
-#
-# plan_tier TIER GIB_PER_HOUR
-#
-# Sets:
-#   P_TOTAL_KBPS P_MEDIA_KBPS P_AUDIO_KBPS P_VIDEO_KBPS  (fixed rates)
-#   P_EP_VKBPS[i]  video kb/s per episode (fixed, or source if lower)
-#   P_EP_AARGS[i]  shell-quoted audio args per episode
-#   P_EP_ADESC[i]  short audio description per episode
-#   P_EP_GIB[i]    expected size per episode
-#   P_CAPPED       episodes capped at their source video bitrate
-#   P_COPIED       audio tracks copied (all episodes)
-#   P_VIDEO_GIB P_AUDIO_GIB P_TOTAL_GIB  totals
+# PLAN  (policy.sh: series_video_plan, series_plan)
 # ============================================================
-
-plan_tier() {
-    local tier="$1"
-    local gib_per_hour="$2"
-    local i t rate src v a_kbps a_size_kb tokens desc
-    local -a src_rates
-
-    P_AUDIO_KBPS=0
-    for t in "${!AUDIO_CHANNELS[@]}"; do
-        rate=$(audio_rate "$tier" "${AUDIO_CHANNELS[$t]}")
-        P_AUDIO_KBPS=$((P_AUDIO_KBPS + rate))
-    done
-
-    P_TOTAL_KBPS=$(gib_per_hour_to_kbps "$gib_per_hour")
-    P_MEDIA_KBPS=$(series_media_kbps "$P_TOTAL_KBPS")
-    P_VIDEO_KBPS=$((P_MEDIA_KBPS - P_AUDIO_KBPS))
-
-    P_CAPPED=0
-    P_COPIED=0
-    P_EP_VKBPS=()
-    P_EP_AARGS=()
-    P_EP_ADESC=()
-    P_EP_GIB=()
-
-    local video_kb_total=0
-    local audio_kb_total=0
-
-    for i in "${!FILES[@]}"; do
-        v="$P_VIDEO_KBPS"
-        src="${EP_VKBPS[$i]}"
-
-        # Never above the source video bitrate.
-        if [[ "$src" =~ ^[0-9]+$ ]] && (( src > 0 && src < v )); then
-            v="$src"
-            ((P_CAPPED += 1))
-        fi
-
-        P_EP_VKBPS[$i]="$v"
-
-        read -ra src_rates <<< "${EP_AKBPS[$i]}"
-        tokens=""
-        desc=""
-        a_kbps=0
-
-        for t in "${!AUDIO_CHANNELS[@]}"; do
-            rate=$(audio_rate "$tier" "${AUDIO_CHANNELS[$t]}")
-            src="${src_rates[$t]:-N/A}"
-
-            if [[ "$src" =~ ^[0-9]+$ ]] && (( src > 0 && src <= rate )); then
-                # Already at or below the target: no lossy re-encode.
-                a_kbps=$((a_kbps + src))
-                desc+="copy "
-                ((P_COPIED += 1))
-            else
-                tokens+=$(printf '%q ' "-c:a:$t" aac "-b:a:$t" "${rate}k")
-                a_kbps=$((a_kbps + rate))
-                desc+="${rate}k "
-            fi
-        done
-
-        P_EP_AARGS[$i]="${tokens% }"
-        P_EP_ADESC[$i]="${desc% }"
-
-        P_EP_GIB[$i]=$(awk -v v="$v" -v a="$a_kbps" -v s="${EP_DUR[$i]}" -v f="$(series_size_factor)" 'BEGIN {
-            printf "%.2f", (v + a) * 1000 * s / 8 / f / 1073741824 }')
-
-        video_kb_total=$(awk -v t="$video_kb_total" -v k="$v" -v s="${EP_DUR[$i]}" \
-            'BEGIN { printf "%.0f", t + k * s }')
-        audio_kb_total=$(awk -v t="$audio_kb_total" -v k="$a_kbps" -v s="${EP_DUR[$i]}" \
-            'BEGIN { printf "%.0f", t + k * s }')
-    done
-
-    P_VIDEO_GIB=$(awk -v k="$video_kb_total" 'BEGIN { printf "%.2f", k * 1000 / 8 / 1073741824 }')
-    P_AUDIO_GIB=$(awk -v k="$audio_kb_total" 'BEGIN { printf "%.2f", k * 1000 / 8 / 1073741824 }')
-    P_TOTAL_GIB=$(awk -v v="$video_kb_total" -v a="$audio_kb_total" -v f="$(series_size_factor)" \
-        'BEGIN { printf "%.2f", (v + a) * 1000 / 8 / f / 1073741824 }')
-}
-
-TOTAL_SECONDS=$(printf '%s\n' "${EP_DUR[@]}" | awk '{ s += $1 } END { printf "%.3f", s }')
-TOTAL_HOURS=$(awk -v s="$TOTAL_SECONDS" 'BEGIN { printf "%.2f", s / 3600 }')
 
 per_file() {
     awk -v g="$1" -v n="$FILE_COUNT" 'BEGIN { printf "%.2f", g / n }'
 }
 
+kbps_mbps() {
+    awk -v k="$1" 'BEGIN { printf "%.2f", k / 1000 }'
+}
+
+# show_preview LABEL TIER [CUSTOM_GIB_PER_HOUR]
 show_preview() {
     local label="$1"
     local tier="$2"
-    local gib="$3"
 
-    plan_tier "$tier" "$gib"
+    series_video_plan "$tier" "${3:-}"
+    series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
 
     echo "$label"
-    printf "   Total:   ~%s GiB | Video ~%s GiB (%s kb/s) | Audio ~%s GiB (%s kb/s)\n" \
-        "$P_TOTAL_GIB" "$P_VIDEO_GIB" "$P_VIDEO_KBPS" "$P_AUDIO_GIB" "$P_AUDIO_KBPS"
+    printf "   Video:   %s kb/s fixed%s\n" "$SPLAN_TARGET_KBPS" \
+        "$( (( SPLAN_MAX_LIMITED == 1 )) && echo " (limited by the $(kbps_mbps "$SPLAN_MAX_KBPS") Mb/s max)")"
+    printf "   Total:   ~%s GiB | Video ~%s GiB | Audio ~%s GiB (%s kb/s, on top)\n" \
+        "$P_TOTAL_GIB" "$P_VIDEO_GIB" "$P_AUDIO_GIB" "$P_AUDIO_KBPS"
 
     printf "   Average: ~%s GiB/file | Video ~%s GiB | Audio ~%s GiB\n" \
         "$(per_file "$P_TOTAL_GIB")" "$(per_file "$P_VIDEO_GIB")" "$(per_file "$P_AUDIO_GIB")"
+
+    if (( SPLAN_BELOW_FLOOR == 1 )); then
+        printf "   Below the %s Mb/s floor: you will be asked (floor or GiB/hour target)\n" \
+            "$(kbps_mbps "$SPLAN_FLOOR_KBPS")"
+    fi
+
+    if (( P_SRC_BELOW_FLOOR > 0 )); then
+        printf "   %d episode(s) below the floor at the source: kept at their source bitrate\n" "$P_SRC_BELOW_FLOOR"
+    fi
 
     if (( P_CAPPED > 0 )); then
         printf "   %d episode(s) kept at their lower source video bitrate\n" "$P_CAPPED"
@@ -435,13 +364,15 @@ show_preview() {
 echo
 echo "Compression tier:"
 
-show_preview "1) Base  [~${SERIES_BASE_TOTAL_GIB_PER_HOUR} GiB/hour]" "Base" "$SERIES_BASE_TOTAL_GIB_PER_HOUR"
+show_preview "1) Base  [${SERIES_BASE_VIDEO_GIB_PER_HOUR} GiB/hour video + audio]" "Base"
 echo
 
-show_preview "2) High  [~${SERIES_HIGH_TOTAL_GIB_PER_HOUR} GiB/hour]" "High" "$SERIES_HIGH_TOTAL_GIB_PER_HOUR"
+show_preview "2) High  [${SERIES_HIGH_VIDEO_GIB_PER_HOUR} GiB/hour video + audio]" "High"
 echo
 
-echo "3) Custom GiB/hour"
+echo "3) Custom video GiB/hour (no floor / max, High audio rates)"
+
+CUSTOM_GIB=""
 
 while true; do
     echo
@@ -450,19 +381,17 @@ while true; do
     case "$t" in
         1)
             TIER="Base"
-            GIB_PER_HOUR="$SERIES_BASE_TOTAL_GIB_PER_HOUR"
             break
             ;;
 
         2)
             TIER="High"
-            GIB_PER_HOUR="$SERIES_HIGH_TOTAL_GIB_PER_HOUR"
             break
             ;;
 
         3)
             while true; do
-                read -rp "Custom GiB/hour: " CUSTOM_GIB
+                read -rp "Custom video GiB/hour: " CUSTOM_GIB
 
                 if awk -v x="$CUSTOM_GIB" \
                     'BEGIN {exit !(x ~ /^[0-9]+([.][0-9]+)?$/ && x > 0)}'
@@ -475,12 +404,11 @@ while true; do
 
             # Custom uses High audio rates.
             TIER="Custom"
-            GIB_PER_HOUR="$CUSTOM_GIB"
 
             echo
             echo "Expected result:"
-            show_preview "Custom [~${GIB_PER_HOUR} GiB/hour]" \
-                "Custom" "$GIB_PER_HOUR"
+            show_preview "Custom [${CUSTOM_GIB} GiB/hour video + audio]" \
+                "Custom" "$CUSTOM_GIB"
 
             break
             ;;
@@ -492,32 +420,65 @@ while true; do
 done
 
 # ============================================================
-# FIXED BITRATES
-#
-# From the tier GiB/hour in compress.conf, or the Custom value;
-# SERIES_CONTAINER_RESERVE_PCT is kept for container/subtitles/
-# metadata.
-#
+# FIXED VIDEO BITRATE
 # ============================================================
 
-plan_tier "$TIER" "$GIB_PER_HOUR"
+series_video_plan "$TIER" "$CUSTOM_GIB"
+GIB_PER_HOUR="$SPLAN_GIB_PER_HOUR"
+VIDEO_KBPS="$SPLAN_TARGET_KBPS"
 
-VIDEO_KBPS="$P_VIDEO_KBPS"
-AUDIO_TOTAL_KBPS="$P_AUDIO_KBPS"
+if (( SPLAN_BELOW_FLOOR == 1 )); then
+    series_plan "$TIER" "$SPLAN_FLOOR_KBPS" "$SPLAN_FLOOR_KBPS"
+    FLOOR_VIDEO_GIB="$P_VIDEO_GIB"
+    series_plan "$TIER" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+    TARGET_VIDEO_GIB="$P_VIDEO_GIB"
 
-if awk -v v="$VIDEO_KBPS" -v m="$SERIES_MIN_VIDEO_KBPS" 'BEGIN { exit !(v < m) }'; then
     echo
-    echo "Audio uses too much of the selected size budget."
-    echo "Total target: ${P_TOTAL_KBPS} kb/s"
-    echo "Audio:        ${AUDIO_TOTAL_KBPS} kb/s"
-    echo "Video left:   ${VIDEO_KBPS} kb/s"
-    exit 1
+    echo "------------------------------------------------------------"
+    echo "${TIER} conflict: the GiB/hour target is below the floor."
+    echo
+
+    printf "%-18s | %-20s | %-20s\n" \
+        "" \
+        "1. ${TIER} floor" \
+        "2. ${GIB_PER_HOUR} GiB/hour"
+
+    printf "%-18s-+-%-20s-+-%-20s\n" \
+        "------------------" \
+        "--------------------" \
+        "--------------------"
+
+    printf "%-18s | %-20s | %-20s\n" \
+        "Video bitrate" \
+        "${SPLAN_FLOOR_KBPS} kb/s" \
+        "${SPLAN_TARGET_KBPS} kb/s"
+
+    printf "%-18s | %-20s | %-20s\n" \
+        "Video, all files" \
+        "~${FLOOR_VIDEO_GIB} GiB" \
+        "~${TARGET_VIDEO_GIB} GiB"
+
+    echo "------------------------------------------------------------"
+
+    while true; do
+        read -rp "Select [1-2]: " fc
+
+        case "$fc" in
+            1) VIDEO_KBPS="$SPLAN_FLOOR_KBPS"; break ;;
+            2) VIDEO_KBPS="$SPLAN_TARGET_KBPS"; break ;;
+            *) echo "Invalid selection." ;;
+        esac
+    done
 fi
+
+series_plan "$TIER" "$VIDEO_KBPS" "$SPLAN_FLOOR_KBPS"
+
+AUDIO_TOTAL_KBPS="$P_AUDIO_KBPS"
 
 echo
 echo "------------------------------------------------------------"
 echo "Tier:                 $TIER"
-echo "Target:               ~${GIB_PER_HOUR} GiB/hour"
+echo "Video target:         ${GIB_PER_HOUR} GiB/hour (video only; audio on top)"
 echo "Resolution:           ${WIDTH}x${HEIGHT} -> ${OUT_WIDTH}x${OUT_HEIGHT}"
 echo "Dynamic range:        $(hdr_description)"
 
@@ -529,8 +490,18 @@ fi
 if [[ "$DV_POLICY" == "preserve" ]] && (( DOWNSCALED == 1 )); then
     echo "Dolby Vision:         L5 active-area offsets rescaled to ${OUT_WIDTH}x${OUT_HEIGHT}"
 fi
-echo "Fixed video bitrate:  ${VIDEO_KBPS} kb/s"
-echo "Fixed audio total:    ${AUDIO_TOTAL_KBPS} kb/s"
+printf "Fixed video bitrate:  %s kb/s" "$VIDEO_KBPS"
+if [[ "$VIDEO_KBPS" == "$SPLAN_FLOOR_KBPS" ]] && (( SPLAN_BELOW_FLOOR == 1 )); then
+    printf "  (floor chosen; GiB/hour target was %s kb/s)" "$SPLAN_TARGET_KBPS"
+elif (( SPLAN_MAX_LIMITED == 1 )); then
+    printf "  (limited by the %s Mb/s max; GiB/hour gives %s kb/s)" "$(kbps_mbps "$SPLAN_MAX_KBPS")" "$SPLAN_RATE_KBPS"
+fi
+echo
+if (( SPLAN_FLOOR_KBPS > 0 || SPLAN_MAX_KBPS > 0 )); then
+    printf "  floor %s Mb/s, max %s\n" "$(kbps_mbps "$SPLAN_FLOOR_KBPS")" \
+        "$( (( SPLAN_MAX_KBPS > 0 )) && echo "$(kbps_mbps "$SPLAN_MAX_KBPS") Mb/s" || echo none)"
+fi
+echo "Fixed audio total:    ${AUDIO_TOTAL_KBPS} kb/s (on top of the video size)"
 
 for i in "${!AUDIO_CHANNELS[@]}"; do
     RATE=$(audio_rate "$TIER" "${AUDIO_CHANNELS[$i]}")
@@ -539,7 +510,8 @@ done
 
 echo
 echo "Per-episode rules (never increase quality settings above the source):"
-echo "  - video: fixed bitrate, or the source video bitrate if that is lower"
+echo "  - video: fixed bitrate, or the source video bitrate if that is lower;"
+echo "    a source below the tier floor is kept at its own bitrate"
 echo "  - audio: re-encoded at the fixed rate, or copied unchanged if the"
 echo "    source track is already at or below it"
 echo "------------------------------------------------------------"
@@ -551,30 +523,35 @@ echo "------------------------------------------------------------"
 echo
 echo "Expected sizes:"
 echo
-printf "  %-44s %7s  %13s  %-16s %s\n" "File" "Minutes" "Video kb/s" "Audio" "Size"
+printf "  %-36s %7s  %-17s %-14s %9s %9s %9s\n" \
+    "Episode" "Minutes" "Video kb/s" "Audio" "Video" "Audio" "Total"
 
 for i in "${!FILES[@]}"; do
-    src="${EP_VKBPS[$i]}"
-    [[ "$src" =~ ^[0-9]+$ ]] || src="?"
+    case "${P_EP_VNOTE[$i]}" in
+        src)   vcol="${P_EP_VKBPS[$i]} (src)" ;;
+        floor) vcol="${P_EP_VKBPS[$i]} (src<floor)" ;;
+        *)     vcol="${P_EP_VKBPS[$i]}" ;;
+    esac
 
-    if [[ "${P_EP_VKBPS[$i]}" != "$VIDEO_KBPS" ]]; then
-        vcol="${P_EP_VKBPS[$i]} (src)"
-    else
-        vcol="${P_EP_VKBPS[$i]}"
-    fi
-
-    printf "  %-44.44s %7s  %13s  %-16.16s ~%s GiB\n" \
+    printf "  %-36.36s %7s  %-17s %-14.14s %9s %9s %9s\n" \
         "$(basename "${FILES[$i]}")" \
         "$(awk -v d="${EP_DUR[$i]}" 'BEGIN { printf "%.1f", d / 60 }')" \
         "$vcol" \
         "${P_EP_ADESC[$i]}" \
-        "${P_EP_GIB[$i]}"
+        "~${P_EP_VGIB[$i]}" "~${P_EP_AGIB[$i]}" "~${P_EP_GIB[$i]}"
 done
+echo "  (sizes in GiB)"
 
 if (( P_CAPPED > 0 )); then
     echo
-    echo "  (src) = source video bitrate is below ${VIDEO_KBPS} kb/s; encoded at the"
-    echo "          source bitrate instead of raising it."
+    echo "  (src)       = source video bitrate is below ${VIDEO_KBPS} kb/s; encoded at the"
+    echo "                source bitrate instead of raising it."
+fi
+
+if (( P_SRC_BELOW_FLOOR > 0 )); then
+    echo
+    echo "  (src<floor) = source video bitrate is below the ${TIER} floor"
+    echo "                ($(kbps_mbps "$SPLAN_FLOOR_KBPS") Mb/s); kept at the source bitrate, not reduced."
 fi
 
 for i in "${!FILES[@]}"; do
@@ -619,17 +596,17 @@ if (( ${#REF_NOTES[@]} )); then
 fi
 
 echo
-echo "Total runtime:        $TOTAL_HOURS hours"
-echo "Files:                ${FILE_COUNT}"
+echo "Season totals (${FILE_COUNT} files):"
+printf "  Total runtime:              %s hours (%s min)\n" \
+    "$(awk -v s="$P_TOTAL_SECONDS" 'BEGIN { printf "%.2f", s / 3600 }')" \
+    "$(awk -v s="$P_TOTAL_SECONDS" 'BEGIN { printf "%.0f", s / 60 }')"
+printf "  Expected total video size:  ~%s GiB\n" "$P_VIDEO_GIB"
+printf "  Expected total audio size:  ~%s GiB\n" "$P_AUDIO_GIB"
+printf "  Expected total output size: ~%s GiB  (incl. ~%s%% container/subtitles)\n" \
+    "$P_TOTAL_GIB" "$SERIES_CONTAINER_RESERVE_PCT"
 echo
-echo "Expected result:"
-printf "  Total:              ~%s GiB\n" "$P_TOTAL_GIB"
-printf "    Video:            ~%s GiB\n" "$P_VIDEO_GIB"
-printf "    Audio:            ~%s GiB\n" "$P_AUDIO_GIB"
-echo
-printf "  Average per file:   ~%s GiB\n" "$(per_file "$P_TOTAL_GIB")"
-printf "    Video:            ~%s GiB\n" "$(per_file "$P_VIDEO_GIB")"
-printf "    Audio:            ~%s GiB\n" "$(per_file "$P_AUDIO_GIB")"
+printf "  Average per file:           ~%s GiB (video ~%s, audio ~%s)\n" \
+    "$(per_file "$P_TOTAL_GIB")" "$(per_file "$P_VIDEO_GIB")" "$(per_file "$P_AUDIO_GIB")"
 echo
 
 # ============================================================

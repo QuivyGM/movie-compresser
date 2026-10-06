@@ -171,8 +171,8 @@ check "default compress.conf loads"           "load_policy 2>'$T/pol.err'"
     eq "movie Quality audio copied"       "$(movie_audio_cap_gib Quality)" 0
     eq "series Base AAC 5.1 from config"  "$(series_aac_kbps Base 6)" "$SERIES_BASE_AAC_KBPS_6"
     eq "series Custom uses High AAC"      "$(series_aac_kbps Custom 2)" "$SERIES_HIGH_AAC_KBPS_2"
-    eq "series reserve from config"       "$(series_media_kbps 10000)" \
-        "$(awk -v r="$SERIES_CONTAINER_RESERVE_PCT" 'BEGIN { printf "%.0f", 10000 * (100 - r) / 100 }')"
+    eq "series reserve from config"       "$(series_size_factor)" \
+        "$(awk -v r="$SERIES_CONTAINER_RESERVE_PCT" 'BEGIN { printf "%.6f", (100 - r) / 100 }')"
     eq "audio menu High 5.1 from config"  "$(audio_menu_high_kbps 6)" "$AUDIO_HIGH_KBPS_5TO6"
 }
 
@@ -375,7 +375,7 @@ conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the default config
     load_policy 2>/dev/null
     eq "edited AAC rates in audio args"   "$(build_audio_args 10000 "6 2" High)" "-c:a aac -b:a:0 500k -b:a:1 100k"
 
-    COMPRESS_CONF=$(conf_with series SERIES_BASE_TOTAL_GIB_PER_HOUR=2.5 SERIES_BASE_AAC_KBPS_6=300)
+    COMPRESS_CONF=$(conf_with series SERIES_BASE_VIDEO_GIB_PER_HOUR=2.5 SERIES_BASE_AAC_KBPS_6=300)
     load_policy 2>/dev/null
     eq "edited series GiB/hour"           "$(series_gib_per_hour Base)" 2.5
     eq "edited series AAC rate"           "$(series_aac_kbps Base 6)" 300
@@ -383,6 +383,141 @@ conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the default config
     COMPRESS_CONF=$(conf_with qaudio MOVIE_QUALITY_AUDIO_MODE=cap MOVIE_QUALITY_AUDIO_MAX_GIB=3)
     load_policy 2>/dev/null
     eq "Quality audio mode cap"           "$(movie_audio_cap_gib Quality)" 3
+}
+
+# ------------------------------------------------------------
+echo
+echo "== series policy: video GiB/hour, audio on top"
+{
+    # series_plan inputs (normally filled by series_compress.sh)
+    set_eps() {   # SOURCE_VIDEO_KBPS DURATION...
+        local src="$1" i=0 d
+        shift
+        EP_DUR=(); EP_VKBPS=(); EP_AKBPS=()
+        for d in "$@"; do
+            EP_DUR[$i]="$d"; EP_VKBPS[$i]="$src"; EP_AKBPS[$i]="5000 5000"
+            ((i += 1))
+        done
+    }
+    AUDIO_CHANNELS=(6 2)
+
+    for tier in High Base; do
+        u=${tier^^}
+        if [[ $tier == High ]]; then r=3.0 f=6 m=10 kb=7158 big=10 r2=4 fk=6000
+        else                         r=1.25 f=2.5 m=5 kb=2983 big=4 r2=2 fk=2500; fi
+        COMPRESS_CONF=$(conf_with "s$tier" SERIES_${u}_VIDEO_GIB_PER_HOUR=$r \
+            SERIES_${u}_VIDEO_FLOOR_MBPS=$f SERIES_${u}_VIDEO_MAX_MBPS=$m)
+        load_policy 2>/dev/null
+
+        # 1 GiB/hour -> fixed bitrate
+        set_eps 50000 3600
+        series_video_plan "$tier"
+        eq "series $tier: $r GiB/hour = $kb kb/s"   "$SPLAN_TARGET_KBPS" "$kb"
+        eq "series $tier: = gib_per_hour_to_kbps"   "$SPLAN_TARGET_KBPS" "$(gib_per_hour_to_kbps "$r")"
+        eq "series $tier: floor / max in kb/s"      "$SPLAN_FLOOR_KBPS/$SPLAN_MAX_KBPS" "$fk/$(_mbps_to_kbps "$m")"
+        eq "series $tier: no conflict, no max"      "$SPLAN_BELOW_FLOOR/$SPLAN_MAX_LIMITED" "0/0"
+
+        # 2 expected video sizes per runtime; bitrate does not depend on runtime
+        if [[ $tier == High ]]; then
+            mins=(30 45 60 90);             want=(1.50 2.25 3.00 4.50)
+        else
+            mins=(30 40 45 50 60 75 90);    want=(0.63 0.83 0.94 1.04 1.25 1.56 1.88)
+        fi
+        set_eps 50000 $(for x in "${mins[@]}"; do echo $((x * 60)); done)
+        series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+        for i in "${!mins[@]}"; do
+            eq "series $tier ${mins[$i]} min: ~${want[$i]} GiB video" "${P_EP_VGIB[$i]}" "${want[$i]}"
+        done
+        eq "series $tier: same bitrate every runtime" \
+            "$(printf '%s\n' "${P_EP_VKBPS[@]}" | sort -u)" "$kb"
+
+        # 3 audio does not reduce the video bitrate
+        AUDIO_CHANNELS=(8 6 2); EP_AKBPS[0]="5000 5000 5000"
+        series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+        many="${P_EP_VKBPS[0]}/$P_VIDEO_KBPS"
+        AUDIO_CHANNELS=(2); EP_AKBPS[0]="5000"
+        series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+        eq "series $tier: 3 audio tracks, same video" "$many" "${P_EP_VKBPS[0]}/$P_VIDEO_KBPS"
+        eq "series $tier: video kb/s ignores audio"   "$many" "$kb/$kb"
+
+        # 4 audio is added on top of the video size
+        AUDIO_CHANNELS=(6 2)
+        set_eps 50000 3600
+        series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+        a=$(( $(series_aac_kbps "$tier" 6) + $(series_aac_kbps "$tier" 2) ))
+        eq "series $tier: audio kb/s from tables"     "$P_AUDIO_KBPS" "$a"
+        eq "series $tier: audio size"                 "${P_EP_AGIB[0]}" \
+            "$(awk -v a="$a" 'BEGIN { printf "%.2f", a * 1000 * 3600 / 8 / 1073741824 }')"
+        eq "series $tier: video size unchanged"       "${P_EP_VGIB[0]}" "${want[$(( ${#want[@]} > 4 ? 4 : 2 ))]}"
+        eq "series $tier: total = video + audio (+reserve)" "${P_EP_GIB[0]}" \
+            "$(awk -v v="$kb" -v a="$a" -v f="$(series_size_factor)" 'BEGIN { printf "%.2f", (v + a) * 1000 * 3600 / 8 / 1073741824 / f }')"
+        eq "series $tier: season totals"              "$P_VIDEO_GIB/$P_AUDIO_GIB/$P_TOTAL_SECONDS" \
+            "${P_EP_VGIB[0]}/${P_EP_AGIB[0]}/3600.000"
+
+        # 5 source below the floor -> source bitrate, no conflict
+        half=$(( fk / 2 ))
+        set_eps "$half" 3600 3600
+        series_video_plan "$tier"
+        series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+        eq "series $tier src<floor: source bitrate"   "${P_EP_VKBPS[0]}/${P_EP_VNOTE[0]}" "$half/floor"
+        eq "series $tier src<floor: counted"          "$P_SRC_BELOW_FLOOR" 2
+        COMPRESS_CONF=$(conf_with "slow$tier" SERIES_${u}_VIDEO_GIB_PER_HOUR=0.1 \
+            SERIES_${u}_VIDEO_FLOOR_MBPS=$f SERIES_${u}_VIDEO_MAX_MBPS=$m)
+        load_policy 2>/dev/null
+        series_video_plan "$tier"
+        eq "series $tier src<floor, target<src: no conflict" "$SPLAN_BELOW_FLOOR" 0
+        series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+        eq "series $tier src<floor, target<src: source wins" "${P_EP_VKBPS[1]}" "$half"
+
+        # 6 source at/above the floor, GiB/hour bitrate below it -> conflict
+        set_eps "$fk" 3600
+        series_video_plan "$tier"
+        eq "series $tier src=floor, target<floor: conflict" "$SPLAN_BELOW_FLOOR" 1
+        set_eps 50000 3600
+        series_video_plan "$tier"
+        eq "series $tier src>floor, target<floor: conflict" "$SPLAN_BELOW_FLOOR" 1
+        eq "series $tier conflict: target not raised" "$SPLAN_TARGET_KBPS" "$(gib_per_hour_to_kbps 0.1)"
+        set_eps 50000 3600 3600; EP_VKBPS[1]="$half"
+        series_video_plan "$tier"
+        series_plan "$tier" "$SPLAN_FLOOR_KBPS" "$SPLAN_FLOOR_KBPS"
+        eq "series $tier mixed: floor chosen / low source kept" \
+            "$SPLAN_BELOW_FLOOR ${P_EP_VKBPS[0]} ${P_EP_VKBPS[1]}" "1 $fk $half"
+
+        # 7 max limits the fixed bitrate
+        COMPRESS_CONF=$(conf_with "smax$tier" SERIES_${u}_VIDEO_GIB_PER_HOUR=$big \
+            SERIES_${u}_VIDEO_FLOOR_MBPS=$f SERIES_${u}_VIDEO_MAX_MBPS=$m)
+        load_policy 2>/dev/null
+        set_eps 50000 3600
+        series_video_plan "$tier"
+        eq "series $tier max: capped"                "$SPLAN_TARGET_KBPS/$SPLAN_MAX_LIMITED" "$(_mbps_to_kbps "$m")/1"
+        series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+        eq "series $tier max: episodes at max"       "${P_EP_VKBPS[0]}" "$(_mbps_to_kbps "$m")"
+
+        # 8 changing the config changes bitrate and sizes
+        COMPRESS_CONF=$(conf_with "srate$tier" SERIES_${u}_VIDEO_GIB_PER_HOUR=$r2 \
+            SERIES_${u}_VIDEO_FLOOR_MBPS=$f SERIES_${u}_VIDEO_MAX_MBPS=0)
+        load_policy 2>/dev/null
+        series_video_plan "$tier"
+        series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+        eq "series $tier edited: bitrate"            "$SPLAN_TARGET_KBPS" "$(gib_per_hour_to_kbps "$r2")"
+        eq "series $tier edited: 60 min = $r2 GiB"   "${P_EP_VGIB[0]}" "$(awk -v r="$r2" 'BEGIN { printf "%.2f", r }')"
+    done
+
+    # 9 / 10 defaults: 60 min episode
+    COMPRESS_CONF="$T/compress.conf"
+    load_policy 2>/dev/null
+    AUDIO_CHANNELS=(6 2)
+    set_eps 50000 3600
+    series_video_plan High; series_plan High "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+    eq "series default High 60 min: ~3.00 GiB video" "${P_EP_VGIB[0]}" 3.00
+    series_video_plan Base; series_plan Base "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+    eq "series default Base 60 min: ~1.25 GiB video" "${P_EP_VGIB[0]}" 1.25
+
+    # Custom: entered GiB/hour, no floor / max, High audio
+    series_video_plan Custom 2
+    eq "series Custom 2 GiB/hour"                "$SPLAN_TARGET_KBPS/$SPLAN_FLOOR_KBPS/$SPLAN_MAX_KBPS" "$(gib_per_hour_to_kbps 2)/0/0"
+    unset -f set_eps
+    unset EP_DUR EP_VKBPS EP_AKBPS AUDIO_CHANNELS
 }
 COMPRESS_CONF="$T/compress.conf"
 
@@ -425,14 +560,24 @@ f=$(conf_with qunset); sed -i '/^MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=/d' "$f"
 reject_file "missing Quality GiB/hour" "MOVIE_QUALITY_VIDEO_GIB_PER_HOUR is not set" "$f"
 check "Quality floor 12 max 0 allowed" "( COMPRESS_CONF=\$(conf_with qok MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=0) load_policy )"
 reject "bad Base audio choice"    "is not a size greater than 0" 'MOVIE_BASE_AUDIO_MAX_GIB_CHOICES="1 none"'
-f=$(conf_with unset); sed -i '/^SERIES_MIN_VIDEO_KBPS=/d' "$f"
-reject_file "missing setting"     "SERIES_MIN_VIDEO_KBPS is not set" "$f"
+f=$(conf_with unset); sed -i '/^SERIES_CONTAINER_RESERVE_PCT=/d' "$f"
+reject_file "missing setting"     "SERIES_CONTAINER_RESERVE_PCT is not set" "$f"
+reject "zero series High GiB/hour" 'SERIES_HIGH_VIDEO_GIB_PER_HOUR="0": must be greater than 0' SERIES_HIGH_VIDEO_GIB_PER_HOUR=0
+reject "zero series Base GiB/hour" 'SERIES_BASE_VIDEO_GIB_PER_HOUR="0": must be greater than 0' SERIES_BASE_VIDEO_GIB_PER_HOUR=0
+reject "negative series floor"    'SERIES_HIGH_VIDEO_FLOOR_MBPS="-1": must not be negative' SERIES_HIGH_VIDEO_FLOOR_MBPS=-1
+reject "negative series max"      'SERIES_BASE_VIDEO_MAX_MBPS="-2": must not be negative' SERIES_BASE_VIDEO_MAX_MBPS=-2
+reject "series floor above max"   'SERIES_BASE_VIDEO_FLOOR_MBPS (6) is greater than SERIES_BASE_VIDEO_MAX_MBPS (5)' SERIES_BASE_VIDEO_FLOOR_MBPS=6
+check "series floor 6 max 0 allowed" "( COMPRESS_CONF=\$(conf_with sok SERIES_BASE_VIDEO_FLOOR_MBPS=6 SERIES_BASE_VIDEO_MAX_MBPS=0) load_policy )"
+for k in SERIES_HIGH_VIDEO_GIB_PER_HOUR SERIES_BASE_VIDEO_GIB_PER_HOUR SERIES_HIGH_VIDEO_FLOOR_MBPS SERIES_BASE_VIDEO_MAX_MBPS; do
+    f=$(conf_with "unset$k"); sed -i "/^$k=/d" "$f"
+    reject_file "missing $k" "$k is not set" "$f"
+done
 reject_file "missing file"        "Compression policy file not found" "$T/nope.conf"
 check "floor = 0 max = 0 allowed" "( COMPRESS_CONF=\$(conf_with zero MOVIE_HIGH_VIDEO_FLOOR_MBPS=0 MOVIE_HIGH_VIDEO_MAX_MBPS=0) load_policy )"
 check "no policy numbers left in movie menu" \
     "! grep -nE '(VIDEO_(FLOOR|PREFERRED|UPPER|MAX_GIB|TARGET_GIB))=[0-9]|AUDIO_CAP_GIB=[0-9]|echo (768|640|512|448|320|256|192|128|96|64)\$' '$SRC_WORK/movie_compress.sh'"
 check "no policy numbers left in series menu" \
-    "! grep -nE 'echo (768|640|384|320|256|192|128|96|64)\$|GIB_PER_HOUR=\"[0-9]|0\\.99|< 500' '$SRC_WORK/series_compress.sh'"
+    "! grep -nE 'echo (768|640|384|320|256|192|128|96|64)\$|GIB_PER_HOUR=\"?[0-9]|_KBPS=[0-9]|0\\.99|< 500|gib_per_hour_to_kbps' '$SRC_WORK/series_compress.sh'"
 check "no policy numbers left in audio menu" \
     "! grep -nE 'TRIGGER_KBPS=[0-9]|LIMIT_GIB=\"?[0-9]|echo (1280|1024|640|384|320|192|128|96)\$' '$ROOT/audio_compress_menu.sh'"
 
