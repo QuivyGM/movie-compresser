@@ -1,5 +1,23 @@
-.venv/
-__pycache__/
-*.pyc
-.pytest_cache/
-config.toml
+# ------------------------------------------------------------
+# Bash compression toolkit (deployed as ~/compress on Linux):
+# media and runtime/generated files
+# ------------------------------------------------------------
+in/*
+out/*
+!in/.gitkeep
+!out/.gitkeep
+
+# generated tmux job scripts and their runtime files
+work/c[0-9]*.sh
+work/a[0-9]*.sh
+work/series[0-9]*.sh
+work/*.state
+work/*.state.tmp
+work/*.progress
+work/*_passes/
+work/logs/
+
+# backups / logs
+work/*.bak
+work/*.bak2
+work/*.log
