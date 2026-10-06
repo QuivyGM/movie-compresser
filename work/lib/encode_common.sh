@@ -312,11 +312,6 @@ audio_transcoded_codecs() {
     return 0
 }
 
-# audio_transcoded_indices AUDIO_ARGS AUDIO_COUNT  ->  indexes only
-audio_transcoded_indices() {
-    audio_transcoded_codecs "$1" "$2" | cut -d' ' -f1
-}
-
 # encoder_codec ENCODER  ->  ffprobe codec name the encoder produces
 encoder_codec() {
     case "$1" in
@@ -527,36 +522,63 @@ audio_title_args() {
     return 0
 }
 
-# audio_title_notes FILE AUDIO_ARGS  ->  one line per renamed track
-audio_title_notes() {
-    local i old new
+# audio_object_kind CODEC PROFILE TITLE  ->  "Dolby Atmos" / "DTS:X" /
+# "" (object audio). ffmpeg names it in the profile; the track title is
+# a fallback for older ffmpeg (then " (per track title)" is appended).
+audio_object_kind() {
+    local codec="$1" profile="$2" title="${3,,}"
 
-    while IFS=$'\t' read -r i old new; do
-        [[ "$old" != "$new" ]] &&
-            echo "audio track $((i + 1)) title \"$old\" -> \"$new\" (codec/object-audio claims no longer true)"
-    done < <(audio_title_plan "$1" "$2")
-    return 0
+    if [[ "$profile" == *Atmos* ]]; then
+        echo "Dolby Atmos"
+    elif [[ "$profile" == *DTS:X* ]]; then
+        echo "DTS:X"
+    elif [[ "$codec" =~ ^(truehd|eac3)$ && "$title" == *atmos* ]]; then
+        echo "Dolby Atmos (per track title)"
+    elif [[ "$codec" == dts && "$title" == *dts:x* ]]; then
+        echo "DTS:X (per track title)"
+    fi
 }
 
-# audio_loss_notes FILE AUDIO_ARGS  ->  one warning line per re-encoded
-# track that carries object audio (Atmos / DTS:X).
-audio_loss_notes() {
-    local file="$1"
-    local -a rows
-    local i codec profile title
+# audio_track_label CODEC PROFILE LAYOUT CHANNELS  ->  "E-AC-3 5.1(side)"
+audio_track_label() {
+    local codec="$1" profile="$2" layout="$3" ch="$4" l
 
-    mapfile -t rows < <(stream_meta "$file" | awk -F'\t' '$2 == "audio"')
+    l=$(codec_title_label "$codec")
+    [[ "$codec" == dts && "$profile" == DTS-HD* ]] && l="${profile%% + *}"
+    if [[ -n "$layout" && "$layout" != "-" && "$layout" != "unknown" ]]; then
+        l+=" $layout"
+    elif [[ "$ch" =~ ^[0-9]+$ ]]; then
+        l+=" ${ch}ch"
+    fi
+    printf '%s' "$l"
+}
 
-    while read -r i; do
-        [[ -n "$i" && -n "${rows[$i]:-}" ]] || continue
-        IFS=$'\t' read -r _ _ codec profile _ _ _ _ _ _ _ _ _ title _ <<< "${rows[$i]}"
+# audio_copy_notes FILE [KBPS_LIST]  ->  one line per audio track of a
+# movie / series encode (all copied unchanged), e.g.
+#   Audio 1: E-AC-3 5.1(side) + Dolby Atmos, 768 kb/s, eng "English" - copied unchanged
+# then "Object audio: Dolby Atmos PRESERVED by stream copy" when present.
+# KBPS_LIST: source kb/s per audio track (stats_audio_kbps), optional.
+audio_copy_notes() {
+    local file="$1" i=0 codec profile ch layout lang title obj line
+    local -a kbps objs=()
 
-        if [[ "$profile" == *Atmos* || ( "$codec" =~ ^(truehd|eac3)$ && "${title,,}" == *atmos* ) ]]; then
-            echo "audio track $((i + 1)) ($codec, $profile): Dolby Atmos object metadata will be LOST by re-encoding"
-        elif [[ "$profile" == *DTS:X* || ( "$codec" == dts && "${title,,}" == *dts:x* ) ]]; then
-            echo "audio track $((i + 1)) ($codec, $profile): DTS:X object metadata will be LOST by re-encoding"
-        fi
-    done < <(audio_transcoded_indices "$2" "${#rows[@]}")
+    read -ra kbps <<< "${2:-}"
+
+    while IFS=$'\t' read -r _ _ codec profile ch layout _ _ _ _ _ _ lang title _; do
+        line="Audio $((i + 1)): $(audio_track_label "$codec" "$profile" "$layout" "$ch")"
+        obj=$(audio_object_kind "$codec" "$profile" "$title")
+        [[ -n "$obj" ]] && { line+=" + $obj"; objs+=("${obj%% (*}"); }
+        [[ "${kbps[$i]:-}" =~ ^[0-9]+$ ]] && line+=", $(awk -v k="${kbps[$i]}" 'BEGIN { if (k >= 1000) printf "%.1f Mb/s", k / 1000; else printf "%d kb/s", k }')"
+        [[ "$lang" != "-" ]] && line+=", $lang"
+        [[ "$title" != "-" ]] && line+=" \"$title\""
+        echo "$line - copied unchanged"
+        ((i += 1))
+    done < <(stream_meta "$file" | awk -F'\t' '$2 == "audio"')
+
+    if (( ${#objs[@]} )); then
+        echo "Object audio: $(printf '%s\n' "${objs[@]}" | sort -u | paste -sd/ -) PRESERVED by stream copy"
+    fi
+    return 0
 }
 
 # movtext_styling FILE STREAM_INDEX
@@ -894,12 +916,13 @@ emit_failed_item() {
     printf 'fi\n\n'
 }
 
-# emit_encode_item INDEX IN OUT TIER VIDEO_KBPS FILTER AUDIO_ARGS PASSLOG OVERWRITE
+# emit_encode_item INDEX IN OUT TIER VIDEO_KBPS FILTER PASSLOG OVERWRITE
 #
 # Two-pass libx265 encode of the main video stream; every other stream
-# is mapped explicitly (see build_stream_map). AUDIO_ARGS is a string
-# of shell-quoted ffmpeg tokens using audio-relative specifiers
-# (-c:a:N / -b:a:N); empty means all audio is copied.
+# is mapped explicitly (see build_stream_map). Every audio stream is
+# copied unchanged (-c:a copy; no tier-dependent audio arguments) and
+# verified afterwards (codec / layout / payload hash, see
+# item_verify_output). Pass 1 reads video only (-an -sn -dn).
 #
 # Dolby Vision / HDR10+ follow DV_POLICY / HDR10P_POLICY (set by
 # confirm_dynamic_range; see hdr_dovi.sh). Sources with Dolby Vision
@@ -912,11 +935,10 @@ emit_encode_item() {
     local tier="$4"
     local kbps="$5"
     local filter="$6"
-    local audio_args="$7"
-    local passlog="$8"
-    local overwrite="$9"
+    local passlog="$7"
+    local overwrite="$8"
 
-    local vidx x265 color dv="" stale="" titles="" i
+    local vidx x265 color dv="" stale=""
     local dv_policy="none" h10p_policy="none" dv_out_profile="" dv_out_compat=""
 
     vidx=$(main_video_index "$in")
@@ -978,11 +1000,9 @@ emit_encode_item() {
 
     [[ -n "$filter" ]] && vf="-filter:v:0 $(printf '%q' "$filter") "
 
-    # Stale statistics of re-encoded streams (refreshed after the mux).
+    # Stale statistics of the re-encoded video (refreshed after the mux;
+    # copied audio keeps correct statistics).
     stale=$(stale_stats_args v:0)
-    while read -r i; do
-        [[ -n "$i" ]] && stale+=$(stale_stats_args "a:$i")
-    done < <(audio_transcoded_indices "$audio_args" "$MAP_AUDIO_COUNT")
 
     local scaled=0
     [[ -n "$filter" ]] && scaled=1
@@ -991,11 +1011,12 @@ emit_encode_item() {
         "$( [[ "$dv_policy" == "preserve" ]] && echo "  (Dolby Vision profile ${HDR_DV_PROFILE} -> $DV_OUT preserved)")"
     printf 'if item_begin %q %q %q %q %q %q &&\n' \
         "$index" "$in" "$out" "$tier" "$overwrite" "$passlog"
-    printf '   item_expect vidx=%q dv=%q dv_profile=%q dv_compat=%q hdr10p=%q scaled=%q copyts=%q atrans=%q &&\n' \
+    # atrans= (empty): no audio track is transcoded; ahash=1: the copied
+    # audio payload is hash-compared with the source.
+    printf '   item_expect vidx=%q dv=%q dv_profile=%q dv_compat=%q hdr10p=%q scaled=%q copyts=%q atrans= ahash=1 &&\n' \
         "$vidx" "$( (( HDR_DV == 1 )) && echo "$dv_policy" || echo none)" \
         "$dv_out_profile" "$dv_out_compat" "$h10p_policy" "$scaled" \
-        "$( [[ "$dv_policy" == "preserve" ]] && echo 1 || echo 0)" \
-        "$(audio_transcoded_indices "$audio_args" "$MAP_AUDIO_COUNT" | paste -sd, -)"
+        "$( [[ "$dv_policy" == "preserve" ]] && echo 1 || echo 0)"
 
     if [[ "$dv_policy" == "preserve" ]]; then
         printf '   item_step rpu item_dv_extract %q %q %q &&\n' "$in" "$vidx" "$DV_MODE"
@@ -1029,22 +1050,18 @@ emit_encode_item() {
 
         printf '   item_run mux ffmpeg -y -copyts -i %q -i "$ITEM_TMP/video_dv.mkv" \\\n' "$in"
         printf '      -map 1:0 %s\\\n' "$MAP_OTHER_ARGS"
-        printf '      -c copy %s\\\n' "$MAP_CODEC_ARGS"
+        printf '      -c copy %s-c:a copy \\\n' "$MAP_CODEC_ARGS"
         printf '      %s\\\n' "$(source_video_tag_args "$in" "$vidx")"
     else
         printf '   item_run 2/2 ffmpeg -y -i %q \\\n' "$in"
         printf '      %s\\\n' "$MAP_ARGS"
-        printf '      -c copy %s\\\n' "$MAP_CODEC_ARGS"
+        printf '      -c copy %s-c:a copy \\\n' "$MAP_CODEC_ARGS"
         [[ -n "$vf" ]] && printf '      %s\\\n' "$vf"
         printf '      -c:v:0 libx265 -preset slow -b:v:0 %sk -pix_fmt:v:0 yuv420p10le %s\\\n' "$kbps" "$dv"
         printf '      -x265-params:v:0 %s %s\\\n' "$p2q" "$color"
     fi
 
-    [[ -n "$audio_args" ]] && printf '      %s \\\n' "$audio_args"
     [[ -n "$MAP_META_ARGS" ]] && printf '      %s\\\n' "$MAP_META_ARGS"
-    # after MAP_META_ARGS: the later -metadata option wins
-    titles=$(audio_title_args "$in" "$audio_args")
-    [[ -n "$titles" ]] && printf '      %s\\\n' "$titles"
     printf '      %s\\\n' "$stale"
     printf '      -map_metadata 0 -map_chapters 0 -max_muxing_queue_size 4096 %s\\\n' "$(matroska_mux_args)"
     emit_part_and_covers "$in"

@@ -14,12 +14,13 @@ source "$WORK_DIR/lib/encode_common.sh"
 source "$WORK_DIR/lib/hdr_dovi.sh"
 source "$WORK_DIR/lib/policy.sh"
 
-declare -a INPUTS OUTPUTS BITRATES FILTERS TIERS AUDIO_ARGS OVERWRITES
+declare -a INPUTS OUTPUTS BITRATES FILTERS TIERS OVERWRITES
 declare -a DV_POLICIES DV_MODES HDR10P_POLICIES
 
 # Compression policy: ~/compress/work/lib/compress.conf (loaded and validated
 # by work/lib/policy.sh). The policy math lives there as well
-# (movie_video_plan, build_audio_args).
+# (movie_video_plan). Audio is always copied unchanged; audio
+# compression is only done by audio_compress_menu.sh.
 if ! load_policy; then
     exit 1
 fi
@@ -33,6 +34,8 @@ for t in Quality High Base; do
     echo
     movie_video_policy_lines "$t"
 done
+echo
+audio_copy_policy_lines
 
 while true; do
 
@@ -86,9 +89,11 @@ while true; do
     SOURCE_TOTAL_BYTES=$(file_bytes "$IN")
 
     # Stored MKV statistics when they pass the checks, otherwise one
-    # packet scan (media_stats.sh: stats_load).
-    STATS_PROGRESS=1 stats_load "$IN" "$DURATION" exact
+    # packet scan, after which the MKV statistics are refreshed for the
+    # next run (media_stats.sh: stats_load).
+    STATS_PROGRESS=1 stats_load "$IN" "$DURATION" exact refresh
     read -r SOURCE_VIDEO_BYTES SOURCE_AUDIO_BYTES _ _ <<< "$(stats_totals "$VIDX")"
+    SOURCE_AUDIO_KBPS=$(stats_audio_kbps)
 
     SOURCE_VIDEO_MBPS=$(bytes_to_mbps "$SOURCE_VIDEO_BYTES" "$DURATION")
     SOURCE_VIDEO_GIB=$(bytes_to_gib "$SOURCE_VIDEO_BYTES")
@@ -127,6 +132,8 @@ while true; do
     echo "Values from:  ${STATS_SOURCE}"
     [[ -n "$STATS_REJECTED" ]] &&
         echo "              (stored statistics rejected: ${STATS_REJECTED})"
+    [[ -n "$STATS_REFRESH" ]] &&
+        echo "              ($(stats_refresh_note))"
 
     probe_hdr "$IN" "$VIDX"
 
@@ -287,68 +294,16 @@ while true; do
     )
 
     # ========================================================
-    # AUDIO
+    # AUDIO: every track copied unchanged (size = actual source audio)
     # ========================================================
-
-    AUDIO_MODE="copy"
-    AUDIO_CAP_GIB=$(movie_audio_cap_gib "$TIER")
-    AUDIO_FFMPEG_ARGS="-c:a copy"
-    EXPECTED_AUDIO_GIB="$SOURCE_AUDIO_GIB"
-
-    if [[ "$TIER" == "Base" ]]; then
-        read -ra BASE_CHOICES <<< "$MOVIE_BASE_AUDIO_MAX_GIB_CHOICES"
-
-        echo
-        echo "Base audio target:"
-        for i in "${!BASE_CHOICES[@]}"; do
-            echo "$((i + 1))) ${BASE_CHOICES[$i]} GiB"
-        done
-
-        while true; do
-            read -rp "Select [1-${#BASE_CHOICES[@]}]: " ac
-
-            if [[ "$ac" =~ ^[0-9]+$ ]] && (( ac >= 1 && ac <= ${#BASE_CHOICES[@]} )); then
-                AUDIO_CAP_GIB="${BASE_CHOICES[$((ac - 1))]}"
-                break
-            fi
-
-            echo "Invalid selection."
-        done
-    fi
-
-    # 0 = no audio limit: copied unchanged
-    TOO_BIG=$(
-        awk -v s="$SOURCE_AUDIO_GIB" -v c="$AUDIO_CAP_GIB" \
-            'BEGIN {print (c > 0 && s > c) ? 1 : 0}'
-    )
-
-    if (( TOO_BIG == 1 )); then
-
-        AUDIO_MODE="aac"
-
-        AUDIO_BUDGET=$(
-            audio_kbps_for_gib \
-                "$AUDIO_CAP_GIB" \
-                "$DURATION"
-        )
-
-        AUDIO_FFMPEG_ARGS=$(
-            build_audio_args \
-                "$AUDIO_BUDGET" \
-                "$AUDIO_CHANNELS" \
-                "$TIER"
-        )
-
-        EXPECTED_AUDIO_GIB="$AUDIO_CAP_GIB"
-    fi
 
     EXPECTED_TOTAL_GIB=$(
         awk \
             -v v="$EXPECTED_VIDEO_GIB" \
-            -v a="$EXPECTED_AUDIO_GIB" \
-            -v o="$OTHER_GIB" '
+            -v a="$SOURCE_AUDIO_BYTES" \
+            -v o="$OTHER_BYTES" '
             BEGIN {
-                printf "%.3f",v+a+o
+                printf "%.3f", v + (a + o) / 1073741824
             }'
     )
 
@@ -379,7 +334,6 @@ while true; do
     BITRATES+=("$TARGET_KBPS")
     FILTERS+=("$FILTER")
     TIERS+=("$TIER")
-    AUDIO_ARGS+=("$AUDIO_FFMPEG_ARGS")
     OVERWRITES+=("$RESOLVED_OVERWRITE")
     DV_POLICIES+=("$DV_POLICY")
     DV_MODES+=("$DV_MODE")
@@ -431,15 +385,12 @@ while true; do
     printf "                     (%s)
 " "$(policy_conf_path)"
 
-    if [[ "$AUDIO_MODE" == "copy" ]]; then
-        printf "  Audio size:        ~%s GiB -> copied unchanged\n" \
-            "$SOURCE_AUDIO_GIB"
-    else
-        printf "  Audio size:        ~%s -> <=%s GiB\n" \
-            "$SOURCE_AUDIO_GIB" \
-            "$AUDIO_CAP_GIB"
-        echo "  Audio codec:       AAC (all tracks retained)"
-    fi
+    printf "  Audio size:        ~%s GiB copied unchanged (%s track(s), actual source audio)\n" \
+        "$SOURCE_AUDIO_GIB" "$AUDIO_TRACKS"
+
+    while IFS= read -r note; do
+        [[ -n "$note" ]] && printf "                     %s\n" "$note"
+    done < <(audio_copy_notes "$IN" "$SOURCE_AUDIO_KBPS")
 
     printf "  Other streams:     ~%s GiB copied\n" \
         "$OTHER_GIB"
@@ -457,14 +408,6 @@ while true; do
     if [[ "$DV_POLICY" == "preserve" ]] && (( DOWNSCALED == 1 )); then
         echo "  Dolby Vision:      L5 active-area offsets rescaled to ${OUT_WIDTH}x${OUT_HEIGHT}"
     fi
-
-    while IFS= read -r note; do
-        [[ -n "$note" ]] && printf "  WARNING:           %s\n" "$note"
-    done < <(audio_loss_notes "$IN" "$AUDIO_FFMPEG_ARGS")
-
-    while IFS= read -r note; do
-        [[ -n "$note" ]] && printf "  Audio title:       %s\n" "$note"
-    done < <(audio_title_notes "$IN" "$AUDIO_FFMPEG_ARGS")
 
     while IFS= read -r note; do
         [[ -n "$note" ]] && printf "  Chapters:          %s\n" "${note#chapters: }"
@@ -519,7 +462,6 @@ mkdir -p "$PASS_DIR"
             "${TIERS[$i]}" \
             "${BITRATES[$i]}" \
             "${FILTERS[$i]}" \
-            "${AUDIO_ARGS[$i]}" \
             "$PASS_DIR/pass_$i" \
             "${OVERWRITES[$i]}"
     done

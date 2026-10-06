@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Compression policy: loads and validates compress.conf and holds the
-# policy math that uses it (movie video targets, AAC rate tables, series
-# / audio-menu rates). Sourced, not executed. Needs bitrate.sh.
+# policy math that uses it (movie / series video targets, audio-menu
+# rates). Sourced, not executed. Needs bitrate.sh.
+#
+# Movie and series compression copy every audio track unchanged; audio
+# compression is only done by audio_compress_menu.sh (AUDIO_* settings).
 #
 # The config is ~/compress/work/lib/compress.conf; COMPRESS_CONF
 # overrides the path (tests). There are no built-in fallback values:
@@ -12,16 +15,7 @@ POLICY_KEYS_POSITIVE=(
     MOVIE_QUALITY_VIDEO_GIB_PER_HOUR MOVIE_QUALITY_VIDEO_MIN_GIB
     MOVIE_HIGH_VIDEO_GIB_PER_HOUR
     MOVIE_BASE_VIDEO_GIB_PER_HOUR
-    MOVIE_HIGH_AAC_KBPS_7PLUS MOVIE_HIGH_AAC_KBPS_6 MOVIE_HIGH_AAC_KBPS_3TO5
-    MOVIE_HIGH_AAC_KBPS_2 MOVIE_HIGH_AAC_KBPS_1
-    MOVIE_BASE_AAC_KBPS_7PLUS MOVIE_BASE_AAC_KBPS_6 MOVIE_BASE_AAC_KBPS_3TO5
-    MOVIE_BASE_AAC_KBPS_2 MOVIE_BASE_AAC_KBPS_1
-    MOVIE_AAC_MIN_KBPS
     SERIES_HIGH_VIDEO_GIB_PER_HOUR SERIES_BASE_VIDEO_GIB_PER_HOUR
-    SERIES_HIGH_AAC_KBPS_7PLUS SERIES_HIGH_AAC_KBPS_6 SERIES_HIGH_AAC_KBPS_3TO5
-    SERIES_HIGH_AAC_KBPS_2 SERIES_HIGH_AAC_KBPS_1
-    SERIES_BASE_AAC_KBPS_7PLUS SERIES_BASE_AAC_KBPS_6 SERIES_BASE_AAC_KBPS_3TO5
-    SERIES_BASE_AAC_KBPS_2 SERIES_BASE_AAC_KBPS_1
     AUDIO_HIGH_TRIGGER_KBPS AUDIO_COMPACT_TRIGGER_GIB AUDIO_COMPACT_LIMIT_GIB
     AUDIO_HIGH_KBPS_1 AUDIO_HIGH_KBPS_2 AUDIO_HIGH_KBPS_3TO4
     AUDIO_HIGH_KBPS_5TO6 AUDIO_HIGH_KBPS_7PLUS
@@ -32,11 +26,27 @@ POLICY_KEYS_POSITIVE=(
 # 0 allowed (0 = "no ceiling" / "no limit")
 POLICY_KEYS_NONNEG=(
     MOVIE_QUALITY_VIDEO_FLOOR_MBPS MOVIE_QUALITY_VIDEO_MAX_MBPS
-    MOVIE_QUALITY_AUDIO_MAX_GIB
-    MOVIE_HIGH_VIDEO_FLOOR_MBPS MOVIE_HIGH_VIDEO_MAX_MBPS MOVIE_HIGH_AUDIO_MAX_GIB
+    MOVIE_HIGH_VIDEO_FLOOR_MBPS MOVIE_HIGH_VIDEO_MAX_MBPS
     MOVIE_BASE_VIDEO_FLOOR_MBPS MOVIE_BASE_VIDEO_MAX_MBPS
     SERIES_HIGH_VIDEO_FLOOR_MBPS SERIES_HIGH_VIDEO_MAX_MBPS
     SERIES_BASE_VIDEO_FLOOR_MBPS SERIES_BASE_VIDEO_MAX_MBPS
+)
+
+# Settings of the former movie / series audio policy. Audio is now always
+# copied by those menus; a config that still sets them gets a note.
+POLICY_KEYS_RETIRED=(
+    MOVIE_QUALITY_AUDIO_MODE MOVIE_QUALITY_AUDIO_MAX_GIB MOVIE_HIGH_AUDIO_MAX_GIB
+    MOVIE_BASE_AUDIO_MAX_GIB_CHOICES MOVIE_AAC_MIN_KBPS
+    MOVIE_HIGH_AAC_KBPS_7PLUS MOVIE_HIGH_AAC_KBPS_6 MOVIE_HIGH_AAC_KBPS_3TO5
+    MOVIE_HIGH_AAC_KBPS_2 MOVIE_HIGH_AAC_KBPS_1
+    MOVIE_BASE_AAC_KBPS_7PLUS MOVIE_BASE_AAC_KBPS_6 MOVIE_BASE_AAC_KBPS_3TO5
+    MOVIE_BASE_AAC_KBPS_2 MOVIE_BASE_AAC_KBPS_1
+    SERIES_HIGH_AAC_KBPS_7PLUS SERIES_HIGH_AAC_KBPS_6 SERIES_HIGH_AAC_KBPS_3TO5
+    SERIES_HIGH_AAC_KBPS_2 SERIES_HIGH_AAC_KBPS_1
+    SERIES_BASE_AAC_KBPS_7PLUS SERIES_BASE_AAC_KBPS_6 SERIES_BASE_AAC_KBPS_3TO5
+    SERIES_BASE_AAC_KBPS_2 SERIES_BASE_AAC_KBPS_1
+    SERIES_TOTAL_GIB_PER_HOUR SERIES_HIGH_TOTAL_GIB_PER_HOUR SERIES_BASE_TOTAL_GIB_PER_HOUR
+    SERIES_MIN_VIDEO_KBPS
 )
 
 policy_conf_path() {
@@ -83,28 +93,6 @@ validate_policy() {
         fi
     done
 
-    m="${MOVIE_QUALITY_AUDIO_MODE-}"
-    case "$m" in
-        copy) ;;
-        cap)
-            if _policy_is_num "${MOVIE_QUALITY_AUDIO_MAX_GIB:-}" &&
-               awk -v x="$MOVIE_QUALITY_AUDIO_MAX_GIB" 'BEGIN { exit !(x <= 0) }'; then
-                errs+=("MOVIE_QUALITY_AUDIO_MODE=\"cap\" needs MOVIE_QUALITY_AUDIO_MAX_GIB greater than 0")
-            fi
-            ;;
-        *)  errs+=("MOVIE_QUALITY_AUDIO_MODE=\"$m\": must be \"copy\" or \"cap\"") ;;
-    esac
-
-    if [[ -z "${MOVIE_BASE_AUDIO_MAX_GIB_CHOICES-}" ]]; then
-        errs+=("MOVIE_BASE_AUDIO_MAX_GIB_CHOICES is not set")
-    else
-        for v in $MOVIE_BASE_AUDIO_MAX_GIB_CHOICES; do
-            if ! _policy_is_num "$v" || awk -v x="$v" 'BEGIN { exit !(x <= 0) }'; then
-                errs+=("MOVIE_BASE_AUDIO_MAX_GIB_CHOICES: \"$v\" is not a size greater than 0")
-            fi
-        done
-    fi
-
     if _policy_is_num "${SERIES_CONTAINER_RESERVE_PCT:-}"; then
         if awk -v x="$SERIES_CONTAINER_RESERVE_PCT" 'BEGIN { exit !(x >= 100) }'; then
             errs+=("SERIES_CONTAINER_RESERVE_PCT=\"$SERIES_CONTAINER_RESERVE_PCT\": must be below 100")
@@ -145,8 +133,7 @@ load_policy() {
     # Start clean: a setting missing from the file must not survive from
     # an earlier load (or from the environment).
     unset "${POLICY_KEYS_POSITIVE[@]}" "${POLICY_KEYS_NONNEG[@]}" \
-        MOVIE_QUALITY_AUDIO_MODE MOVIE_BASE_AUDIO_MAX_GIB_CHOICES \
-        SERIES_CONTAINER_RESERVE_PCT
+        "${POLICY_KEYS_RETIRED[@]}" SERIES_CONTAINER_RESERVE_PCT
 
     # shellcheck source=/dev/null
     if ! source "$conf"; then
@@ -154,7 +141,26 @@ load_policy() {
         return 1
     fi
 
+    policy_retired_note
     validate_policy
+}
+
+# policy_retired_note  ->  note on stderr when the config still sets
+# former movie / series audio settings (they have no effect any more)
+policy_retired_note() {
+    local k set=()
+
+    for k in "${POLICY_KEYS_RETIRED[@]}"; do
+        [[ -n "${!k+x}" ]] && set+=("$k")
+    done
+
+    if (( ${#set[@]} )); then
+        echo "Note: $(policy_conf_path) still sets former movie/series audio settings," >&2
+        echo "      which are ignored (movie/series audio is always copied; audio" >&2
+        echo "      compression uses the AUDIO_* settings of audio_compress_menu.sh):" >&2
+        printf '        %s\n' "${set[@]}" >&2
+    fi
+    return 0
 }
 
 # ------------------------------------------------------------
@@ -244,7 +250,12 @@ movie_video_plan() {
     fi
 
     PLAN_TARGET_GIB="$gib"
-    PLAN_SIZE_MBPS=$(bitrate_for_gib "$gib" "$dur")
+    if (( PLAN_SOURCE_LIMITED == 1 )); then
+        # exact bytes, not the 0.001 GiB rounded size (small sources)
+        PLAN_SIZE_MBPS="$PLAN_SOURCE_MBPS"
+    else
+        PLAN_SIZE_MBPS=$(bitrate_for_gib "$gib" "$dur")
+    fi
     t="$PLAN_SIZE_MBPS"
 
     if awk -v m="$max" -v x="$t" 'BEGIN { exit !(m > 0 && x > m) }'; then
@@ -273,93 +284,14 @@ movie_video_plan() {
     PLAN_MAX_MBPS="$max"
 }
 
-# movie_audio_cap_gib TIER  ->  audio limit of the tier (0 = copy).
-# Base has a menu choice instead (MOVIE_BASE_AUDIO_MAX_GIB_CHOICES).
-movie_audio_cap_gib() {
-    case "$1" in
-        Quality) [[ "$MOVIE_QUALITY_AUDIO_MODE" == "cap" ]] && echo "$MOVIE_QUALITY_AUDIO_MAX_GIB" || echo 0 ;;
-        High)    echo "$MOVIE_HIGH_AUDIO_MAX_GIB" ;;
-        *)       echo 0 ;;
-    esac
-}
-
-# _aac_by_channels PREFIX CHANNELS  ->  PREFIX_{7PLUS,6,3TO5,2,1}
-_aac_by_channels() {
-    local ch="$2" k
-
-    [[ "$ch" =~ ^[0-9]+$ ]] || ch=2
-
-    if (( ch >= 7 )); then k="${1}_7PLUS"
-    elif (( ch == 6 )); then k="${1}_6"
-    elif (( ch >= 3 )); then k="${1}_3TO5"
-    elif (( ch == 2 )); then k="${1}_2"
-    else k="${1}_1"; fi
-
-    echo "${!k}"
-}
-
-# movie_aac_kbps TIER CHANNELS  (High rates for High and Quality)
-movie_aac_kbps() {
-    case "$1" in
-        Base) _aac_by_channels MOVIE_BASE_AAC_KBPS "$2" ;;
-        *)    _aac_by_channels MOVIE_HIGH_AAC_KBPS "$2" ;;
-    esac
-}
-
-# build_audio_args BUDGET_KBPS "CH CH ..." TIER  ->  ffmpeg audio args
-# (all tracks AAC; scaled down proportionally when over the budget)
-build_audio_args() {
-    local budget="$1"
-    local channels_string="$2"
-    local tier="$3"
-    local -a channels recommendations=()
-    local ch kbps total=0 i
-
-    read -ra channels <<< "$channels_string"
-
-    if (( ${#channels[@]} == 0 )); then
-        echo "-c:a copy"
-        return
-    fi
-
-    for ch in "${channels[@]}"; do
-        kbps=$(movie_aac_kbps "$tier" "$ch")
-        recommendations+=("$kbps")
-        total=$((total + kbps))
-    done
-
-    local args="-c:a aac"
-
-    if (( total <= budget )); then
-        for i in "${!recommendations[@]}"; do
-            args+=" -b:a:${i} ${recommendations[$i]}k"
-        done
-    else
-        for i in "${!recommendations[@]}"; do
-            kbps=$(awk -v r="${recommendations[$i]}" -v t="$total" -v b="$budget" \
-                -v m="$MOVIE_AAC_MIN_KBPS" 'BEGIN {
-                    x = int(r / t * b)
-                    if (x < m) x = m
-                    printf "%d", x
-                }')
-            args+=" -b:a:${i} ${kbps}k"
-        done
-    fi
-
-    echo "$args"
-}
-
 # movie_policy_line TIER  ->  one-line description of the effective values
 movie_policy_line() {
-    local cap
-
     case "$1" in
         Quality)
             printf 'quality-first [%s GiB/hour video, at least %s GiB / %s Mb/s floor / %s]' \
                 "$MOVIE_QUALITY_VIDEO_GIB_PER_HOUR" "$MOVIE_QUALITY_VIDEO_MIN_GIB" \
                 "$MOVIE_QUALITY_VIDEO_FLOOR_MBPS" \
                 "$(awk -v m="$MOVIE_QUALITY_VIDEO_MAX_MBPS" 'BEGIN { print (m > 0) ? m " Mb/s max" : "no bitrate max" }')"
-            cap=$(movie_audio_cap_gib Quality)
             ;;
         High|Base)
             local u="${1^^}"
@@ -368,17 +300,17 @@ movie_policy_line() {
                 "$( [[ "$1" == High ]] && echo efficiency-first || echo size-first)" \
                 "${!gk}" "${!fk}" \
                 "$(awk -v m="${!mk}" 'BEGIN { print (m > 0) ? m " Mb/s max" : "no bitrate max" }')"
-            cap=$(movie_audio_cap_gib "$1")
             ;;
     esac
 
-    if [[ "$1" == "Base" ]]; then
-        printf '; audio <= one of: %s GiB' "${MOVIE_BASE_AUDIO_MAX_GIB_CHOICES// / \/ }"
-    elif awk -v c="$cap" 'BEGIN { exit !(c > 0) }'; then
-        printf '; audio <= %s GiB' "$cap"
-    else
-        printf '; audio copied'
-    fi
+    printf '; audio copied'
+}
+
+# audio_copy_policy_lines  ->  the audio rule of the movie / series menus
+audio_copy_policy_lines() {
+    echo "Audio:"
+    echo "  all tracks copied unchanged"
+    echo "  use audio_compress_menu.sh for optional audio compression"
 }
 
 # movie_video_policy_lines TIER  ->  the tier's video settings, one per line
@@ -398,7 +330,7 @@ movie_video_policy_lines() {
 # Series
 #
 # One fixed video bitrate for every episode, from a video-only size per
-# hour of runtime (audio is added on top, never taken from it):
+# hour of runtime (audio is copied unchanged and added on top):
 #   fixed = kb/s of SERIES_<TIER>_VIDEO_GIB_PER_HOUR
 #   fixed = min(fixed, SERIES_<TIER>_VIDEO_MAX_MBPS)   (0 = no max)
 # Per episode (never above the source):
@@ -511,64 +443,46 @@ series_episode_video_kbps() {
     echo "$fixed -"
 }
 
-# series_aac_kbps TIER CHANNELS  (High rates for High and Custom)
-series_aac_kbps() {
-    case "$1" in
-        High|Custom) _aac_by_channels SERIES_HIGH_AAC_KBPS "$2" ;;
-        *)           _aac_by_channels SERIES_BASE_AAC_KBPS "$2" ;;
-    esac
-}
-
 # series_size_factor  ->  1 - reserve, for size estimates
 series_size_factor() {
     awk -v r="$SERIES_CONTAINER_RESERVE_PCT" 'BEGIN { printf "%.6f", (100 - r) / 100 }'
 }
 
-# series_plan TIER FIXED_VIDEO_KBPS FLOOR_KBPS
+# series_plan FIXED_VIDEO_KBPS FLOOR_KBPS
 #
-# Reads EP_DUR, EP_VKBPS, EP_AKBPS (source audio kb/s per track,
-# space separated) and AUDIO_CHANNELS.
+# Reads EP_DUR, EP_VKBPS and EP_ABYTES (bytes of all source audio of the
+# episode, copied unchanged; "N/A" -> estimated from EP_AKBPS, the source
+# audio kb/s per track).
 #
 # Sets:
 #   P_VIDEO_KBPS        the fixed video bitrate
-#   P_AUDIO_KBPS        fixed audio total (all tracks re-encoded)
 #   P_EP_VKBPS[i]       video kb/s per episode
 #   P_EP_VNOTE[i]       "-", "src" or "floor" (see series_episode_video_kbps)
-#   P_EP_AARGS[i]       shell-quoted audio args per episode
-#   P_EP_ADESC[i]       short audio description per episode
+#   P_EP_AKBPS[i]       copied audio kb/s of the episode (all tracks)
 #   P_EP_VGIB[i] P_EP_AGIB[i] P_EP_GIB[i]   expected video / audio / total
 #   P_CAPPED            episodes at their source bitrate (below fixed)
 #   P_SRC_BELOW_FLOOR   episodes kept at a source bitrate below the floor
-#   P_COPIED            audio tracks copied (all episodes)
 #   P_TOTAL_SECONDS
 #   P_VIDEO_GIB P_AUDIO_GIB P_TOTAL_GIB     totals
-# Total sizes add SERIES_CONTAINER_RESERVE_PCT for container/subtitles.
+# Audio is on top of the video size; total sizes add
+# SERIES_CONTAINER_RESERVE_PCT for container/subtitles.
 series_plan() {
-    local tier="$1" fixed="$2" floor="$3"
-    local i t rate src v note a_kbps tokens desc f
-    local -a src_rates
+    local fixed="$1" floor="$2"
+    local i v note ab f
 
     f=$(series_size_factor)
 
     P_VIDEO_KBPS="$fixed"
-    P_AUDIO_KBPS=0
-    for t in "${!AUDIO_CHANNELS[@]}"; do
-        rate=$(series_aac_kbps "$tier" "${AUDIO_CHANNELS[$t]}")
-        P_AUDIO_KBPS=$((P_AUDIO_KBPS + rate))
-    done
-
     P_CAPPED=0
     P_SRC_BELOW_FLOOR=0
-    P_COPIED=0
     P_EP_VKBPS=()
     P_EP_VNOTE=()
-    P_EP_AARGS=()
-    P_EP_ADESC=()
+    P_EP_AKBPS=()
     P_EP_VGIB=()
     P_EP_AGIB=()
     P_EP_GIB=()
 
-    local video_kb_total=0 audio_kb_total=0 seconds=0
+    local video_bytes=0 audio_bytes=0 seconds=0
 
     for i in "${!EP_DUR[@]}"; do
         read -r v note <<< "$(series_episode_video_kbps "$fixed" "${EP_VKBPS[$i]:-N/A}" "$floor")"
@@ -580,46 +494,29 @@ series_plan() {
         P_EP_VKBPS[$i]="$v"
         P_EP_VNOTE[$i]="$note"
 
-        read -ra src_rates <<< "${EP_AKBPS[$i]:-}"
-        tokens=""
-        desc=""
-        a_kbps=0
+        ab="${EP_ABYTES[$i]:-N/A}"
+        if [[ ! "$ab" =~ ^[0-9]+$ ]]; then
+            ab=$(awk -v l="${EP_AKBPS[$i]:-}" -v s="${EP_DUR[$i]}" 'BEGIN {
+                n = split(l, k, " "); for (j = 1; j <= n; j++) if (k[j] ~ /^[0-9]+$/) t += k[j]
+                printf "%.0f", t * 1000 / 8 * s }')
+        fi
 
-        for t in "${!AUDIO_CHANNELS[@]}"; do
-            rate=$(series_aac_kbps "$tier" "${AUDIO_CHANNELS[$t]}")
-            src="${src_rates[$t]:-N/A}"
+        read -r P_EP_AKBPS[$i] P_EP_VGIB[$i] P_EP_AGIB[$i] P_EP_GIB[$i] < <(
+            awk -v v="$v" -v a="$ab" -v s="${EP_DUR[$i]}" -v f="$f" 'BEGIN {
+                vb = v * 1000 / 8 * s; G = 1073741824
+                printf "%.0f %.2f %.2f %.2f\n", (s > 0 ? a * 8 / s / 1000 : 0), vb / G, a / G, (vb + a) / G / f }')
 
-            if [[ "$src" =~ ^[0-9]+$ ]] && (( src > 0 && src <= rate )); then
-                # Already at or below the target: no lossy re-encode.
-                a_kbps=$((a_kbps + src))
-                desc+="copy "
-                ((P_COPIED += 1))
-            else
-                tokens+=$(printf '%q ' "-c:a:$t" aac "-b:a:$t" "${rate}k")
-                a_kbps=$((a_kbps + rate))
-                desc+="${rate}k "
-            fi
-        done
-
-        P_EP_AARGS[$i]="${tokens% }"
-        P_EP_ADESC[$i]="${desc% }"
-
-        read -r P_EP_VGIB[$i] P_EP_AGIB[$i] P_EP_GIB[$i] < <(
-            awk -v v="$v" -v a="$a_kbps" -v s="${EP_DUR[$i]}" -v f="$f" 'BEGIN {
-                g = 1000 * s / 8 / 1073741824
-                printf "%.2f %.2f %.2f\n", v * g, a * g, (v + a) * g / f }')
-
-        read -r video_kb_total audio_kb_total seconds < <(
-            awk -v vt="$video_kb_total" -v at="$audio_kb_total" -v st="$seconds" \
-                -v v="$v" -v a="$a_kbps" -v s="${EP_DUR[$i]}" \
-                'BEGIN { printf "%.0f %.0f %.3f\n", vt + v * s, at + a * s, st + s }')
+        read -r video_bytes audio_bytes seconds < <(
+            awk -v vt="$video_bytes" -v at="$audio_bytes" -v st="$seconds" \
+                -v v="$v" -v a="$ab" -v s="${EP_DUR[$i]}" \
+                'BEGIN { printf "%.0f %.0f %.3f\n", vt + v * 1000 / 8 * s, at + a, st + s }')
     done
 
     P_TOTAL_SECONDS="$seconds"
     read -r P_VIDEO_GIB P_AUDIO_GIB P_TOTAL_GIB < <(
-        awk -v v="$video_kb_total" -v a="$audio_kb_total" -v f="$f" 'BEGIN {
-            g = 1000 / 8 / 1073741824
-            printf "%.2f %.2f %.2f\n", v * g, a * g, (v + a) * g / f }')
+        awk -v v="$video_bytes" -v a="$audio_bytes" -v f="$f" 'BEGIN {
+            G = 1073741824
+            printf "%.2f %.2f %.2f\n", v / G, a / G, (v + a) / G / f }')
 }
 
 # ------------------------------------------------------------

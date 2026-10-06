@@ -8,8 +8,8 @@
 #     codec names, bitrates, commentary text kept)
 #  3. SDR source, audio copied: plain two-pass job (no DV steps); tracks,
 #     flags, languages, titles (unchanged), chapters, attachments kept
-#  4. HDR10 source, audio -> AAC: HDR10 metadata kept; transcoded audio
-#     titles rewritten and verified
+#  4. HDR10 source: HDR10 metadata kept; all audio copied unchanged and
+#     verified (codec / layout / payload hash)
 #  5. MP4 source with styled mov_text: conversion + styling loss reported
 #  6. needs mkvtoolnix: ordered chapters / 2 editions / nesting / hidden
 #     / multi-language names / segment reference restored and verified
@@ -18,6 +18,11 @@
 #  8. stream statistics: stored MKV tags used when valid, rejected when
 #     missing / incomplete / inconsistent / stale, packet scan fallback;
 #     verify.sh Validate + update (needs mkvtoolnix)
+#  9. refresh after a fallback scan: one scan, MKV statistics rewritten
+#     for the next run (never for symlinks, read-only or non-MKV files,
+#     or sources a running compression job is reading)
+# 10. movie / series menus copy every audio track (all tiers, Custom);
+#     only audio_compress_menu.sh converts audio
 #
 # Runs in a temporary copy of work/ so real logs/jobs are untouched.
 # Everything here is synthetic: it proves the mechanics, not behaviour
@@ -168,12 +173,15 @@ check "default compress.conf loads"           "load_policy 2>'$T/pol.err'"
     movie_video_plan Quality 5400
     eq "movie Quality 90 min not below floor" "$PLAN_BELOW_FLOOR" 0
 
-    eq "movie High AAC 5.1 from config"   "$(movie_aac_kbps High 6)" "$MOVIE_HIGH_AAC_KBPS_6"
-    eq "movie Base AAC stereo from config" "$(movie_aac_kbps Base 2)" "$MOVIE_BASE_AAC_KBPS_2"
-    eq "movie High audio cap from config" "$(movie_audio_cap_gib High)" "$MOVIE_HIGH_AUDIO_MAX_GIB"
-    eq "movie Quality audio copied"       "$(movie_audio_cap_gib Quality)" 0
-    eq "series Base AAC 5.1 from config"  "$(series_aac_kbps Base 6)" "$SERIES_BASE_AAC_KBPS_6"
-    eq "series Custom uses High AAC"      "$(series_aac_kbps Custom 2)" "$SERIES_HIGH_AAC_KBPS_2"
+    for tier in Quality High Base; do
+        check "movie $tier policy: audio copied" "[[ \"\$(movie_policy_line $tier)\" == *'; audio copied' ]]"
+    done
+    check "no movie/series audio policy functions left" \
+        "! declare -F movie_aac_kbps movie_audio_cap_gib build_audio_args series_aac_kbps >/dev/null"
+    check "no movie/series AAC settings in the config" \
+        "! grep -qE '^(MOVIE|SERIES)_[A-Z_]*(AAC|AUDIO)' '$SRC_WORK/lib/compress.conf'"
+    check "audio menu settings still in the config" \
+        "grep -q '^AUDIO_HIGH_KBPS_5TO6=' '$SRC_WORK/lib/compress.conf' && grep -q '^AUDIO_COMPACT_LIMIT_GIB=' '$SRC_WORK/lib/compress.conf'"
     eq "series reserve from config"       "$(series_size_factor)" \
         "$(awk -v r="$SERIES_CONTAINER_RESERVE_PCT" 'BEGIN { printf "%.6f", (100 - r) / 100 }')"
     eq "audio menu High 5.1 from config"  "$(audio_menu_high_kbps 6)" "$AUDIO_HIGH_KBPS_5TO6"
@@ -374,35 +382,33 @@ conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the default config
     eq "Q6 edited GiB/hour: 12 * 3 h"     "$PLAN_TARGET_GIB" 36.000
     eq "Q6 edited GiB/hour: bitrate"      "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 36 10800)"
 
-    COMPRESS_CONF=$(conf_with aac MOVIE_HIGH_AAC_KBPS_6=500 MOVIE_HIGH_AAC_KBPS_2=100)
-    load_policy 2>/dev/null
-    eq "edited AAC rates in audio args"   "$(build_audio_args 10000 "6 2" High)" "-c:a aac -b:a:0 500k -b:a:1 100k"
-
-    COMPRESS_CONF=$(conf_with series SERIES_BASE_VIDEO_GIB_PER_HOUR=2.5 SERIES_BASE_AAC_KBPS_6=300)
+    COMPRESS_CONF=$(conf_with series SERIES_BASE_VIDEO_GIB_PER_HOUR=2.5)
     load_policy 2>/dev/null
     eq "edited series GiB/hour"           "$(series_gib_per_hour Base)" 2.5
-    eq "edited series AAC rate"           "$(series_aac_kbps Base 6)" 300
 
-    COMPRESS_CONF=$(conf_with qaudio MOVIE_QUALITY_AUDIO_MODE=cap MOVIE_QUALITY_AUDIO_MAX_GIB=3)
-    load_policy 2>/dev/null
-    eq "Quality audio mode cap"           "$(movie_audio_cap_gib Quality)" 3
+    # a config still setting the former audio policy loads, with a note
+    COMPRESS_CONF=$(conf_with retired MOVIE_HIGH_AUDIO_MAX_GIB=2 SERIES_HIGH_AAC_KBPS_6=640)
+    check "retired audio settings: still loads"   "load_policy 2>'$T/retired.err'"
+    check "retired audio settings: named as ignored" \
+        "grep -q 'ignored' '$T/retired.err' && grep -q MOVIE_HIGH_AUDIO_MAX_GIB '$T/retired.err' && grep -q SERIES_HIGH_AAC_KBPS_6 '$T/retired.err'"
 }
 
 # ------------------------------------------------------------
 echo
-echo "== series policy: video GiB/hour, audio on top"
+echo "== series policy: video GiB/hour, copied audio on top"
 {
     # series_plan inputs (normally filled by series_compress.sh)
     set_eps() {   # SOURCE_VIDEO_KBPS DURATION...
         local src="$1" i=0 d
         shift
-        EP_DUR=(); EP_VKBPS=(); EP_AKBPS=()
+        EP_DUR=(); EP_VKBPS=(); EP_AKBPS=(); EP_ABYTES=()
         for d in "$@"; do
-            EP_DUR[$i]="$d"; EP_VKBPS[$i]="$src"; EP_AKBPS[$i]="5000 5000"
+            # copied source audio: 768 + 192 kb/s (E-AC-3 5.1 + stereo)
+            EP_DUR[$i]="$d"; EP_VKBPS[$i]="$src"; EP_AKBPS[$i]="768 192"
+            EP_ABYTES[$i]=$(awk -v d="$d" 'BEGIN { printf "%.0f", 960 * 1000 / 8 * d }')
             ((i += 1))
         done
     }
-    AUDIO_CHANNELS=(6 2)
 
     for tier in High Base; do
         u=${tier^^}
@@ -427,41 +433,42 @@ echo "== series policy: video GiB/hour, audio on top"
             mins=(30 40 45 50 60 75 90);    want=(0.63 0.83 0.94 1.04 1.25 1.56 1.88)
         fi
         set_eps 50000 $(for x in "${mins[@]}"; do echo $((x * 60)); done)
-        series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
         for i in "${!mins[@]}"; do
             eq "series $tier ${mins[$i]} min: ~${want[$i]} GiB video" "${P_EP_VGIB[$i]}" "${want[$i]}"
         done
         eq "series $tier: same bitrate every runtime" \
             "$(printf '%s\n' "${P_EP_VKBPS[@]}" | sort -u)" "$kb"
 
-        # 3 audio does not reduce the video bitrate
-        AUDIO_CHANNELS=(8 6 2); EP_AKBPS[0]="5000 5000 5000"
-        series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
-        many="${P_EP_VKBPS[0]}/$P_VIDEO_KBPS"
-        AUDIO_CHANNELS=(2); EP_AKBPS[0]="5000"
-        series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
-        eq "series $tier: 3 audio tracks, same video" "$many" "${P_EP_VKBPS[0]}/$P_VIDEO_KBPS"
-        eq "series $tier: video kb/s ignores audio"   "$many" "$kb/$kb"
+        # 3 copied audio does not reduce the video bitrate (13)
+        EP_ABYTES[0]=$(( 40 * 1073741824 )); EP_AKBPS[0]="18000 18000 18000"
+        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+        many="${P_EP_VKBPS[0]}/$P_VIDEO_KBPS/${P_EP_VGIB[0]}"
+        EP_ABYTES[0]=1000; EP_AKBPS[0]="64"
+        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+        eq "series $tier: huge vs tiny audio, same video" "$many" "${P_EP_VKBPS[0]}/$P_VIDEO_KBPS/${P_EP_VGIB[0]}"
+        eq "series $tier: video kb/s ignores audio"   "${many%%/*}" "$kb"
 
-        # 4 audio is added on top of the video size
-        AUDIO_CHANNELS=(6 2)
+        # 4 / 12 copied audio: actual source bytes on top of the video size
         set_eps 50000 3600
-        series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
-        a=$(( $(series_aac_kbps "$tier" 6) + $(series_aac_kbps "$tier" 2) ))
-        eq "series $tier: audio kb/s from tables"     "$P_AUDIO_KBPS" "$a"
-        eq "series $tier: audio size"                 "${P_EP_AGIB[0]}" \
-            "$(awk -v a="$a" 'BEGIN { printf "%.2f", a * 1000 * 3600 / 8 / 1073741824 }')"
+        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+        ab=$(awk 'BEGIN { printf "%.0f", 960 * 1000 / 8 * 3600 }')
+        eq "series $tier: audio size = source bytes"  "${P_EP_AGIB[0]}" "$(awk -v a="$ab" 'BEGIN { printf "%.2f", a / 1073741824 }')"
+        eq "series $tier: copied audio kb/s shown"    "${P_EP_AKBPS[0]}" 960
         eq "series $tier: video size unchanged"       "${P_EP_VGIB[0]}" "${want[$(( ${#want[@]} > 4 ? 4 : 2 ))]}"
         eq "series $tier: total = video + audio (+reserve)" "${P_EP_GIB[0]}" \
-            "$(awk -v v="$kb" -v a="$a" -v f="$(series_size_factor)" 'BEGIN { printf "%.2f", (v + a) * 1000 * 3600 / 8 / 1073741824 / f }')"
+            "$(awk -v v="$kb" -v a="$ab" -v f="$(series_size_factor)" 'BEGIN { printf "%.2f", (v * 1000 / 8 * 3600 + a) / 1073741824 / f }')"
         eq "series $tier: season totals"              "$P_VIDEO_GIB/$P_AUDIO_GIB/$P_TOTAL_SECONDS" \
             "${P_EP_VGIB[0]}/${P_EP_AGIB[0]}/3600.000"
+        EP_ABYTES[0]=N/A
+        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+        eq "series $tier: no bytes -> from source kb/s" "${P_EP_AGIB[0]}" "$(awk 'BEGIN { printf "%.2f", 960 * 1000 / 8 * 3600 / 1073741824 }')"
 
         # 5 source below the floor -> source bitrate, no conflict
         half=$(( fk / 2 ))
         set_eps "$half" 3600 3600
         series_video_plan "$tier"
-        series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
         eq "series $tier src<floor: source bitrate"   "${P_EP_VKBPS[0]}/${P_EP_VNOTE[0]}" "$half/floor"
         eq "series $tier src<floor: counted"          "$P_SRC_BELOW_FLOOR" 2
         COMPRESS_CONF=$(conf_with "slow$tier" SERIES_${u}_VIDEO_GIB_PER_HOUR=0.1 \
@@ -469,7 +476,7 @@ echo "== series policy: video GiB/hour, audio on top"
         load_policy 2>/dev/null
         series_video_plan "$tier"
         eq "series $tier src<floor, target<src: no conflict" "$SPLAN_BELOW_FLOOR" 0
-        series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
         eq "series $tier src<floor, target<src: source wins" "${P_EP_VKBPS[1]}" "$half"
 
         # 6 source at/above the floor, GiB/hour bitrate below it -> conflict
@@ -482,7 +489,7 @@ echo "== series policy: video GiB/hour, audio on top"
         eq "series $tier conflict: target not raised" "$SPLAN_TARGET_KBPS" "$(gib_per_hour_to_kbps 0.1)"
         set_eps 50000 3600 3600; EP_VKBPS[1]="$half"
         series_video_plan "$tier"
-        series_plan "$tier" "$SPLAN_FLOOR_KBPS" "$SPLAN_FLOOR_KBPS"
+        series_plan "$SPLAN_FLOOR_KBPS" "$SPLAN_FLOOR_KBPS"
         eq "series $tier mixed: floor chosen / low source kept" \
             "$SPLAN_BELOW_FLOOR ${P_EP_VKBPS[0]} ${P_EP_VKBPS[1]}" "1 $fk $half"
 
@@ -493,7 +500,7 @@ echo "== series policy: video GiB/hour, audio on top"
         set_eps 50000 3600
         series_video_plan "$tier"
         eq "series $tier max: capped"                "$SPLAN_TARGET_KBPS/$SPLAN_MAX_LIMITED" "$(_mbps_to_kbps "$m")/1"
-        series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
         eq "series $tier max: episodes at max"       "${P_EP_VKBPS[0]}" "$(_mbps_to_kbps "$m")"
 
         # 8 changing the config changes bitrate and sizes
@@ -501,7 +508,7 @@ echo "== series policy: video GiB/hour, audio on top"
             SERIES_${u}_VIDEO_FLOOR_MBPS=$f SERIES_${u}_VIDEO_MAX_MBPS=0)
         load_policy 2>/dev/null
         series_video_plan "$tier"
-        series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
         eq "series $tier edited: bitrate"            "$SPLAN_TARGET_KBPS" "$(gib_per_hour_to_kbps "$r2")"
         eq "series $tier edited: 60 min = $r2 GiB"   "${P_EP_VGIB[0]}" "$(awk -v r="$r2" 'BEGIN { printf "%.2f", r }')"
     done
@@ -509,18 +516,17 @@ echo "== series policy: video GiB/hour, audio on top"
     # 9 / 10 defaults: 60 min episode
     COMPRESS_CONF="$T/compress.conf"
     load_policy 2>/dev/null
-    AUDIO_CHANNELS=(6 2)
     set_eps 50000 3600
-    series_video_plan High; series_plan High "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+    series_video_plan High; series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
     eq "series default High 60 min: ~3.00 GiB video" "${P_EP_VGIB[0]}" 3.00
-    series_video_plan Base; series_plan Base "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+    series_video_plan Base; series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
     eq "series default Base 60 min: ~1.25 GiB video" "${P_EP_VGIB[0]}" 1.25
 
     # Custom: entered GiB/hour, no floor / max, High audio
     series_video_plan Custom 2
     eq "series Custom 2 GiB/hour"                "$SPLAN_TARGET_KBPS/$SPLAN_FLOOR_KBPS/$SPLAN_MAX_KBPS" "$(gib_per_hour_to_kbps 2)/0/0"
     unset -f set_eps
-    unset EP_DUR EP_VKBPS EP_AKBPS AUDIO_CHANNELS
+    unset EP_DUR EP_VKBPS EP_AKBPS EP_ABYTES
 }
 COMPRESS_CONF="$T/compress.conf"
 
@@ -552,8 +558,7 @@ for k in MOVIE_HIGH_VIDEO_GIB_PER_HOUR MOVIE_BASE_VIDEO_GIB_PER_HOUR MOVIE_HIGH_
     f=$(conf_with "unset$k"); sed -i "/^$k=/d" "$f"
     reject_file "missing $k" "$k is not set" "$f"
 done
-reject "decimal kb/s"             "whole number of kb/s"     SERIES_HIGH_AAC_KBPS_6=640.5
-reject "bad audio mode"           "must be \"copy\" or \"cap\"" MOVIE_QUALITY_AUDIO_MODE=lossless
+reject "decimal kb/s"             "whole number of kb/s"     AUDIO_HIGH_KBPS_5TO6=640.5
 reject "zero Quality GiB/hour"    'MOVIE_QUALITY_VIDEO_GIB_PER_HOUR="0": must be greater than 0' MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=0
 reject "zero Quality minimum"     'MOVIE_QUALITY_VIDEO_MIN_GIB="0": must be greater than 0' MOVIE_QUALITY_VIDEO_MIN_GIB=0
 reject "negative Quality floor"   'MOVIE_QUALITY_VIDEO_FLOOR_MBPS="-1": must not be negative' MOVIE_QUALITY_VIDEO_FLOOR_MBPS=-1
@@ -562,7 +567,6 @@ reject "Quality floor above max"  'MOVIE_QUALITY_VIDEO_FLOOR_MBPS (12) is greate
 f=$(conf_with qunset); sed -i '/^MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=/d' "$f"
 reject_file "missing Quality GiB/hour" "MOVIE_QUALITY_VIDEO_GIB_PER_HOUR is not set" "$f"
 check "Quality floor 12 max 0 allowed" "( COMPRESS_CONF=\$(conf_with qok MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=0) load_policy )"
-reject "bad Base audio choice"    "is not a size greater than 0" 'MOVIE_BASE_AUDIO_MAX_GIB_CHOICES="1 none"'
 f=$(conf_with unset); sed -i '/^SERIES_CONTAINER_RESERVE_PCT=/d' "$f"
 reject_file "missing setting"     "SERIES_CONTAINER_RESERVE_PCT is not set" "$f"
 reject "zero series High GiB/hour" 'SERIES_HIGH_VIDEO_GIB_PER_HOUR="0": must be greater than 0' SERIES_HIGH_VIDEO_GIB_PER_HOUR=0
@@ -683,15 +687,15 @@ ffmpeg -v error -y -f lavfi -i "testsrc2=s=1280x720:r=24000/1001:d=2,format=yuv4
 mux_source "$T/hdr10.mkv" "$T/in/HDR10.mkv"
 
 # ------------------------------------------------------------
-# run_item NAME INPUT FILTER AUDIO_ARGS [OVERWRITE]  ->  job script + output + log
+# run_item NAME INPUT FILTER [OVERWRITE]  ->  job script + output + log
 run_item() {
-    local name="$1" in="$2" filter="$3" audio="$4" overwrite="${5:-0}"
+    local name="$1" in="$2" filter="$3" overwrite="${4:-0}"
     local job="$WORK_DIR/$name.sh"
 
     mkdir -p "$WORK_DIR/${name}_passes"
     {
         emit_job_header "$name" movie 1
-        emit_encode_item 1 "$in" "$T/out/$name.mkv" Test 1500 "$filter" "$audio" \
+        emit_encode_item 1 "$in" "$T/out/$name.mkv" Test 1500 "$filter" \
             "$WORK_DIR/${name}_passes/pass_0" "$overwrite"
         emit_job_footer
     } > "$job"
@@ -726,6 +730,9 @@ common_checks() {
     check "$n: global title MATCH"             "report_has $n 'Global title: +MATCH'"
     check "$n: stream order MATCH"             "report_has $n 'Stream order: +MATCH'"
     check "$n: no RESULT failure"              "! report_has $n 'RESULT: FAILED'"
+    check "$n: audio 1 COPIED, payload MATCH"  "report_has $n 'Audio track 1: +COPIED \\(AC-3 5.1.* 48000 Hz, payload MD5 MATCH\\)'"
+    check "$n: audio 2 COPIED, payload MATCH"  "report_has $n 'Audio track 2: +COPIED \\(AC-3 stereo, 48000 Hz, payload MD5 MATCH\\)'"
+    check "$n: commentary track kept"          "[[ \$(ffprobe -v error -select_streams a:1 -show_entries stream_disposition=comment -of default=nw=1:nk=1 '$T/out/$n.mkv') == 1 ]]"
     check "$n: stale source video BPS not copied" \
         "[[ \$(ffprobe -v error -select_streams v:0 -show_entries stream_tags=BPS -of default=nw=1:nk=1 '$T/out/$n.mkv') != 99999999 ]]"
 }
@@ -740,6 +747,9 @@ nondv_job_checks() {
     check "$n: metadata + chapters mapped"     "grep -q -- '-map_metadata 0 -map_chapters 0' '$job'"
     check "$n: chapter restore step"           "grep -q 'item_step chapters item_restore_mkv_chapters' '$job'"
     check "$n: video stats stripped"           "grep -q -- '-metadata:s:v:0 BPS=' '$job'"
+    check "$n: audio copied (-c:a copy)"       "grep -q -- '-c:a copy' '$job'"
+    check "$n: no audio encoder arguments"     "! grep -qE -- '-c:a:[0-9]|-b:a|aac|eac3|libopus|-ac |-ar ' '$job'"
+    check "$n: pass 1 without audio"           "grep -q -- '-an -sn -dn -f null' '$job'"
     check "$n: final mux to .part"             "grep -q '\"\$ITEM_PART\"' '$job'"
 }
 
@@ -747,7 +757,7 @@ nondv_job_checks() {
 echo
 echo "== SDR (audio copied)"
 DV_POLICY=none; DV_MODE=""; HDR10P_POLICY=none
-run_item sdr "$T/in/SDR.mkv" "" ""
+run_item sdr "$T/in/SDR.mkv" ""
 nondv_job_checks sdr
 common_checks sdr
 check "sdr: HDR type SDR"                      "report_has sdr 'HDR type: +SDR\$'"
@@ -765,30 +775,30 @@ printf 'keep me\n' > "$T/ostore/dir/inside.txt"
 OSUM=$(md5sum < "$T/ostore/target.mkv")
 
 ln -s "$T/ostore/target.mkv" "$T/out/osv.mkv"           # valid  + overwrite
-run_item osv "$T/in/SDR.mkv" "" "" 1
+run_item osv "$T/in/SDR.mkv" "" 1
 check "valid + overwrite: job ok"             "grep -q 'All encodes finished: 1 ok, 0 failed' '$T/osv.log'"
 check "valid + overwrite: link replaced"      "[[ -f '$T/out/osv.mkv' && ! -L '$T/out/osv.mkv' ]]"
 check "valid + overwrite: says so"            "grep -q 'Replacing the symlink osv.mkv (its target is not modified)' '$T/osv.log'"
 eq    "valid + overwrite: target unchanged"   "$(md5sum < "$T/ostore/target.mkv")" "$OSUM"
 
 ln -s "$T/ostore/gone.mkv" "$T/out/osb.mkv"             # broken + overwrite
-run_item osb "$T/in/SDR.mkv" "" "" 1
+run_item osb "$T/in/SDR.mkv" "" 1
 check "broken + overwrite: job ok"            "grep -q 'All encodes finished: 1 ok, 0 failed' '$T/osb.log'"
 check "broken + overwrite: link replaced"     "[[ -f '$T/out/osb.mkv' && ! -L '$T/out/osb.mkv' ]]"
 check "broken + overwrite: nothing created at the old link target" "[[ ! -e '$T/ostore/gone.mkv' ]]"
 
 ln -s "$T/ostore/target.mkv" "$T/out/osk.mkv"           # valid, no overwrite
-run_item osk "$T/in/SDR.mkv" "" "" 0
+run_item osk "$T/in/SDR.mkv" "" 0
 check "valid, keep both: saved as (2)"        "[[ -f '$T/out/osk (2).mkv' && -L '$T/out/osk.mkv' ]]"
 eq    "valid, keep both: target unchanged"    "$(md5sum < "$T/ostore/target.mkv")" "$OSUM"
 
 ln -s "$T/ostore/dir" "$T/out/osd.mkv"                  # symlink to a directory
-run_item osd "$T/in/SDR.mkv" "" "" 1
+run_item osd "$T/in/SDR.mkv" "" 1
 check "dir symlink + overwrite: link replaced, dir untouched" \
     "[[ -f '$T/out/osd.mkv' && ! -L '$T/out/osd.mkv' && \$(ls '$T/ostore/dir') == inside.txt ]]"
 
 ln -s "$T/ostore/target.mkv" "$T/out/osp.mkv.part"      # .part is a symlink
-run_item osp "$T/in/SDR.mkv" "" "" 0
+run_item osp "$T/in/SDR.mkv" "" 0
 check "part symlink: item refused"            "grep -q 'osp.mkv.part is a symlink; refusing to write through it' '$T/osp.log'"
 eq    "part symlink: target unchanged"        "$(md5sum < "$T/ostore/target.mkv")" "$OSUM"
 
@@ -798,7 +808,7 @@ mkdir -p "$T/store"
 cp "$T/in/SDR.mkv" "$T/store/Linked.mkv"
 ln -s "$T/store/Linked.mkv" "$T/in/Linked.mkv"
 sum_before=$(md5sum < "$T/store/Linked.mkv")
-run_item lnk "$T/in/Linked.mkv" "" ""
+run_item lnk "$T/in/Linked.mkv" ""
 check "lnk: job reported success"              "grep -q 'All encodes finished: 1 ok, 0 failed' '$T/lnk.log'"
 check "lnk: chapters + attachments MATCH"      "report_has lnk 'Chapters: +MATCH' && report_has lnk 'Attachments: +MATCH'"
 check "lnk: source is still a symlink"         "[[ -L '$T/in/Linked.mkv' ]]"
@@ -999,23 +1009,388 @@ fi
 stream_packet_bytes() { _real_stream_packet_bytes "$@"; }
 
 echo
-echo "== HDR10 (audio -> AAC)"
-run_item hdr10 "$T/in/HDR10.mkv" "" "-c:a aac -b:a:0 384k -b:a:1 96k"
+echo "== stream statistics: refresh after a fallback scan"
+RF="$T/refresh"
+mkdir -p "$RF/store" "$RF/bdir" "$RF/series"
+stream_packet_bytes() { echo scan >> "$ST/scans"; _real_stream_packet_bytes "$@"; }
+
+# mkvpropedit stand-ins: count calls, then run the real one / fail
+cat > "$RF/mkvpe" <<'EOF'
+#!/usr/bin/env bash
+echo "$1" >> "$(dirname "$0")/calls"
+exec mkvpropedit "$@"
+EOF
+cat > "$RF/mkvpe_fail" <<'EOF'
+#!/usr/bin/env bash
+echo "$1" >> "$(dirname "$0")/calls"
+exit 1
+EOF
+# refreshes correctly, then rewrites the first audio track's statistics
+# with a self-consistent but wrong byte count
+cat > "$RF/mkvpe_wrong" <<'EOF'
+#!/usr/bin/env bash
+echo "$1" >> "$(dirname "$0")/calls"
+mkvpropedit "$@" || exit 1
+f="$1"
+get() { ffprobe -v error -select_streams a:0 -show_entries "stream_tags=$1" -of default=nw=1:nk=1 "$f"; }
+b=$(( $(get NUMBER_OF_BYTES) + 4000 )); dt=$(get DURATION)
+bps=$(awk -v b="$b" -v t="$dt" 'BEGIN { split(t, a, ":"); printf "%.0f", b * 8 / (a[1] * 3600 + a[2] * 60 + a[3]) }')
+x="$(dirname "$0")/wrong.xml"
+printf '<?xml version="1.0"?><Tags><Tag><Targets><TargetTypeValue>50</TargetTypeValue></Targets>%s%s%s</Tag></Tags>\n' \
+    "<Simple><Name>BPS</Name><String>$bps</String></Simple>" \
+    "<Simple><Name>DURATION</Name><String>$dt</String></Simple>" \
+    "<Simple><Name>NUMBER_OF_BYTES</Name><String>$b</String></Simple>" > "$x"
+mkvpropedit -q "$f" --tags "track:a1:$x"
+EOF
+chmod +x "$RF"/mkvpe*
+
+counts() { echo "$(grep -c . "$ST/scans" 2>/dev/null || true)/$(grep -c . "$RF/calls" 2>/dev/null || true)"; }
+# run_load FILE [MODE] [MKVPROPEDIT]  ->  stats_load ... refresh; progress in $RF/out
+run_load() {
+    : > "$ST/scans"; : > "$RF/calls"
+    STATS_MKVPROPEDIT="${3:-$RF/mkvpe}" STATS_PROGRESS=1 \
+        stats_load "$1" "" "${2:-exact}" refresh > "$RF/out" 2>&1
+}
+said() { grep -qF -- "$1" "$RF/out"; }
+streams_md5() { ffmpeg -v error -i "$1" -map 0 -c copy -f streamhash -hash md5 - 2>/dev/null; }
+
+# R1 valid statistics: no scan, no mkvpropedit, file untouched
+cp "$ST/valid.mkv" "$RF/r1.mkv"; m=$(md5sum < "$RF/r1.mkv")
+run_load "$RF/r1.mkv"
+eq    "refresh 1: valid -> 0 scans / 0 mkvpropedit"  "$(counts)" "0/0"
+eq    "refresh 1: tags used, nothing attempted"       "$STATS_KIND/$STATS_REFRESH" "tags/"
+eq    "refresh 1: file untouched"                     "$(md5sum < "$RF/r1.mkv")" "$m"
+
+if (( HAVE_MKV == 1 )); then
+    # R2 missing statistics: one scan, refreshed, re-read matches; next run reads tags
+    remux "$ST/raw.mkv" "$RF/r2.mkv" -metadata title=Movie -metadata:s:2 title=Main -metadata:s:2 language=eng
+    before_streams=$(streams_md5 "$RF/r2.mkv")
+    before_meta=$(ffprobe -v error -show_entries stream=index,codec_type,codec_name:stream_tags=title,language:format_tags=title -show_chapters -of compact "$RF/r2.mkv")
+    run_load "$RF/r2.mkv"
+    scan_totals=$(stats_totals 0)
+    eq    "refresh 2: missing -> 1 scan / 1 mkvpropedit"  "$(counts)" "1/1"
+    eq    "refresh 2: this run uses the scan"             "$STATS_KIND/$STATS_REFRESH" "packets/refreshed"
+    check "refresh 2: progress lines"                     "said 'Packet scan complete.' && said 'Refreshing MKV statistics...' && said 'MKV statistics updated.' && said 'Metadata-first re-read: MATCH'"
+    eq    "refresh 2: audio/video data unchanged"         "$(streams_md5 "$RF/r2.mkv")" "$before_streams"
+    eq    "refresh 2: titles/languages/chapters unchanged" \
+        "$(ffprobe -v error -show_entries stream=index,codec_type,codec_name:stream_tags=title,language:format_tags=title -show_chapters -of compact "$RF/r2.mkv")" "$before_meta"
+    run_load "$RF/r2.mkv"
+    eq    "refresh 2: second run 0 scans / 0 mkvpropedit" "$(counts)" "0/0"
+    eq    "refresh 2: second run from tags, same values"  "$STATS_KIND $(stats_totals 0)" "tags $scan_totals"
+
+    # R3 stale statistics: rejected, one scan, refreshed; next run reads tags
+    cp "$ST/reenc.mkv" "$RF/r3.mkv"
+    run_load "$RF/r3.mkv"
+    eq    "refresh 3: stale -> 1 scan / 1 mkvpropedit"    "$(counts)" "1/1"
+    check "refresh 3: rejected as stale, refreshed"       "[[ '$STATS_REJECTED' == *stale* && '$STATS_REFRESH' == refreshed ]]"
+    eq    "refresh 3: this run uses the scan"             "$(stats_field 0 bytes)" "$(pk "$RF/r3.mkv" 0)"
+    run_load "$RF/r3.mkv"
+    eq    "refresh 3: second run 0 scans, tags"           "$(counts) $STATS_KIND" "0/0 tags"
+    eq    "refresh 3: tags now = real stream size"        "$(stats_field 0 bytes)" "$(pk "$RF/r3.mkv" 0)"
+else
+    SKIPPED+=("refresh 2/3/10/11: real MKV statistics refresh (needs mkvtoolnix)")
+fi
+
+# R4 mkvpropedit missing: scan used, refresh skipped, file untouched
+cp "$ST/raw.mkv" "$RF/r4.mkv"; m=$(md5sum < "$RF/r4.mkv")
+run_load "$RF/r4.mkv" exact "no-such-mkvpropedit-$$"
+eq    "refresh 4: no mkvpropedit -> scan ok"          "$STATS_KIND $(stats_field 0 bytes)" "packets $(pk "$RF/r4.mkv" 0)"
+eq    "refresh 4: skipped cleanly"                    "$STATS_REFRESH" "skipped: mkvpropedit not found"
+check "refresh 4: message"                            "said 'Packet scan complete.' && said 'MKV statistics not refreshed: mkvpropedit not found'"
+eq    "refresh 4: file untouched"                     "$(md5sum < "$RF/r4.mkv")" "$m"
+
+# R5 read-only MKV: scan ok, refresh skipped
+if [[ $(id -u) != 0 ]]; then
+    cp "$ST/raw.mkv" "$RF/r5.mkv"; chmod 444 "$RF/r5.mkv"; m=$(md5sum < "$RF/r5.mkv")
+    run_load "$RF/r5.mkv"
+    eq    "refresh 5: read-only -> skipped, 0 calls"  "$STATS_REFRESH $(counts)" "skipped: source is not writable 1/0"
+    eq    "refresh 5: file untouched"                 "$(md5sum < "$RF/r5.mkv")" "$m"
+    chmod 644 "$RF/r5.mkv"
+else
+    SKIPPED+=("refresh 5: read-only file (running as root)")
+fi
+
+# R6 symlink: read through, never refreshed, target unchanged
+cp "$ST/raw.mkv" "$RF/store/target.mkv"; m=$(md5sum < "$RF/store/target.mkv")
+ln -s "$RF/store/target.mkv" "$RF/link.mkv"
+run_load "$RF/link.mkv"
+eq    "refresh 6: symlink -> values of the target"    "$STATS_KIND $(stats_field 0 bytes)" "packets $(pk "$RF/store/target.mkv" 0)"
+eq    "refresh 6: never refreshed through the link"   "$STATS_REFRESH $(counts)" "skipped: source is a symlink 1/0"
+check "refresh 6: message"                            "said 'MKV statistics not refreshed: source is a symlink'"
+eq    "refresh 6: target unchanged"                   "$(md5sum < "$RF/store/target.mkv")" "$m"
+check "refresh 6: link still a link"                  "[[ -L '$RF/link.mkv' ]]"
+
+# R7 broken symlink: still skipped by discovery, nothing written
+ln -s missing.mkv "$RF/bdir/Broken.mkv"
+eq    "refresh 7: broken link not listed"             "$(video_files_in_dir "$RF/bdir" 2>/dev/null)" ""
+run_load "$RF/bdir/Broken.mkv"
+eq    "refresh 7: no refresh attempt"                 "$STATS_REFRESH/$(grep -c . "$RF/calls" || true)" "/0"
+check "refresh 7: nothing created at the target"      "[[ -L '$RF/bdir/Broken.mkv' && ! -e '$RF/bdir/missing.mkv' ]]"
+
+# R8 non-MKV: never refreshed
+cp "$ST/clip.mp4" "$RF/r8.mp4"; m=$(md5sum < "$RF/r8.mp4")
+run_load "$RF/r8.mp4"
+eq    "refresh 8: mp4 -> scan, no refresh attempt"    "$(counts) $STATS_KIND/$STATS_REFRESH" "1/0 packets/"
+eq    "refresh 8: mp4 untouched"                      "$(md5sum < "$RF/r8.mp4")" "$m"
+
+# R9 mkvpropedit fails: warning, scan values used
+cp "$ST/raw.mkv" "$RF/r9.mkv"
+run_load "$RF/r9.mkv" exact "$RF/mkvpe_fail"
+eq    "refresh 9: failure reported"                   "$STATS_REFRESH $(counts)" "failed: mkvpropedit failed 1/1"
+check "refresh 9: warning shown"                      "said 'WARNING: MKV statistics refresh failed'"
+eq    "refresh 9: scan values used"                   "$STATS_KIND $(stats_field 0 bytes)" "packets $(pk "$RF/r9.mkv" 0)"
+
+if (( HAVE_MKV == 1 )); then
+    # R10 refresh ok but the re-read disagrees: reported, scan kept, no 2nd scan
+    cp "$ST/raw.mkv" "$RF/r10.mkv"
+    run_load "$RF/r10.mkv" exact "$RF/mkvpe_wrong"
+    check "refresh 10: verification failure reported"   "[[ '$STATS_REFRESH' == verify-failed:* ]] && said 'Metadata-first re-read: DIFFERENT'"
+    eq    "refresh 10: one scan only"                   "$(counts)" "1/1"
+    eq    "refresh 10: scan values used"                "$STATS_KIND $(stats_field 2 bytes)" "packets $(pk "$RF/r10.mkv" 2)"
+
+    # R11 / R12 series with mixed metadata: only the bad files scan / refresh
+    cp "$ST/valid.mkv" "$RF/series/E01.mkv"
+    cp "$ST/raw.mkv"   "$RF/series/E02.mkv"
+    cp "$ST/reenc.mkv" "$RF/series/E03.mkv"
+    m1=$(md5sum < "$RF/series/E01.mkv")
+    : > "$ST/scans"; : > "$RF/calls"
+    for f in "$RF"/series/E0*.mkv; do
+        STATS_MKVPROPEDIT="$RF/mkvpe" stats_load "$f" "" estimate refresh > /dev/null
+        echo "$(basename "$f") $STATS_KIND $STATS_REFRESH"
+    done > "$RF/series.out"
+    eq    "refresh 11: 2 scans / 2 refreshes for 3 files" "$(counts)" "2/2"
+    eq    "refresh 11: refreshed only E02, E03"           "$(sort "$RF/calls" | xargs -n1 basename | tr '\n' ' ')" "E02.mkv E03.mkv "
+    eq    "refresh 11: per-file sources"                  "$(tr '\n' ';' < "$RF/series.out")" \
+        "E01.mkv tags ;E02.mkv packets refreshed;E03.mkv packets refreshed;"
+    eq    "refresh 11: valid episode untouched"           "$(md5sum < "$RF/series/E01.mkv")" "$m1"
+    : > "$ST/scans"; : > "$RF/calls"
+    for f in "$RF"/series/E0*.mkv; do
+        STATS_MKVPROPEDIT="$RF/mkvpe" stats_load "$f" "" estimate refresh > /dev/null
+    done
+    eq    "refresh 12: second series run 0 scans / 0 calls" "$(counts)" "0/0"
+fi
+
+stream_packet_bytes() { _real_stream_packet_bytes "$@"; }
+
+
+echo
+echo "== statistics refresh never touches a source an active job is reading"
+AJ="$T/activejob"
+mkdir -p "$AJ/movies" "$AJ/other" "$AJ/show"
+stream_packet_bytes() { echo scan >> "$ST/scans"; _real_stream_packet_bytes "$@"; }
+# stand-in mkvpropedit: only counts calls (the guard decides before it runs)
+cat > "$AJ/mpe" <<'EOF'
+#!/usr/bin/env bash
+echo "$1" >> "$(dirname "$0")/calls"
+EOF
+chmod +x "$AJ/mpe"
+cp "$ST/raw.mkv" "$AJ/movies/Movie.mkv"
+cp "$ST/raw.mkv" "$AJ/other/Movie.mkv"
+cp "$ST/raw.mkv" "$AJ/show/E01.mkv"
+ln -s "$AJ/movies/Movie.mkv" "$AJ/alias.mkv"
+# fake_job SESSION STATUS INPUT TYPE  ->  job state as job_runtime.sh writes it
+fake_job() {
+    printf 'version=1\nsession=%s\ntype=%s\nstatus=%s\nitem=1\nitems=2\ninput=%s\n' \
+        "$1" "${4:-movie}" "$2" "$3" > "$WORK_DIR/$1.state"
+}
+tmux() { [[ "$1" == has-session ]] && [[ " ${LIVE_SESSIONS:-} " == *" ${3#=} "* ]]; }
+aj_load() {   # FILE  ->  stats_load ... refresh, counting scans / calls
+    : > "$ST/scans"; : > "$AJ/calls"
+    STATS_MKVPROPEDIT="$AJ/mpe" STATS_PROGRESS=1 stats_load "$1" "" exact refresh > "$AJ/out" 2>&1
+    AJ_COUNTS="$(grep -c . "$ST/scans" || true)/$(grep -c . "$AJ/calls" || true)"
+}
+
+aj_load "$AJ/movies/Movie.mkv"
+eq    "active 17: no job -> refresh allowed"         "$AJ_COUNTS" "1/1"
+
+LIVE_SESSIONS="ajm1"; fake_job ajm1 running "$AJ/movies/Movie.mkv" movie
+aj_load "$AJ/movies/Movie.mkv"
+eq    "active 16: movie job -> refresh skipped"      "$STATS_REFRESH" "skipped: source is in use by an active compression job (ajm1)"
+eq    "active 18: one scan, no mkvpropedit"          "$AJ_COUNTS" "1/0"
+check "active: message"                               "grep -q 'MKV statistics not refreshed: source is in use by an active compression job' '$AJ/out'"
+eq    "active: this run uses the scan"               "$STATS_KIND $(stats_field 0 bytes)" "packets $(pk "$AJ/movies/Movie.mkv" 0)"
+
+aj_load "$AJ/other/Movie.mkv"
+eq    "active: same name, other dir -> allowed"      "$AJ_COUNTS $STATS_REFRESH" "1/1 verify-failed: re-read MISSING"
+
+ln -sf "$AJ/movies/Movie.mkv" "$AJ/joblink.mkv"
+fake_job ajm1 running "$AJ/joblink.mkv" movie
+aj_load "$AJ/movies/Movie.mkv"
+eq    "active: job reads it via a symlink -> skipped" "$AJ_COUNTS" "1/0"
+aj_load "$AJ/alias.mkv"
+eq    "active: symlink alias -> never modified"       "$AJ_COUNTS $STATS_REFRESH" "1/0 skipped: source is a symlink"
+
+LIVE_SESSIONS="ajm1 ajs1"; fake_job ajs1 running "$AJ/show/E01.mkv" series
+aj_load "$AJ/show/E01.mkv"
+eq    "active: series episode -> skipped"             "$STATS_REFRESH $AJ_COUNTS" "skipped: source is in use by an active compression job (ajs1) 1/0"
+
+fake_job ajm1 finished "$AJ/movies/Movie.mkv" movie
+aj_load "$AJ/movies/Movie.mkv"
+eq    "active: job finished -> refresh allowed"       "$AJ_COUNTS" "1/1"
+
+fake_job ajm1 running "$AJ/movies/Movie.mkv" movie; LIVE_SESSIONS="ajs1"
+aj_load "$AJ/movies/Movie.mkv"
+eq    "active: stale 'running' (session gone) -> allowed" "$AJ_COUNTS" "1/1"
+
+fake_job ajm1 starting "" movie; LIVE_SESSIONS="ajm1 ajs1"
+aj_load "$AJ/movies/Movie.mkv"
+eq    "active: job not started yet -> allowed"        "$AJ_COUNTS" "1/1"
+
+exec 9< "$AJ/movies/Movie.mkv"
+aj_load "$AJ/movies/Movie.mkv"
+exec 9<&-
+eq    "active: file open in a process -> skipped"     "$STATS_REFRESH $AJ_COUNTS" "skipped: source is open in another process 1/0"
+
+if [[ $(id -u) != 0 ]]; then
+    fake_job ajx1 running "$AJ/other/Movie.mkv" movie; chmod 000 "$WORK_DIR/ajx1.state"
+    aj_load "$AJ/movies/Movie.mkv"
+    eq    "active: unreadable job state -> skipped (safe)" "$STATS_REFRESH $AJ_COUNTS" "skipped: cannot read job state ajx1.state 1/0"
+    chmod 644 "$WORK_DIR/ajx1.state"
+fi
+rm -f "$WORK_DIR"/aj*.state
+unset -f tmux
+stream_packet_bytes() { _real_stream_packet_bytes "$@"; }
+
+# ------------------------------------------------------------
+echo
+echo "== movie / series menus copy all audio; only the audio menu converts"
+AC="$T/acopy"
+MH="$AC/home"
+mkdir -p "$MH/compress/in/Show" "$MH/compress/out" "$AC/stub"
+cp -r "$SRC_WORK" "$MH/compress/work"
+cp "$ROOT/audio_compress_menu.sh" "$MH/compress/"
+printf '#!/usr/bin/env bash\n[[ "$1" == has-session ]] && exit 1\nexit 0\n' > "$AC/stub/tmux"
+chmod +x "$AC/stub/tmux"
+menu() {   # SCRIPT INPUT LOG
+    printf "$2" | HOME="$MH" PATH="$AC/stub:$PATH" COMPRESS_CONF="${MENU_CONF:-$T/compress.conf}" \
+        bash "$1" > "$3" 2>&1
+}
+newest_job() { ls -t "$MH/compress/work"/*.sh 2>/dev/null | head -1; }
+no_audio_encoding() {   # JOB  ->  0 when the job converts no audio
+    grep -q -- '-c:a copy' "$1" && grep -q 'atrans= ahash=1' "$1" &&
+        ! grep -qE -- '-c:a:[0-9]|-b:a|[ :](aac|eac3|ac3|libopus|dca|truehd)( |$)|-ac[ :]|-ar ' "$1"
+}
+
+# E-AC-3 5.1 "Atmos" (object audio named in the title: ffmpeg cannot
+# write real Atmos/JOC), TrueHD 5.1, DTS 5.1, AAC commentary
+ffmpeg -v error -y -f lavfi -i "testsrc2=s=640x360:r=24:d=2" -f lavfi -i "sine=f=440:r=48000:d=2" \
+    -map 0:v -map 1:a -map 1:a -map 1:a -map 1:a -c:v libx264 -preset ultrafast \
+    -c:a:0 eac3 -ac:a:0 6 -b:a:0 640k -c:a:1 truehd -ac:a:1 6 -strict -2 \
+    -c:a:2 dca -ac:a:2 6 -b:a:2 768k -c:a:3 aac -ac:a:3 2 -b:a:3 96k \
+    -metadata:s:a:0 language=eng -metadata:s:a:0 "title=English DDP 5.1 Atmos" -disposition:a:0 default \
+    -metadata:s:a:1 language=eng -metadata:s:a:1 "title=TrueHD 5.1" \
+    -metadata:s:a:2 language=ger -metadata:s:a:2 "title=DTS 5.1" \
+    -metadata:s:a:3 language=eng -metadata:s:a:3 "title=Director Commentary" -disposition:a:3 comment \
+    "$MH/compress/in/Multi.mkv" 2>"$AC/mk.err"
+
+if [[ -s "$MH/compress/in/Multi.mkv" ]]; then
+    src_audio=$(ffprobe -v error -select_streams a -show_entries stream=codec_name,channels,sample_rate -of csv=p=0 "$MH/compress/in/Multi.mkv" | tr '\n' ' ')
+    check "acopy: source has E-AC-3, TrueHD, DTS, AAC" "[[ '$src_audio' == 'eac3,48000,6 truehd,48000,6 dts,48000,6 aac,48000,2 ' ]]"
+
+    n=0
+    for t in Quality High Base; do
+        ((n += 1))
+        rm -f "$MH/compress/work"/c[0-9]*.sh
+        menu "$MH/compress/work/movie_compress.sh" "1\n$n\nn\n" "$AC/movie_$t.log"
+        job=$(ls "$MH/compress/work"/c[0-9]*.sh 2>/dev/null | head -1)
+        check "acopy $n: movie $t job written"          "[[ -n '$job' ]]"
+        check "acopy $n: movie $t copies all audio"     "no_audio_encoding '$job'"
+        check "acopy $n: movie $t summary says copied"  "grep -q 'Audio size: .*copied unchanged (4 track(s), actual source audio)' '$AC/movie_$t.log'"
+        [[ "$t" == Quality ]] && cp "$job" "$AC/movie_quality_job.sh"
+    done
+    check "acopy: movie header: audio copied"          "grep -q '^  all tracks copied unchanged' '$AC/movie_Quality.log' && grep -q 'use audio_compress_menu.sh for optional audio compression' '$AC/movie_Quality.log'"
+    check "acopy: movie lists tracks as copied"        "grep -q 'Audio 1: E-AC-3 5.1(side) + Dolby Atmos (per track title).*copied unchanged' '$AC/movie_Quality.log' && grep -q 'Audio 4: AAC stereo.*\"Director Commentary\" - copied unchanged' '$AC/movie_Quality.log'"
+    check "acopy: Atmos PRESERVED, no LOST warning"    "grep -q 'Object audio: Dolby Atmos PRESERVED by stream copy' '$AC/movie_Quality.log' && ! grep -qi 'LOST' '$AC/movie_Quality.log'"
+    check "acopy: no Base audio question"              "! grep -q 'Base audio target' '$AC/movie_Base.log'"
+    # 12 expected size uses the actual source audio bytes
+    stats_load "$MH/compress/in/Multi.mkv" "" exact
+    read -r _ srcab _ _ <<< "$(stats_totals 0)"
+    check "acopy 12: movie audio size = source bytes"  "grep -q \"Audio size: *~$(bytes_to_gib "$srcab") GiB copied\" '$AC/movie_Quality.log'"
+
+    # run the Quality job: every track identical in the output
+    bash "$AC/movie_quality_job.sh" < /dev/null > "$AC/movie_run.log" 2>&1
+    mout=$(ls "$MH/compress/out"/Multi*.mkv 2>/dev/null | head -1)
+    check "acopy 7: movie output written"             "[[ -s '$mout' ]]"
+    eq    "acopy 7: all 4 audio tracks, same codecs"  "$(ffprobe -v error -select_streams a -show_entries stream=codec_name,channels,sample_rate -of csv=p=0 "$mout" | tr '\n' ' ')" "$src_audio"
+    eq    "acopy 9-11: payload identical (all tracks)" "$(_audio_payload_md5 "$mout" | tr '\n' ' ')" "$(_audio_payload_md5 "$MH/compress/in/Multi.mkv" | tr '\n' ' ')"
+    check "acopy 9: E-AC-3 copied, Atmos PRESERVED"   "grep -q 'Audio track 1: *COPIED (E-AC-3 5.1(side), 48000 Hz, payload MD5 MATCH)' '$AC/movie_run.log' && grep -q 'Audio 1 object: *Dolby Atmos PRESERVED (stream copy)' '$AC/movie_run.log'"
+    check "acopy 10: TrueHD copied"                   "grep -q 'Audio track 2: *COPIED (TrueHD 5.1(side), 48000 Hz, payload MD5 MATCH)' '$AC/movie_run.log'"
+    check "acopy 11: DTS copied"                      "grep -q 'Audio track 3: *COPIED (DTS 5.1(side), 48000 Hz, payload MD5 MATCH)' '$AC/movie_run.log'"
+    check "acopy 8: commentary kept"                  "[[ \$(ffprobe -v error -select_streams a:3 -show_entries stream_disposition=comment -of default=nw=1:nk=1 '$mout') == 1 ]] && grep -q 'Audio track 4: *COPIED (AAC stereo' '$AC/movie_run.log'"
+    check "acopy: titles / languages kept"            "grep -q 'Languages: *MATCH' '$AC/movie_run.log' && grep -q 'Track titles: *MATCH' '$AC/movie_run.log'"
+    check "acopy: job succeeded"                      "grep -q 'All encodes finished: 1 ok, 0 failed' '$AC/movie_run.log'"
+
+    # verification catches a transcode that was not planned
+    ffmpeg -v error -y -i "$mout" -map 0 -c copy -c:a:3 libopus -b:a:3 64k "$AC/tampered.mkv"
+    ITEM_INPUT="$MH/compress/in/Multi.mkv"; ITEM_PART="$AC/tampered.mkv"; ITEM_TMP="$AC/vtmp"
+    mkdir -p "$ITEM_TMP"; declare -A ITEM_EXP=([vidx]=0 [video]=copy [atrans]= [ahash]=1)
+    item_verify_output > /dev/null 2>&1
+    check "acopy: unexpected transcode FAILS verify"  "grep -q 'Audio track 4: *CHANGED although it was to be copied: codec aac -> opus' '$ITEM_TMP/report.txt' && grep -q 'RESULT: FAILED' '$ITEM_TMP/report.txt'"
+
+    # series: Base / High / Custom
+    cp "$MH/compress/in/Multi.mkv" "$MH/compress/in/Show/E01.mkv"
+    cp "$MH/compress/in/Multi.mkv" "$MH/compress/in/Show/E02.mkv"
+    mv "$MH/compress/in/Multi.mkv" "$AC/Multi.mkv"
+    for sel in "1:Base" "2:High" "3:Custom"; do
+        k="${sel%%:*}"; t="${sel#*:}"
+        rm -f "$MH/compress/work"/series[0-9]*.sh; rm -rf "$MH/compress/out/Show"*
+        in="1\n$k\ny\n"; [[ $t == Custom ]] && in="1\n3\n3\ny\n"
+        menu "$MH/compress/work/series_compress.sh" "$in" "$AC/series_$t.log"
+        job=$(ls "$MH/compress/work"/series[0-9]*.sh 2>/dev/null | head -1)
+        check "acopy $((k + 3)): series $t job written"       "[[ -n '$job' ]]"
+        check "acopy $((k + 3)): series $t copies all audio"  "no_audio_encoding '$job'"
+        check "acopy: series $t table shows copied audio"     "grep -qE 'E0[12].mkv .* copy [0-9]+k' '$AC/series_$t.log'"
+    done
+    check "acopy: series header: audio copied"         "grep -q '^  all tracks copied unchanged' '$AC/series_Base.log'"
+    check "acopy: series Custom label"                 "grep -q '3) Custom video GiB/hour (no floor / max; audio copied)' '$AC/series_Custom.log'"
+    check "acopy: series lists tracks, Atmos PRESERVED" "grep -q 'Audio 1: E-AC-3 5.1(side) + Dolby Atmos' '$AC/series_Custom.log' && grep -q 'Object audio: Dolby Atmos PRESERVED by stream copy' '$AC/series_Custom.log'"
+    check "acopy: series no AAC rates / LOST warning"  "! grep -qiE 'kb/s AAC|LOST|Fixed audio total' '$AC/series_Custom.log'"
+    check "acopy: series season totals"                "grep -q 'Copied source audio size: *~' '$AC/series_Custom.log'"
+
+    # 15 the audio menu still converts audio (High: E-AC-3 640k -> 256k)
+    rm -f "$mout"
+    mv "$AC/Multi.mkv" "$MH/compress/out/Multi.mkv"
+    MENU_CONF=$(conf_with amenu AUDIO_HIGH_TRIGGER_KBPS=100 AUDIO_HIGH_KBPS_5TO6=256)
+    rm -f "$MH/compress/work"/[a-z][0-9]*.sh "$MH/compress/work"/[a-z]*[0-9].sh
+    menu "$MH/compress/audio_compress_menu.sh" "1\n1\n2\nn\ny\ny\n" "$AC/amenu.log"
+    MENU_CONF=""
+    ajob=$(newest_job)
+    check "acopy 15: audio menu warns Atmos LOST"      "grep -q 'WARNING: Dolby Atmos object metadata will be LOST' '$AC/amenu.log'"
+    check "acopy 15: audio menu job converts track 1"  "[[ -n '$ajob' ]] && grep -q -- '-c:a:0 eac3 -b:a:0 256k' '$ajob'"
+    bash "$ajob" < /dev/null > "$AC/arun.log" 2>&1
+    aout=$(ls -t "$MH/compress/out"/*.mkv | grep -v '/Multi.mkv$' | head -1)
+    check "acopy 15: converted output written"         "[[ -s '$aout' ]]"
+    eq    "acopy 15: track 1 re-encoded at 256k"      "$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,bit_rate -of csv=p=0 "$aout")" "eac3,256000"
+    eq    "acopy 15: other tracks copied"             "$(_audio_payload_md5 "$aout" | tail -n +2 | tr '\n' ' ')" "$(_audio_payload_md5 "$MH/compress/out/Multi.mkv" | tail -n +2 | tr '\n' ' ')"
+    check "acopy 15: audio job succeeded"             "grep -q 'All encodes finished: 1 ok, 0 failed' '$AC/arun.log'"
+else
+    SKIPPED+=("audio copy end-to-end (ffmpeg cannot write the E-AC-3/TrueHD/DTS fixture: $(head -1 "$AC/mk.err"))")
+fi
+
+# object-audio detection (real ffprobe profile strings)
+eq "object: E-AC-3 Atmos profile"   "$(audio_object_kind eac3 'Dolby Digital Plus + Dolby Atmos' -)" "Dolby Atmos"
+eq "object: TrueHD Atmos profile"   "$(audio_object_kind truehd 'Dolby TrueHD + Dolby Atmos' -)" "Dolby Atmos"
+eq "object: DTS:X profile"          "$(audio_object_kind dts 'DTS-HD MA + DTS:X' -)" "DTS:X"
+eq "object: plain DTS-HD MA"        "$(audio_object_kind dts 'DTS-HD MA' 'DTS-HD MA 7.1')" ""
+eq "object: label DTS-HD MA"        "$(audio_track_label dts 'DTS-HD MA + DTS:X' 7.1 8)" "DTS-HD MA 7.1"
+
+echo
+echo "== HDR10 (audio copied)"
+run_item hdr10 "$T/in/HDR10.mkv" ""
 nondv_job_checks hdr10
 common_checks hdr10
 check "hdr10: x265 HDR10 params"               "grep -q 'transfer=smpte2084' '$WORK_DIR/hdr10.sh' && grep -q 'master-display=' '$WORK_DIR/hdr10.sh' && grep -q 'max-cll=1000' '$WORK_DIR/hdr10.sh'"
-check "hdr10: transcoded audio stats stripped" "grep -q -- '-metadata:s:a:1 BPS=' '$WORK_DIR/hdr10.sh'"
+check "hdr10: copied audio keeps its stats"    "! grep -q -- '-metadata:s:a:[0-9] BPS=' '$WORK_DIR/hdr10.sh'"
 check "hdr10: HDR type HDR10"                  "report_has hdr10 'HDR type: +HDR10\$'"
 check "hdr10: colour MATCH"                    "report_has hdr10 'Colour signalling: +MATCH \\(bt2020/smpte2084/bt2020nc/tv\\)'"
 check "hdr10: chroma location MATCH"           "report_has hdr10 'Chroma location: +MATCH \\(topleft\\)'"
 check "hdr10: mastering VERIFIED"              "report_has hdr10 'HDR10 mastering: +VERIFIED'"
 check "hdr10: MaxCLL VERIFIED"                 "report_has hdr10 'MaxCLL/MaxFALL: +VERIFIED'"
-check "hdr10: audio 1 transcode reported"      "report_has hdr10 'Audio track 1: +AC-3 .* -> AAC'"
-eq    "hdr10: audio 1 title rewritten"         "$(out_title hdr10 0)" "English AAC 5.1"
-eq    "hdr10: audio 2 title rewritten"         "$(out_title hdr10 1)" "Director Commentary - AAC"
-check "hdr10: title UPDATED in report"         "report_has hdr10 'Audio 1 title: +UPDATED \"$A0_TITLE\" -> \"English AAC 5.1\"'"
-check "hdr10: track titles AS PLANNED"         "report_has hdr10 'Track titles: +AS PLANNED \\(2 audio title'"
-check "hdr10: no stale title"                  "! report_has hdr10 'STALE'"
+eq    "hdr10: audio 1 title unchanged"         "$(out_title hdr10 0)" "$A0_TITLE"
+eq    "hdr10: audio 2 title unchanged"         "$(out_title hdr10 1)" "$A1_TITLE"
+eq    "hdr10: audio codecs unchanged"          "$(ffprobe -v error -select_streams a -show_entries stream=codec_name,channels,sample_rate -of csv=p=0 "$T/out/hdr10.mkv" | tr '\n' ' ')" \
+    "$(ffprobe -v error -select_streams a -show_entries stream=codec_name,channels,sample_rate -of csv=p=0 "$T/in/HDR10.mkv" | tr '\n' ' ')"
+check "hdr10: track titles MATCH"              "report_has hdr10 'Track titles: +MATCH'"
 
 # ------------------------------------------------------------
 echo
@@ -1041,7 +1416,7 @@ ffmpeg -v error -y -i "$T/sdr.mkv" -i "$T/a20.mka" -i "$T/styled.ass" \
 build_stream_map "$T/in/MOVTEXT.mp4" 0
 printf '%s\n' "${MAP_NOTES[@]}" > "$T/mov_notes.txt"
 check "mov: pre-encode note names the loss"    "grep -q 'mov_text subtitle -> SRT .*styling LOST: .*default font (Arial)' '$T/mov_notes.txt'"
-run_item mov "$T/in/MOVTEXT.mp4" "" ""
+run_item mov "$T/in/MOVTEXT.mp4" ""
 check "mov: job reported success"              "grep -q 'All encodes finished: 1 ok, 0 failed' '$T/mov.log'"
 check "mov: report shows conversion"           "report_has mov 'Subtitle 1: +mov_text -> SRT'"
 check "mov: report shows styling LOST"         "report_has mov 'Subtitle 1 styling: +styling LOST: .*(background box|transparency)'"
@@ -1099,7 +1474,7 @@ EOF
     check "ed: pre-encode note about segment UID" \
         "grep -q 'source segment UID is kept' '$T/ed_notes.txt'"
 
-    run_item ed "$T/in/EDITIONS.mkv" "" ""
+    run_item ed "$T/in/EDITIONS.mkv" ""
     check "ed: job reported success"           "grep -q 'All encodes finished: 1 ok, 0 failed' '$T/ed.log'"
     check "ed: editions MATCH"                 "report_has ed 'Editions: +MATCH \\(2 editions \\(1 ordered\\), 4 chapters \\(1 nested, 1 hidden\\)'"
     check "ed: segment UID KEPT"               "report_has ed 'Segment UID: +KEPT'"
@@ -1110,7 +1485,7 @@ EOF
     # from the file duration, which changes with re-encoding
     printf 'CHAPTER01=00:00:00.000\nCHAPTER01NAME=One\nCHAPTER02=00:00:01.000\nCHAPTER02NAME=Two\n' > "$T/simple.txt"
     mkvmerge -q -o "$T/in/OPENEND.mkv" --chapters "$T/simple.txt" --no-chapters "$T/in/SDR.mkv"
-    run_item openend "$T/in/OPENEND.mkv" "" "-c:a aac -b:a:0 384k -b:a:1 96k"
+    run_item openend "$T/in/OPENEND.mkv" ""
     check "openend: job reported success"      "grep -q 'All encodes finished: 1 ok, 0 failed' '$T/openend.log'"
     check "openend: chapters MATCH"            "report_has openend 'Chapters: +MATCH \\(2: start times'"
     check "openend: editions MATCH"            "report_has openend 'Editions: +MATCH'"
@@ -1139,8 +1514,7 @@ if (( DOVI_TOOL_OK == 1 )) && [[ -n "$MKVMERGE" ]]; then
 
     DV_POLICY=preserve; DV_MODE=""; HDR10P_POLICY=none
     run_item dv "$T/in/DV.mkv" \
-        "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2" \
-        "-c:a aac -b:a:0 384k -b:a:1 96k"
+        "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2"
     common_checks dv
     check "dv: RPU steps in job"               "grep -q 'item_step rpu item_dv_extract' '$WORK_DIR/dv.sh' && grep -q 'item_dv_inject' '$WORK_DIR/dv.sh'"
     check "dv: still two-pass"                 "[[ \$(grep -c 'libx265' '$WORK_DIR/dv.sh') == 2 ]]"
@@ -1148,7 +1522,8 @@ if (( DOVI_TOOL_OK == 1 )) && [[ -n "$MKVMERGE" ]]; then
     check "dv: RPU VERIFIED"                   "report_has dv 'Dolby Vision RPU: +VERIFIED'"
     check "dv: HDR10 fallback VERIFIED"        "report_has dv 'HDR10 fallback: +VERIFIED'"
     check "dv: mastering VERIFIED"             "report_has dv 'HDR10 mastering: +VERIFIED'"
-    eq    "dv: audio title rewritten (DV path)" "$(out_title dv 0)" "English AAC 5.1"
+    eq    "dv: audio copied, title kept (DV path)" "$(out_title dv 0)" "$A0_TITLE"
+    check "dv: audio payload MATCH (DV path)"  "report_has dv 'Audio track 1: +COPIED .*payload MD5 MATCH'"
 
     ffmpeg -v error -i "$T/out/dv.mkv" -map 0:v:0 -c copy -f hevc - |
         "$DOVI_TOOL" extract-rpu - -o "$T/out.rpu" > /dev/null 2>&1

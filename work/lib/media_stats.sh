@@ -92,7 +92,7 @@ stored_tag_totals() {
 # ------------------------------------------------------------
 # Metadata-first stream statistics
 #
-#   stats_load FILE [DURATION] [MODE]
+#   stats_load FILE [DURATION] [MODE] [refresh]
 #
 # 1. Matroska: stored statistics tags (BPS, NUMBER_OF_BYTES, DURATION,
 #    as written by mkvmerge / mkvpropedit), used only when every
@@ -104,6 +104,13 @@ stored_tag_totals() {
 # MODE "exact" (default) never uses estimated bit rates: callers that
 # need byte-accurate sizes (movie / audio menus) get tags or packets.
 #
+# "refresh" (compression menus): after a fallback packet scan of a
+# Matroska file, rewrite its track statistics tags with mkvpropedit so
+# the next analysis can skip the scan (_stats_refresh: regular,
+# writable, non-symlink files that no running compression job is
+# reading, see source_in_active_job; only the statistics tags change).
+# The current analysis always keeps the packet-scan values.
+#
 # Sets:
 #   STATS_LINES     one line per stream: "index type attached bytes kbps"
 #                   (bytes / kbps "N/A" when unknown; kbps is whole kb/s)
@@ -113,10 +120,16 @@ stored_tag_totals() {
 #   STATS_REJECTED  why stored statistics were not used ("" when they
 #                   were used or there were none)
 #   STATS_SCANNED   1 when a packet scan was done
+#   STATS_REFRESH   "" (not attempted) | "refreshed" (tags rewritten and
+#                   the metadata-first re-read matches the scan) |
+#                   "skipped: why" | "failed: why" | "verify-failed: why"
 #
 # STATS_PROGRESS=1 prints the rejection reason and "Scanning packets..."
 # before a scan (menus); STATS_INDENT is put in front of those lines.
 # ------------------------------------------------------------
+
+# mkvpropedit command used by _stats_refresh (tests replace it).
+STATS_MKVPROPEDIT="${STATS_MKVPROPEDIT:-mkvpropedit}"
 
 # Unexplained bytes allowed between the stream statistics and the file
 # size (container overhead, cover art): this share of the file, but at
@@ -276,8 +289,155 @@ _stats_from_packets() {
         }' <<< "$1"
 }
 
+# _stats_say TEXT  ->  progress line (only with STATS_PROGRESS=1)
+_stats_say() {
+    if [[ "${STATS_PROGRESS:-0}" == 1 ]]; then
+        echo "${*:+${STATS_INDENT:-}$*}"
+    fi
+    return 0
+}
+
+# source_in_active_job FILE
+#
+# 0 when FILE (its resolved real path, so symlink aliases count too) may
+# be read by a running compression job right now, or when that cannot be
+# determined safely; 1 when it is not in use. ACTIVE_JOB_WHY says why.
+#
+# Primary test: the job state files written by job_runtime.sh
+# (WORK_DIR/<session>.state). A job is active while its status is
+# "running" and its tmux session exists; only its current item's input
+# can be in use (the job's later items are queued, not open yet; jobs
+# still "starting" have no current item). Secondary test: an open file
+# descriptor on the same file in /proc (exact path, no command lines).
+source_in_active_job() {
+    local file="$1" real st status session input ireal pat
+    local work="${WORK_DIR:-$HOME/compress/work}"
+
+    ACTIVE_JOB_WHY=""
+
+    if ! real=$(readlink -f -- "$file" 2>/dev/null) || [[ -z "$real" ]]; then
+        ACTIVE_JOB_WHY="cannot resolve the source path"
+        return 0
+    fi
+
+    for st in "$work"/*.state; do
+        [[ -e "$st" ]] || continue
+
+        if [[ ! -r "$st" ]] || ! status=$(sed -n 's/^status=//p' "$st" 2>/dev/null); then
+            ACTIVE_JOB_WHY="cannot read job state $(basename "$st")"
+            return 0
+        fi
+        [[ "$status" == "running" ]] || continue
+
+        session=$(sed -n 's/^session=//p' "$st")
+        input=$(sed -n 's/^input=//p' "$st")
+
+        # a "running" state whose tmux session is gone is left over from
+        # a job that was killed without cleaning up
+        if command -v tmux >/dev/null 2>&1 && [[ -n "$session" ]] &&
+           ! tmux has-session -t "=$session" 2>/dev/null; then
+            continue
+        fi
+
+        [[ -n "$input" ]] || continue
+        ireal=$(readlink -f -- "$input" 2>/dev/null) || continue
+
+        if [[ "$ireal" == "$real" ]]; then
+            ACTIVE_JOB_WHY="source is in use by an active compression job${session:+ ($session)}"
+            return 0
+        fi
+    done
+
+    if [[ -d /proc/self/fd ]]; then
+        # exact match on the fd target (glob characters escaped)
+        pat=$(printf '%s' "$real" | sed 's/[][*?\\]/\\&/g')
+        # (no pipe into grep -q: under pipefail find's SIGPIPE would hide the match)
+        if [[ -n "$(find /proc/[0-9]*/fd -lname "$pat" -print -quit 2>/dev/null)" ]]; then
+            ACTIVE_JOB_WHY="source is open in another process"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# _stats_refresh FILE DURATION PROBE
+#
+# After a packet scan (STATS_LINES): rewrite the track statistics tags,
+# then re-read them metadata-only (no second scan). Success only when
+# the re-read passes _stats_from_tags and every stream's byte count
+# equals the scan. Sets STATS_REFRESH; never fails the caller.
+_stats_refresh() {
+    local file="$1" dur="$2" probe="$3"
+    local res bad why=""
+
+    STATS_REFRESH=""
+
+    # Matroska only (MP4 / MOV / ... are never modified)
+    _stats_is_matroska "$probe" || return 0
+
+    if [[ -L "$file" ]]; then
+        why="source is a symlink"
+    elif [[ ! -f "$file" ]]; then
+        why="not a regular file"
+    elif [[ ! -w "$file" ]]; then
+        why="source is not writable"
+    elif ! command -v "$STATS_MKVPROPEDIT" >/dev/null 2>&1; then
+        why="mkvpropedit not found"
+    elif source_in_active_job "$file"; then
+        # checked last, immediately before mkvpropedit
+        why="$ACTIVE_JOB_WHY"
+    fi
+
+    if [[ -n "$why" ]]; then
+        STATS_REFRESH="skipped: $why"
+        _stats_say "MKV statistics not refreshed: $why"
+        return 0
+    fi
+
+    _stats_say ""
+    _stats_say "Refreshing MKV statistics..."
+
+    if ! "$STATS_MKVPROPEDIT" "$file" \
+            --delete-track-statistics-tags \
+            --add-track-statistics-tags >/dev/null 2>&1; then
+        STATS_REFRESH="failed: mkvpropedit failed"
+        _stats_say "WARNING: MKV statistics refresh failed (mkvpropedit); using the packet scan."
+        return 0
+    fi
+
+    _stats_say "MKV statistics updated."
+
+    probe=$(_stats_probe "$file")
+    res=$(_stats_from_tags "$probe" "$(file_bytes "$file" 2>/dev/null || echo 0)" "$dur")
+
+    if [[ "$res" != OK* ]]; then
+        bad="re-read ${res#REJECT }"
+    else
+        # every stream the scan measured must have the same byte count
+        bad=$(awk '
+            NR == FNR { if ($4 != "N/A") scan[$1] = $4; next }
+            { tag[$1] = $4 }
+            END {
+                for (i in scan)
+                    if (!(i in tag) || tag[i] != scan[i]) {
+                        printf "stream %s: tag %s, scan %s bytes", i, (i in tag) ? tag[i] : "none", scan[i]
+                        exit
+                    }
+            }' <(printf '%s\n' "$STATS_LINES") <(printf '%s\n' "${res#OK$'\n'}"))
+    fi
+
+    if [[ -z "$bad" ]]; then
+        STATS_REFRESH="refreshed"
+        _stats_say "Metadata-first re-read: MATCH"
+    else
+        STATS_REFRESH="verify-failed: $bad"
+        _stats_say "WARNING: Metadata-first re-read: DIFFERENT ($bad); using the packet scan."
+    fi
+}
+
 stats_load() {
-    local file="$1" dur="${2:-}" mode="${3:-exact}"
+    local file="$1" dur="${2:-}" mode="${3:-exact}" refresh="${4:-}"
     local probe fsize res
 
     STATS_LINES=""
@@ -285,6 +445,7 @@ stats_load() {
     STATS_KIND=""
     STATS_REJECTED=""
     STATS_SCANNED=0
+    STATS_REFRESH=""
 
     [[ "$dur" =~ ^[0-9]+([.][0-9]+)?$ ]] || dur=$(get_duration "$file" 2>/dev/null || true)
     [[ "$dur" =~ ^[0-9]+([.][0-9]+)?$ ]] || dur=0
@@ -324,6 +485,24 @@ stats_load() {
     STATS_SOURCE="packet scan"
     STATS_KIND="packets"
     STATS_SCANNED=1
+    _stats_say "Packet scan complete."
+
+    # For the next run only: this run keeps the scanned values.
+    if [[ "$refresh" == "refresh" ]]; then
+        _stats_refresh "$file" "$dur" "$probe"
+    fi
+    return 0
+}
+
+# stats_refresh_note  ->  short note on STATS_REFRESH for "Values from"
+# lines ("" when nothing was attempted)
+stats_refresh_note() {
+    case "$STATS_REFRESH" in
+        refreshed)       echo "MKV statistics refreshed; next run reads them without a scan" ;;
+        skipped:*)       echo "MKV statistics not refreshed: ${STATS_REFRESH#skipped: }" ;;
+        failed:*)        echo "MKV statistics refresh failed: ${STATS_REFRESH#failed: }" ;;
+        verify-failed:*) echo "MKV statistics refreshed but the re-read did not match: ${STATS_REFRESH#verify-failed: }" ;;
+    esac
 }
 
 # stats_totals MAIN_VIDEO_INDEX  ->  "video_bytes audio_bytes audio_count complete"

@@ -18,16 +18,16 @@ source "$WORK_DIR/lib/policy.sh"
 # series_video_plan / series_plan)
 #
 # Base / High: SERIES_*_VIDEO_GIB_PER_HOUR (video only), floor, max
-# Custom:      user-entered video GiB/hour, no floor / max, High audio
+# Custom:      user-entered video GiB/hour, no floor / max
 #
-# One fixed video bitrate for every episode; audio is added on top of
-# the video size, never taken from it. Per episode:
-#   - a source video bitrate below the fixed bitrate is kept (never
-#     increased); one below the tier floor is kept as well (not reduced)
-#   - an audio track whose source bitrate is already at or below the
-#     fixed audio rate for its channel count is copied unchanged
+# One fixed video bitrate for every episode. Per episode, a source video
+# bitrate below the fixed bitrate is kept (never increased); one below
+# the tier floor is kept as well (not reduced).
 #
-# All audio tracks and subtitles are retained.
+# Every audio track is copied unchanged (codec, bitrate, channels,
+# Atmos / DTS:X, titles, flags) and comes on top of the video size;
+# audio compression is only done by audio_compress_menu.sh. All
+# subtitles are retained.
 # ============================================================
 
 if ! load_policy; then
@@ -40,14 +40,7 @@ for t in High Base; do
     series_video_policy_lines "$t"
 done
 echo
-echo "Audio:"
-echo "  separate from video size target"
-echo "  (AAC per track by channel count; tracks already at or below it are copied)"
-
-# audio_rate TIER CHANNELS  ->  AAC kb/s (compress.conf SERIES_*_AAC_KBPS_*)
-audio_rate() {
-    series_aac_kbps "$@"
-}
+audio_copy_policy_lines
 
 # ============================================================
 # FIND SERIES FOLDERS
@@ -107,8 +100,8 @@ FILE_COUNT=${#FILES[@]}
 echo
 echo "Analyzing ${FILE_COUNT} files..."
 
-declare -a EP_DUR EP_VIDX EP_VKBPS EP_AKBPS EP_ACH EP_ACODEC EP_ASR
-declare -a EP_RES EP_VCODEC EP_PIX EP_FPS EP_RANGE EP_SUBS EP_OTHER EP_HOW EP_H10P
+declare -a EP_DUR EP_VIDX EP_VKBPS EP_AKBPS EP_ABYTES EP_ACH EP_ACODEC EP_ASR
+declare -a EP_RES EP_VCODEC EP_PIX EP_FPS EP_RANGE EP_SUBS EP_OTHER EP_HOW EP_H10P EP_REFRESH
 
 for i in "${!FILES[@]}"; do
     file="${FILES[$i]}"
@@ -126,13 +119,19 @@ for i in "${!FILES[@]}"; do
     fi
 
     dur=$(get_duration "$file")
-    STATS_PROGRESS=1 STATS_INDENT="      " stats_load "$file" "$dur" estimate
+    # Only episodes that needed a packet scan get their MKV statistics
+    # refreshed; valid ones are read and left untouched.
+    STATS_PROGRESS=1 STATS_INDENT="      " stats_load "$file" "$dur" estimate refresh
 
     EP_DUR[$i]="$dur"
     EP_VIDX[$i]="$vidx"
     EP_VKBPS[$i]=$(stats_field "$vidx" kbps)
     EP_HOW[$i]="$STATS_SOURCE"
+    EP_REFRESH[$i]="$STATS_REFRESH"
     EP_AKBPS[$i]=$(stats_audio_kbps)
+    # copied source audio (all tracks): its actual size goes on top of
+    # the video target
+    read -r _ EP_ABYTES[$i] _ _ <<< "$(stats_totals "$vidx")"
 
     EP_ACH[$i]=$(awk -F'\t' '$2 == "audio" { printf "%s ", $5 }' <<< "$info")
     EP_ACODEC[$i]=$(awk -F'\t' '$2 == "audio" { printf "%s ", $3 }' <<< "$info")
@@ -258,8 +257,19 @@ echo "Resolution:    ${WIDTH}x${HEIGHT}"
 echo "Video:         ${EP_VCODEC[0]} / ${EP_PIX[0]}"
 echo "Frame rate:    ${EP_FPS[0]}"
 echo "Audio tracks:  ${#AUDIO_CHANNELS[@]}"
-printf "%s\n" "${EP_HOW[@]}" | sort | uniq -c |
-    awk '{ n = $1; $1 = ""; printf "%s%s%s (%d file%s)\n", (NR == 1 ? "Values from:   " : "               "), "", substr($0, 2), n, (n == 1 ? "" : "s") }'
+echo "Values from:"
+{
+    printf "%s\n" "${EP_HOW[@]}"
+    for r in "${EP_REFRESH[@]+"${EP_REFRESH[@]}"}"; do
+        case "$r" in
+            refreshed)       echo "refreshed statistics" ;;
+            skipped:*)       echo "statistics not refreshed (${r#skipped: })" ;;
+            failed:*)        echo "statistics refresh failed" ;;
+            verify-failed:*) echo "statistics refreshed, re-read did not match" ;;
+        esac
+    done
+} | awk '{ n[$0]++; if (!($0 in seen)) { seen[$0] = 1; order[++k] = $0 } }
+    END { for (i = 1; i <= k; i++) printf "  %s: %d file%s\n", order[i], n[order[i]], (n[order[i]] == 1 ? "" : "s") }'
 echo "------------------------------------------------------------"
 
 if ! confirm_dynamic_range "this series"; then
@@ -330,13 +340,13 @@ show_preview() {
     local tier="$2"
 
     series_video_plan "$tier" "${3:-}"
-    series_plan "$tier" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+    series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
 
     echo "$label"
     printf "   Video:   %s kb/s fixed%s\n" "$SPLAN_TARGET_KBPS" \
         "$( (( SPLAN_MAX_LIMITED == 1 )) && echo " (limited by the $(kbps_mbps "$SPLAN_MAX_KBPS") Mb/s max)")"
-    printf "   Total:   ~%s GiB | Video ~%s GiB | Audio ~%s GiB (%s kb/s, on top)\n" \
-        "$P_TOTAL_GIB" "$P_VIDEO_GIB" "$P_AUDIO_GIB" "$P_AUDIO_KBPS"
+    printf "   Total:   ~%s GiB | Video ~%s GiB | Audio ~%s GiB (copied unchanged, on top)\n" \
+        "$P_TOTAL_GIB" "$P_VIDEO_GIB" "$P_AUDIO_GIB"
 
     printf "   Average: ~%s GiB/file | Video ~%s GiB | Audio ~%s GiB\n" \
         "$(per_file "$P_TOTAL_GIB")" "$(per_file "$P_VIDEO_GIB")" "$(per_file "$P_AUDIO_GIB")"
@@ -353,10 +363,6 @@ show_preview() {
     if (( P_CAPPED > 0 )); then
         printf "   %d episode(s) kept at their lower source video bitrate\n" "$P_CAPPED"
     fi
-
-    if (( P_COPIED > 0 )); then
-        printf "   %d audio track(s) copied: source already at or below target\n" "$P_COPIED"
-    fi
 }
 
 # ============================================================
@@ -372,7 +378,7 @@ echo
 show_preview "2) High  [${SERIES_HIGH_VIDEO_GIB_PER_HOUR} GiB/hour video + audio]" "High"
 echo
 
-echo "3) Custom video GiB/hour (no floor / max, High audio rates)"
+echo "3) Custom video GiB/hour (no floor / max; audio copied)"
 
 CUSTOM_GIB=""
 
@@ -404,7 +410,6 @@ while true; do
                 echo "Enter a positive number, e.g. 2.5"
             done
 
-            # Custom uses High audio rates.
             TIER="Custom"
 
             echo
@@ -430,9 +435,9 @@ GIB_PER_HOUR="$SPLAN_GIB_PER_HOUR"
 VIDEO_KBPS="$SPLAN_TARGET_KBPS"
 
 if (( SPLAN_BELOW_FLOOR == 1 )); then
-    series_plan "$TIER" "$SPLAN_FLOOR_KBPS" "$SPLAN_FLOOR_KBPS"
+    series_plan "$SPLAN_FLOOR_KBPS" "$SPLAN_FLOOR_KBPS"
     FLOOR_VIDEO_GIB="$P_VIDEO_GIB"
-    series_plan "$TIER" "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
+    series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
     TARGET_VIDEO_GIB="$P_VIDEO_GIB"
 
     echo
@@ -473,9 +478,7 @@ if (( SPLAN_BELOW_FLOOR == 1 )); then
     done
 fi
 
-series_plan "$TIER" "$VIDEO_KBPS" "$SPLAN_FLOOR_KBPS"
-
-AUDIO_TOTAL_KBPS="$P_AUDIO_KBPS"
+series_plan "$VIDEO_KBPS" "$SPLAN_FLOOR_KBPS"
 
 echo
 echo "------------------------------------------------------------"
@@ -503,19 +506,19 @@ if (( SPLAN_FLOOR_KBPS > 0 || SPLAN_MAX_KBPS > 0 )); then
     printf "  floor %s Mb/s, max %s\n" "$(kbps_mbps "$SPLAN_FLOOR_KBPS")" \
         "$( (( SPLAN_MAX_KBPS > 0 )) && echo "$(kbps_mbps "$SPLAN_MAX_KBPS") Mb/s" || echo none)"
 fi
-echo "Fixed audio total:    ${AUDIO_TOTAL_KBPS} kb/s (on top of the video size)"
+echo "Audio:                all tracks copied unchanged (on top of the video size)"
 
-for i in "${!AUDIO_CHANNELS[@]}"; do
-    RATE=$(audio_rate "$TIER" "${AUDIO_CHANNELS[$i]}")
-    echo "  Audio $((i+1)):           ${RATE} kb/s AAC (${AUDIO_CHANNELS[$i]} ch)"
-done
+# same audio layout in every episode (verified above); details of the first
+while IFS= read -r note; do
+    [[ -n "$note" ]] && echo "  $note"
+done < <(audio_copy_notes "$REFERENCE" "${EP_AKBPS[0]}")
 
 echo
 echo "Per-episode rules (never increase quality settings above the source):"
 echo "  - video: fixed bitrate, or the source video bitrate if that is lower;"
 echo "    a source below the tier floor is kept at its own bitrate"
-echo "  - audio: re-encoded at the fixed rate, or copied unchanged if the"
-echo "    source track is already at or below it"
+echo "  - audio: every track copied unchanged (optional audio compression"
+echo "    afterwards with audio_compress_menu.sh)"
 echo "------------------------------------------------------------"
 
 # ============================================================
@@ -539,7 +542,7 @@ for i in "${!FILES[@]}"; do
         "$(basename "${FILES[$i]}")" \
         "$(awk -v d="${EP_DUR[$i]}" 'BEGIN { printf "%.1f", d / 60 }')" \
         "$vcol" \
-        "${P_EP_ADESC[$i]}" \
+        "copy ${P_EP_AKBPS[$i]}k" \
         "~${P_EP_VGIB[$i]}" "~${P_EP_AGIB[$i]}" "~${P_EP_GIB[$i]}"
 done
 echo "  (sizes in GiB)"
@@ -564,22 +567,6 @@ for i in "${!FILES[@]}"; do
     fi
 done
 
-LOSS_SHOWN=0
-
-for i in "${!FILES[@]}"; do
-    while IFS= read -r note; do
-        [[ -n "$note" ]] || continue
-
-        if (( LOSS_SHOWN == 0 )); then
-            echo
-            echo "WARNING: object audio metadata is lost by re-encoding:"
-            LOSS_SHOWN=1
-        fi
-
-        printf "  %s: %s\n" "$(basename "${FILES[$i]}")" "$note"
-    done < <(audio_loss_notes "${FILES[$i]}" "${P_EP_AARGS[$i]}")
-done
-
 # Stream / title / chapter handling, shown for the first episode (the
 # same rules apply to every episode; each output is verified).
 build_stream_map "$REFERENCE" "${EP_VIDX[0]}"
@@ -587,7 +574,7 @@ REF_NOTES=("${MAP_NOTES[@]+"${MAP_NOTES[@]}"}")
 
 while IFS= read -r note; do
     [[ -n "$note" ]] && REF_NOTES+=("$note")
-done < <(audio_title_notes "$REFERENCE" "${P_EP_AARGS[0]}"; chapter_notes "$REFERENCE")
+done < <(chapter_notes "$REFERENCE")
 
 if (( ${#REF_NOTES[@]} )); then
     echo
@@ -603,7 +590,7 @@ printf "  Total runtime:              %s hours (%s min)\n" \
     "$(awk -v s="$P_TOTAL_SECONDS" 'BEGIN { printf "%.2f", s / 3600 }')" \
     "$(awk -v s="$P_TOTAL_SECONDS" 'BEGIN { printf "%.0f", s / 60 }')"
 printf "  Expected total video size:  ~%s GiB\n" "$P_VIDEO_GIB"
-printf "  Expected total audio size:  ~%s GiB\n" "$P_AUDIO_GIB"
+printf "  Copied source audio size:   ~%s GiB\n" "$P_AUDIO_GIB"
 printf "  Expected total output size: ~%s GiB  (incl. ~%s%% container/subtitles)\n" \
     "$P_TOTAL_GIB" "$SERIES_CONTAINER_RESERVE_PCT"
 echo
@@ -730,7 +717,6 @@ mkdir -p "$PASS_DIR"
             "$TIER" \
             "${P_EP_VKBPS[$i]}" \
             "$VIDEO_FILTER" \
-            "${P_EP_AARGS[$i]}" \
             "$PASS_DIR/pass_$i" \
             "${EP_OVERWRITE[$i]}"
     done

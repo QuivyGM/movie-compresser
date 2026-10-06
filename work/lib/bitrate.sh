@@ -18,12 +18,6 @@ gib_per_hour_to_kbps() {
     }'
 }
 
-audio_kbps_for_gib() {
-    awk -v gib="$1" -v sec="$2" 'BEGIN {
-        printf "%.0f", gib * 1073741824 * 8 / sec / 1000 * 0.98
-    }'
-}
-
 min_value() {
     awk -v a="$1" -v b="$2" 'BEGIN {
         if (a < b) printf "%.3f", a

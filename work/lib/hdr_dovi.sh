@@ -594,7 +594,7 @@ _cover_default() {
 # <MS>-separated:
 #   1 codec  2 profile  3 layout  4 default  5 forced  6 comment  7 hi
 #   8 vi  9 language  10 title  11 channels  12 source index
-#   13 original codec
+#   13 original codec  14 sample rate
 # For the source (PREFIX == S), only streams the encode keeps are
 # listed (mov_text already as subrip), so the lists line up with the
 # output.
@@ -626,7 +626,7 @@ _meta_load() {
             [[ "$act" == "srt" ]] && codec="subrip"
         fi
 
-        row="$codec$MS$profile$MS$layout$MS$def$MS$forced$MS$comment$MS$hi$MS$vi$MS$lang$MS$title$MS$ch$MS$idx$MS$oc"
+        row="$codec$MS$profile$MS$layout$MS$def$MS$forced$MS$comment$MS$hi$MS$vi$MS$lang$MS$title$MS$ch$MS$idx$MS$oc$MS$srate"
 
         case "$type" in
             video)
@@ -699,6 +699,14 @@ _codec_label() {
 
     [[ "$profile" != "-" && "$profile" != "unknown" && -n "$profile" ]] && codec+=" ($profile)"
     printf '%s' "$codec"
+}
+
+# _audio_payload_md5 FILE  ->  "MD5=..." per audio stream, in stream
+# order: hash of every packet's data (stream copy keeps it identical;
+# timestamps and container framing are not part of it)
+_audio_payload_md5() {
+    ffmpeg -v error -nostdin -i "$1" -map 0:a -c copy -f streamhash -hash md5 - 2>/dev/null |
+        awk -F',' '{ print $3 }'
 }
 
 # _rep LABEL VALUE
@@ -867,6 +875,54 @@ item_verify_output() {
     _meta_load "$src" S "$vidx"
     _meta_load "$out" O "$ovidx"
 
+    # _verify_copied_audio I  ->  report + fails/warns for a track that was
+    # meant to be stream-copied: codec, profile, channels, layout and
+    # sample rate must be unchanged, object audio (Atmos / DTS:X) still
+    # present, and (when hashed) the payload identical.
+    _verify_copied_audio() {
+        local i="$1" d="" f
+        local sr="${S_A[$i]}" orow="${O_A[$i]}" so oo h=""
+        local -a sv ov
+
+        IFS="$MS" read -ra sv <<< "$sr"
+        IFS="$MS" read -ra ov <<< "$orow"
+
+        for f in "0 codec" "1 profile" "10 channels" "2 layout" "13 sample rate"; do
+            local k="${f%% *}" name="${f#* }"
+            [[ "${sv[$k]:-}" == "${ov[$k]:-}" ]] || d+="${d:+; }$name ${sv[$k]:-?} -> ${ov[$k]:-?}"
+        done
+
+        if [[ -n "$d" ]]; then
+            _rep "Audio track $((i + 1))" "CHANGED although it was to be copied: $d" >&3
+            fails+=("audio $((i + 1)) was not copied unchanged ($d)")
+            return 0
+        fi
+
+        if (( ${#S_AH[@]} )); then
+            if [[ -n "${S_AH[$i]:-}" && "${S_AH[$i]}" == "${O_AH[$i]:-}" ]]; then
+                h=", payload MD5 MATCH"
+            else
+                h=", payload CHECK REQUIRED"
+                warns+=("audio $((i + 1)) payload differs from the source although it was copied")
+            fi
+        fi
+
+        _rep "Audio track $((i + 1))" "COPIED ($(audio_track_label "${sv[0]}" "${sv[1]}" "${sv[2]}" "${sv[10]}"), ${sv[13]} Hz$h)" >&3
+        [[ "$h" == *CHECK* ]] &&
+            _rep "Audio $((i + 1)) payload" "CHECK REQUIRED: packet data differs from the source" >&3
+
+        so=$(audio_object_kind "${sv[0]}" "${sv[1]}" "${sv[9]}")
+        if [[ -n "$so" ]]; then
+            oo=$(audio_object_kind "${ov[0]}" "${ov[1]}" "${ov[9]}")
+            if [[ -n "$oo" ]]; then
+                _rep "Audio $((i + 1)) object" "${so%% (*} PRESERVED (stream copy)" >&3
+            else
+                _rep "Audio $((i + 1)) object" "${so%% (*} MISSING in the output" >&3
+                fails+=("audio $((i + 1)): ${so%% (*} not present after stream copy")
+            fi
+        fi
+    }
+
     local -A trans=()
     local exp_titles=() updated=0
     if [[ -n "${ITEM_EXP[atrans]+x}" ]]; then
@@ -876,6 +932,14 @@ item_verify_output() {
     line="${#S_A[@]} -> ${#O_A[@]}"
     _rep "Audio tracks" "$line" >&3
     (( ${#S_A[@]} == ${#O_A[@]} )) || fails+=("audio track count changed ($line)")
+
+    # movie / series encodes copy all audio: compare the packet payload
+    local S_AH=() O_AH=()
+    if [[ "${ITEM_EXP[ahash]:-0}" == "1" ]] && (( ${#S_A[@]} )); then
+        echo "Hashing copied audio..."
+        mapfile -t S_AH < <(_audio_payload_md5 "$src")
+        mapfile -t O_AH < <(_audio_payload_md5 "$out")
+    fi
 
     for ((i = 0; i < ${#S_A[@]}; i++)); do
         local sc sp sl sch st oc="" op="" ol="" och="" ot="" et claims
@@ -897,6 +961,8 @@ item_verify_output() {
 
         if [[ -z "${trans[$i]:-}" ]]; then
             exp_titles+=("$st")
+            [[ -n "$oc" ]] || continue      # missing: track count failed above
+            _verify_copied_audio "$i"
             continue
         fi
 
@@ -1111,7 +1177,7 @@ item_verify_output() {
     fi
 
     exec 3>&-
-    unset -f _flags_line
+    unset -f _flags_line _verify_copied_audio
 
     (( ${#fails[@]} == 0 ))
 }
