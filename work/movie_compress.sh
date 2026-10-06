@@ -29,8 +29,10 @@ for t in Quality High Base; do
     printf "  %-8s %s
 " "$t" "$(movie_policy_line "$t")"
 done
-echo
-movie_quality_policy_lines
+for t in Quality High Base; do
+    echo
+    movie_video_policy_lines "$t"
+done
 
 while true; do
 
@@ -213,12 +215,12 @@ while true; do
 
         echo
         echo "------------------------------------------------------------"
-        echo "Quality conflict:"
+        echo "${TIER} conflict:"
         echo
 
         printf "%-18s | %-18s | %-18s\n" \
             "" \
-            "1. Quality floor" \
+            "1. ${TIER} floor" \
             "2. ${PLAN_TARGET_GIB} GiB target"
 
         printf "%-18s-+-%-18s-+-%-18s\n" \
@@ -402,16 +404,22 @@ while true; do
         "$SOURCE_VIDEO_GIB" \
         "$EXPECTED_VIDEO_GIB"
 
-    if [[ "$TIER" == "Quality" ]]; then
-        printf "  Quality target:    rate-based   %s GiB  (%s GiB/hour x %s h)\n" \
-            "$PLAN_RATE_GIB" "$MOVIE_QUALITY_VIDEO_GIB_PER_HOUR" \
-            "$(awk -v d="$DURATION" 'BEGIN { printf "%.2f", d / 3600 }')"
+    printf "  Video target:      rate-based   %s GiB  (%s GiB/hour x %s h)\n" \
+        "$PLAN_RATE_GIB" "$PLAN_GIB_PER_HOUR" \
+        "$(awk -v d="$DURATION" 'BEGIN { printf "%.2f", d / 3600 }')"
+    [[ -n "$PLAN_MIN_GIB" ]] &&
         printf "                     minimum      %s GiB\n" "$PLAN_MIN_GIB"
-        printf "                     source video %s GiB\n" "${PLAN_SOURCE_GIB:-N/A}"
+    printf "                     source video %s GiB\n" "${PLAN_SOURCE_GIB:-N/A}"
+    if (( PLAN_SOURCE_BELOW_FLOOR == 1 )) && [[ "$TIER" != "Quality" ]]; then
+        printf "                     Source bitrate (%.2f Mb/s) is below the %s floor (%s Mb/s).\n" \
+            "$PLAN_SOURCE_MBPS" "$TIER" "$PLAN_FLOOR_MBPS"
+        printf "                     Using source bitrate as target: %.2f Mb/s (~%s GiB)\n" \
+            "$PLAN_TARGET_MBPS" "$PLAN_TARGET_GIB"
+    else
         printf "                     selected     %s GiB%s\n" "$PLAN_TARGET_GIB" \
             "$( (( PLAN_SOURCE_LIMITED == 1 )) && echo "  (limited by the source video size)")"
         printf "                     bitrate      %s Mb/s%s\n" "$PLAN_TARGET_MBPS" \
-            "$( (( PLAN_MAX_LIMITED == 1 )) && echo "  (limited by the ${MOVIE_QUALITY_VIDEO_MAX_MBPS} Mb/s max)")"
+            "$( (( PLAN_MAX_LIMITED == 1 )) && echo "  (limited by the ${PLAN_MAX_MBPS} Mb/s max)")"
     fi
 
     printf "  Policy:           %s

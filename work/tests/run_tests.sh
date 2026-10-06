@@ -126,11 +126,12 @@ echo
 echo "== policy: compress.conf loading and validation"
 
 # expected values are computed from the config, not hardcoded
-exp_clamp() {   # size_gib floor max dur  ->  clamp(bitrate(size), floor, max>0 ? max : inf)
-    awk -v g="$1" -v f="$2" -v m="$3" -v d="$4" 'BEGIN {
+exp_rate() {   # gib_per_hour max dur [source_gib]  ->  High/Base target Mb/s
+    awk -v r="$1" -v m="$2" -v d="$3" -v s="${4:-0}" 'BEGIN {
+        g = sprintf("%.3f", r * d / 3600) + 0   # the plan sizes in 0.001 GiB steps
+        if (s > 0 && s < g) g = s
         t = g * 1073741824 * 8 / d / 1000000
         if (m > 0 && t > m) t = m
-        if (t < f) t = f
         printf "%.3f", t }'
 }
 
@@ -150,10 +151,10 @@ check "default compress.conf loads"           "load_policy 2>'$T/pol.err'"
 {
     load_policy 2>/dev/null
     for tier in High Base; do
-        u=${tier^^}; g="MOVIE_${u}_VIDEO_TARGET_GIB"; f="MOVIE_${u}_VIDEO_FLOOR_MBPS"; m="MOVIE_${u}_VIDEO_MAX_MBPS"
+        u=${tier^^}; g="MOVIE_${u}_VIDEO_GIB_PER_HOUR"; m="MOVIE_${u}_VIDEO_MAX_MBPS"
         for dur in 1800 5400 9000 20000; do
             movie_video_plan "$tier" "$dur"
-            eq "movie $tier ${dur}s target from config" "$PLAN_TARGET_MBPS" "$(exp_clamp "${!g}" "${!f}" "${!m}" "$dur")"
+            eq "movie $tier ${dur}s target from config" "$PLAN_TARGET_MBPS" "$(exp_rate "${!g}" "${!m}" "$dur")"
         done
     done
 
@@ -189,17 +190,118 @@ conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the default config
 
 {
     load_policy 2>/dev/null
-    movie_video_plan High 5400; before="$PLAN_TARGET_MBPS"
-    COMPRESS_CONF=$(conf_with high5 MOVIE_HIGH_VIDEO_TARGET_GIB=5 MOVIE_HIGH_VIDEO_FLOOR_MBPS=4 MOVIE_HIGH_VIDEO_MAX_MBPS=9)
-    load_policy 2>/dev/null
-    movie_video_plan High 5400
-    check "edited conf changes High target"  "[[ '$PLAN_TARGET_MBPS' != '$before' ]]"
-    eq "edited conf High target = new values" "$PLAN_TARGET_MBPS" "$(exp_clamp 5 4 9 5400)"
+    # High / Base: GiB/hour, no minimum size (fixed values, not the defaults)
+    for tier in High Base; do
+        u=${tier^^}
+        if [[ $tier == High ]]; then r=3.0 f=6 m=10 r2=4 big=10; else r=1.25 f=2.5 m=5 r2=2 big=4; fi
+        COMPRESS_CONF=$(conf_with "hb$tier" MOVIE_${u}_VIDEO_GIB_PER_HOUR=$r \
+            MOVIE_${u}_VIDEO_FLOOR_MBPS=$f MOVIE_${u}_VIDEO_MAX_MBPS=0)
+        load_policy 2>/dev/null
 
-    COMPRESS_CONF=$(conf_with nomax MOVIE_HIGH_VIDEO_MAX_MBPS=0 MOVIE_HIGH_VIDEO_TARGET_GIB=40)
+        # 1 / 7 / 8: normal GiB/hour calculation (no max, large source)
+        for h in 1.5 2 2.5 3; do
+            dur=$(awk -v h="$h" 'BEGIN { printf "%.0f", h * 3600 }')
+            want=$(awk -v r="$r" -v h="$h" 'BEGIN { printf "%.3f", r * h }')
+            movie_video_plan "$tier" "$dur" "$(gib_bytes 60)"
+            eq "$tier ${h} h: $want GiB video"     "$PLAN_TARGET_GIB" "$want"
+            eq "$tier ${h} h: bitrate from size"   "$PLAN_TARGET_MBPS" "$(bitrate_for_gib "$want" "$dur")"
+        done
+        movie_video_plan "$tier" 7200
+        eq "$tier 2 h: no minimum size"         "$PLAN_MIN_GIB" ""
+        eq "$tier 2 h: not limited"             "$PLAN_SOURCE_LIMITED/$PLAN_MAX_LIMITED/$PLAN_BELOW_FLOOR" "0/0/0"
+
+        # 2 source video smaller than the rate-based target (bitrate above the floor)
+        if [[ $tier == High ]]; then small=5.500; else small=2.300; fi
+        movie_video_plan "$tier" 7200 "$(gib_bytes "$small")"
+        eq "$tier source: source size wins"     "$PLAN_TARGET_GIB" "$small"
+        eq "$tier source: flagged as limited"   "$PLAN_SOURCE_LIMITED/$PLAN_SOURCE_BELOW_FLOOR" "1/0"
+        eq "$tier source: bitrate from source"  "$PLAN_TARGET_MBPS" "$(bitrate_for_gib "$small" 7200)"
+
+        # source bitrate vs floor (2 h; bytes for an exact Mb/s over 7200 s)
+        mbps_bytes() { awk -v x="$1" 'BEGIN { printf "%.0f", x * 1000000 / 8 * 7200 }'; }
+        half=$(awk -v f="$f" 'BEGIN { printf "%.3f", f / 2 }')
+        fl=$(awk -v f="$f" 'BEGIN { printf "%.3f", f }')
+
+        # S1 source below floor, GiB/hour target below the source -> source wins
+        COMPRESS_CONF=$(conf_with "hbsrc$tier" MOVIE_${u}_VIDEO_GIB_PER_HOUR=0.1 \
+            MOVIE_${u}_VIDEO_FLOOR_MBPS=$f MOVIE_${u}_VIDEO_MAX_MBPS=$m)
+        load_policy 2>/dev/null
+        movie_video_plan "$tier" 7200 "$(mbps_bytes "$half")"
+        eq "$tier S1 src<floor, rate<src: source bitrate" "$PLAN_TARGET_MBPS" "$half"
+        eq "$tier S1 src<floor, rate<src: flagged" "$PLAN_SOURCE_BELOW_FLOOR" 1
+        # S5 no floor conflict when the source itself is below the floor
+        eq "$tier S5 src<floor: no conflict"    "$PLAN_BELOW_FLOOR" 0
+
+        # S2 source below floor, GiB/hour target above the source -> source wins
+        COMPRESS_CONF=$(conf_with "hbsrc2$tier" MOVIE_${u}_VIDEO_GIB_PER_HOUR=$big \
+            MOVIE_${u}_VIDEO_FLOOR_MBPS=$f MOVIE_${u}_VIDEO_MAX_MBPS=0)
+        load_policy 2>/dev/null
+        movie_video_plan "$tier" 7200 "$(mbps_bytes "$half")"
+        eq "$tier S2 src<floor, rate>src: source bitrate" "$PLAN_TARGET_MBPS" "$half"
+        eq "$tier S2 src<floor, rate>src: no conflict" "$PLAN_SOURCE_BELOW_FLOOR/$PLAN_BELOW_FLOOR" "1/0"
+
+        # S3 source equal to the floor -> normal path (low rate -> conflict)
+        COMPRESS_CONF=$(conf_with "hbsrc3$tier" MOVIE_${u}_VIDEO_GIB_PER_HOUR=0.1 \
+            MOVIE_${u}_VIDEO_FLOOR_MBPS=$f MOVIE_${u}_VIDEO_MAX_MBPS=$m)
+        load_policy 2>/dev/null
+        movie_video_plan "$tier" 7200 "$(mbps_bytes "$fl")"
+        eq "$tier S3 src=floor: not below floor" "$PLAN_SOURCE_BELOW_FLOOR" 0
+        eq "$tier S3 src=floor: GiB/hour target" "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 0.2 7200)"
+        eq "$tier S3 src=floor: floor conflict"  "$PLAN_BELOW_FLOOR" 1
+
+        # S4 source above the floor -> GiB/hour logic unchanged
+        COMPRESS_CONF=$(conf_with "hbsrc4$tier" MOVIE_${u}_VIDEO_GIB_PER_HOUR=$r \
+            MOVIE_${u}_VIDEO_FLOOR_MBPS=$f MOVIE_${u}_VIDEO_MAX_MBPS=$m)
+        load_policy 2>/dev/null
+        movie_video_plan "$tier" 7200 "$(mbps_bytes "$(awk -v f="$f" 'BEGIN { print f * 2 }')")"
+        want=$(awk -v r="$r" 'BEGIN { printf "%.3f", r * 2 }')
+        eq "$tier S4 src>floor: GiB/hour size"   "$PLAN_TARGET_GIB" "$want"
+        eq "$tier S4 src>floor: bitrate"         "$PLAN_TARGET_MBPS" "$(bitrate_for_gib "$want" 7200)"
+        eq "$tier S4 src>floor: no flags"        "$PLAN_SOURCE_BELOW_FLOOR/$PLAN_SOURCE_LIMITED/$PLAN_BELOW_FLOOR" "0/0/0"
+
+        # Quality is unchanged: a source below its floor still gets the size target
+        COMPRESS_CONF=$(conf_with "qsrc$tier" MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=0.1 MOVIE_QUALITY_VIDEO_MIN_GIB=0.1 \
+            MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=0)
+        load_policy 2>/dev/null
+        movie_video_plan Quality 7200 "$(mbps_bytes 6)"
+        eq "Quality src<floor: size target kept" "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 0.2 7200)"
+        eq "Quality src<floor: conflict as before" "$PLAN_BELOW_FLOOR" 1
+
+        # 3 nonzero bitrate max limits the result
+        COMPRESS_CONF=$(conf_with "hbmax$tier" MOVIE_${u}_VIDEO_GIB_PER_HOUR=$big \
+            MOVIE_${u}_VIDEO_FLOOR_MBPS=$f MOVIE_${u}_VIDEO_MAX_MBPS=$m)
+        load_policy 2>/dev/null
+        movie_video_plan "$tier" 7200 "$(gib_bytes 60)"
+        eq "$tier max: capped at $m Mb/s"        "$PLAN_TARGET_MBPS" "$(awk -v m="$m" 'BEGIN { printf "%.3f", m }')"
+        eq "$tier max: flagged as limited"      "$PLAN_MAX_LIMITED" 1
+
+        # 4 calculated bitrate below the floor -> conflict, floor not forced
+        COMPRESS_CONF=$(conf_with "hbfloor$tier" MOVIE_${u}_VIDEO_GIB_PER_HOUR=0.5 \
+            MOVIE_${u}_VIDEO_FLOOR_MBPS=$f MOVIE_${u}_VIDEO_MAX_MBPS=$m)
+        load_policy 2>/dev/null
+        movie_video_plan "$tier" 7200 "$(gib_bytes 60)"
+        eq "$tier floor: below floor -> asks"   "$PLAN_BELOW_FLOOR" 1
+        eq "$tier floor: target not raised"     "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 1 7200)"
+        eq "$tier floor: floor offered"         "$PLAN_FLOOR_MBPS" "$f"
+
+        # 6 changing GiB/hour changes the target
+        COMPRESS_CONF=$(conf_with "hbrate$tier" MOVIE_${u}_VIDEO_GIB_PER_HOUR=$r2 \
+            MOVIE_${u}_VIDEO_FLOOR_MBPS=$f MOVIE_${u}_VIDEO_MAX_MBPS=0)
+        load_policy 2>/dev/null
+        movie_video_plan "$tier" 7200 "$(gib_bytes 60)"
+        eq "$tier edited GiB/hour: $r2 * 2 h"   "$PLAN_TARGET_GIB" "$(awk -v r="$r2" 'BEGIN { printf "%.3f", r * 2 }')"
+    done
+
+    # default config: High 2 h -> 6 GiB, Base 2 h -> 2.5 GiB before caps
+    COMPRESS_CONF="$T/compress.conf"
+    load_policy 2>/dev/null
+    movie_video_plan High 7200;  eq "default High 2 h rate-based 6 GiB"   "$PLAN_RATE_GIB" 6.000
+    movie_video_plan Base 7200;  eq "default Base 2 h rate-based 2.5 GiB" "$PLAN_RATE_GIB" 2.500
+
+    COMPRESS_CONF=$(conf_with nomax MOVIE_HIGH_VIDEO_MAX_MBPS=0 MOVIE_HIGH_VIDEO_GIB_PER_HOUR=40)
     load_policy 2>/dev/null
     movie_video_plan High 5400
-    eq "MAX_MBPS=0: size decides"         "$PLAN_TARGET_MBPS" "$(exp_clamp 40 "$MOVIE_HIGH_VIDEO_FLOOR_MBPS" 0 5400)"
+    eq "MAX_MBPS=0: size decides"         "$PLAN_TARGET_MBPS" "$(exp_rate 40 0 5400)"
 
     # Quality: GiB/hour with a minimum size (fixed values, not the defaults)
     COMPRESS_CONF=$(conf_with q MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=8.4 MOVIE_QUALITY_VIDEO_MIN_GIB=20 \
@@ -299,11 +401,19 @@ reject_file() {   # LABEL PATTERN CONF
         bad "rejects $label (message: $(tr '\n' ' ' < "$T/rej.out"))"
     fi
 }
-reject "negative size"            "must not be negative"     MOVIE_HIGH_VIDEO_TARGET_GIB=-3
+reject "negative size"            "must not be negative"     MOVIE_HIGH_VIDEO_GIB_PER_HOUR=-3
 reject "negative bitrate"         "must not be negative"     MOVIE_BASE_VIDEO_FLOOR_MBPS=-1
 reject "non-numeric value"        "not a number"             MOVIE_HIGH_VIDEO_MAX_MBPS=twelve
 reject "floor above nonzero max"  "is greater than MOVIE_HIGH_VIDEO_MAX_MBPS" MOVIE_HIGH_VIDEO_FLOOR_MBPS=15
-reject "zero size target"         "must be greater than 0"   MOVIE_BASE_VIDEO_TARGET_GIB=0
+reject "zero High GiB/hour"       'MOVIE_HIGH_VIDEO_GIB_PER_HOUR="0": must be greater than 0' MOVIE_HIGH_VIDEO_GIB_PER_HOUR=0
+reject "zero Base GiB/hour"       'MOVIE_BASE_VIDEO_GIB_PER_HOUR="0": must be greater than 0' MOVIE_BASE_VIDEO_GIB_PER_HOUR=0
+reject "negative High floor"      'MOVIE_HIGH_VIDEO_FLOOR_MBPS="-1": must not be negative' MOVIE_HIGH_VIDEO_FLOOR_MBPS=-1
+reject "negative Base max"        'MOVIE_BASE_VIDEO_MAX_MBPS="-5": must not be negative' MOVIE_BASE_VIDEO_MAX_MBPS=-5
+reject "Base floor above max"     'MOVIE_BASE_VIDEO_FLOOR_MBPS (6) is greater than MOVIE_BASE_VIDEO_MAX_MBPS (5)' MOVIE_BASE_VIDEO_FLOOR_MBPS=6
+for k in MOVIE_HIGH_VIDEO_GIB_PER_HOUR MOVIE_BASE_VIDEO_GIB_PER_HOUR MOVIE_HIGH_VIDEO_FLOOR_MBPS MOVIE_BASE_VIDEO_MAX_MBPS; do
+    f=$(conf_with "unset$k"); sed -i "/^$k=/d" "$f"
+    reject_file "missing $k" "$k is not set" "$f"
+done
 reject "decimal kb/s"             "whole number of kb/s"     SERIES_HIGH_AAC_KBPS_6=640.5
 reject "bad audio mode"           "must be \"copy\" or \"cap\"" MOVIE_QUALITY_AUDIO_MODE=lossless
 reject "zero Quality GiB/hour"    'MOVIE_QUALITY_VIDEO_GIB_PER_HOUR="0": must be greater than 0' MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=0
