@@ -9,6 +9,7 @@
 # compress.conf is the only place the numbers live.
 
 POLICY_KEYS_POSITIVE=(
+    MOVIE_QUALITY_VIDEO_GIB_PER_HOUR MOVIE_QUALITY_VIDEO_MIN_GIB
     MOVIE_HIGH_VIDEO_TARGET_GIB
     MOVIE_BASE_VIDEO_TARGET_GIB
     MOVIE_HIGH_AAC_KBPS_7PLUS MOVIE_HIGH_AAC_KBPS_6 MOVIE_HIGH_AAC_KBPS_3TO5
@@ -30,8 +31,8 @@ POLICY_KEYS_POSITIVE=(
 
 # 0 allowed (0 = "no ceiling" / "no limit")
 POLICY_KEYS_NONNEG=(
-    MOVIE_QUALITY_VIDEO_MAX_GIB MOVIE_QUALITY_VIDEO_FLOOR_MBPS
-    MOVIE_QUALITY_VIDEO_MAX_MBPS MOVIE_QUALITY_AUDIO_MAX_GIB
+    MOVIE_QUALITY_VIDEO_FLOOR_MBPS MOVIE_QUALITY_VIDEO_MAX_MBPS
+    MOVIE_QUALITY_AUDIO_MAX_GIB
     MOVIE_HIGH_VIDEO_FLOOR_MBPS MOVIE_HIGH_VIDEO_MAX_MBPS MOVIE_HIGH_AUDIO_MAX_GIB
     MOVIE_BASE_VIDEO_FLOOR_MBPS MOVIE_BASE_VIDEO_MAX_MBPS
     SERIES_MIN_VIDEO_KBPS
@@ -80,12 +81,6 @@ validate_policy() {
             errs+=("$fl (${!fl}) is greater than $mx (${!mx})")
         fi
     done
-
-    # Quality needs at least one ceiling
-    if _policy_is_num "${MOVIE_QUALITY_VIDEO_MAX_GIB:-}" && _policy_is_num "${MOVIE_QUALITY_VIDEO_MAX_MBPS:-}" &&
-       awk -v a="$MOVIE_QUALITY_VIDEO_MAX_GIB" -v b="$MOVIE_QUALITY_VIDEO_MAX_MBPS" 'BEGIN { exit !(a == 0 && b == 0) }'; then
-        errs+=("MOVIE_QUALITY_VIDEO_MAX_GIB and MOVIE_QUALITY_VIDEO_MAX_MBPS are both 0: Quality needs a size or bitrate ceiling")
-    fi
 
     m="${MOVIE_QUALITY_AUDIO_MODE-}"
     case "$m" in
@@ -165,41 +160,77 @@ load_policy() {
 # Movie
 # ------------------------------------------------------------
 
-# movie_video_plan TIER DURATION_SECONDS
+# movie_video_plan TIER DURATION_SECONDS [SOURCE_VIDEO_BYTES]
+#
+# Quality (size per hour, with a minimum size):
+#   rate   = hours * MOVIE_QUALITY_VIDEO_GIB_PER_HOUR
+#   target = max(rate, MOVIE_QUALITY_VIDEO_MIN_GIB)
+#   target = min(target, source video size)
+#   bitrate from target and duration, capped at MOVIE_QUALITY_VIDEO_MAX_MBPS
+#   (0 = no cap). Below the floor -> the menu asks floor vs target.
+#
+# High / Base: size target, clamped between floor and max.
 #
 # Sets:
-#   PLAN_TARGET_MBPS      video target from the policy (before the
-#                         "never above source" cap)
+#   PLAN_TARGET_MBPS      video target from the policy (the menu still
+#                         applies the "never above source bitrate" cap)
 #   PLAN_FLOOR_MBPS       floor of the tier
-#   PLAN_SIZE_MBPS        bitrate of the tier's size value ("" if none)
-#   PLAN_BELOW_FLOOR      1 (Quality only) when the ceilings are below
-#                         the floor: the menu asks floor vs ceiling
+#   PLAN_SIZE_MBPS        bitrate of the tier's size target
+#   PLAN_BELOW_FLOOR      1 (Quality only) when the target is below the
+#                         floor: the menu asks floor vs target
+# Quality only:
+#   PLAN_RATE_GIB         GiB/hour * runtime
+#   PLAN_MIN_GIB          configured minimum size
+#   PLAN_TARGET_GIB       selected video size (after the source limit)
+#   PLAN_SOURCE_GIB       source video size ("" when not known)
+#   PLAN_SOURCE_LIMITED   1 when the source size lowered the target
+#   PLAN_MAX_LIMITED      1 when MOVIE_QUALITY_VIDEO_MAX_MBPS lowered it
 movie_video_plan() {
-    local tier="$1" dur="$2"
+    local tier="$1" dur="$2" src_bytes="${3:-}"
     local gib floor max t
 
     PLAN_BELOW_FLOOR=0
     PLAN_SIZE_MBPS=""
+    PLAN_RATE_GIB=""
+    PLAN_MIN_GIB=""
+    PLAN_TARGET_GIB=""
+    PLAN_SOURCE_GIB=""
+    PLAN_SOURCE_LIMITED=0
+    PLAN_MAX_LIMITED=0
 
     case "$tier" in
         Quality)
-            gib="$MOVIE_QUALITY_VIDEO_MAX_GIB"
             floor="$MOVIE_QUALITY_VIDEO_FLOOR_MBPS"
             max="$MOVIE_QUALITY_VIDEO_MAX_MBPS"
 
-            awk -v g="$gib" 'BEGIN { exit !(g > 0) }' &&
-                PLAN_SIZE_MBPS=$(bitrate_for_gib "$gib" "$dur")
+            PLAN_RATE_GIB=$(awk -v r="$MOVIE_QUALITY_VIDEO_GIB_PER_HOUR" -v d="$dur" \
+                'BEGIN { printf "%.3f", r * d / 3600 }')
+            PLAN_MIN_GIB=$(awk -v m="$MOVIE_QUALITY_VIDEO_MIN_GIB" 'BEGIN { printf "%.3f", m }')
+            gib=$(max_value "$PLAN_RATE_GIB" "$PLAN_MIN_GIB")
 
-            # as high as possible up to every configured ceiling
-            if [[ -n "$PLAN_SIZE_MBPS" ]] && awk -v m="$max" 'BEGIN { exit !(m > 0) }'; then
-                t=$(min_value "$max" "$PLAN_SIZE_MBPS")
-            elif [[ -n "$PLAN_SIZE_MBPS" ]]; then
-                t=$(min_value "$PLAN_SIZE_MBPS" "$PLAN_SIZE_MBPS")
-            else
-                t=$(min_value "$max" "$max")
+            if [[ "$src_bytes" =~ ^[0-9]+$ ]] && (( src_bytes > 0 )); then
+                PLAN_SOURCE_GIB=$(awk -v b="$src_bytes" 'BEGIN { printf "%.3f", b / 1073741824 }')
+                if awk -v s="$PLAN_SOURCE_GIB" -v g="$gib" 'BEGIN { exit !(s < g) }'; then
+                    gib="$PLAN_SOURCE_GIB"
+                    PLAN_SOURCE_LIMITED=1
+                fi
             fi
 
-            awk -v x="$t" -v f="$floor" 'BEGIN { exit !(x < f) }' && PLAN_BELOW_FLOOR=1
+            PLAN_TARGET_GIB="$gib"
+            PLAN_SIZE_MBPS=$(bitrate_for_gib "$gib" "$dur")
+            t="$PLAN_SIZE_MBPS"
+
+            if awk -v m="$max" -v x="$t" 'BEGIN { exit !(m > 0 && x > m) }'; then
+                t=$(min_value "$max" "$t")
+                PLAN_MAX_LIMITED=1
+            fi
+
+            # A source below the floor is not a conflict: encoding above
+            # the source is never done, so the floor could not be used.
+            if (( PLAN_SOURCE_LIMITED == 0 )) &&
+               awk -v x="$t" -v f="$floor" 'BEGIN { exit !(x < f) }'; then
+                PLAN_BELOW_FLOOR=1
+            fi
             ;;
         High|Base)
             local u="${tier^^}"
@@ -303,10 +334,10 @@ movie_policy_line() {
 
     case "$1" in
         Quality)
-            printf 'quality-first [%s Mb/s floor / %s / %s video max]' \
+            printf 'quality-first [%s GiB/hour video, at least %s GiB / %s Mb/s floor / %s]' \
+                "$MOVIE_QUALITY_VIDEO_GIB_PER_HOUR" "$MOVIE_QUALITY_VIDEO_MIN_GIB" \
                 "$MOVIE_QUALITY_VIDEO_FLOOR_MBPS" \
-                "$(awk -v m="$MOVIE_QUALITY_VIDEO_MAX_MBPS" 'BEGIN { print (m > 0) ? m " Mb/s max" : "no bitrate max" }')" \
-                "$(awk -v g="$MOVIE_QUALITY_VIDEO_MAX_GIB" 'BEGIN { print (g > 0) ? g " GiB" : "no size" }')"
+                "$(awk -v m="$MOVIE_QUALITY_VIDEO_MAX_MBPS" 'BEGIN { print (m > 0) ? m " Mb/s max" : "no bitrate max" }')"
             cap=$(movie_audio_cap_gib Quality)
             ;;
         High|Base)
@@ -327,6 +358,15 @@ movie_policy_line() {
     else
         printf '; audio copied'
     fi
+}
+
+# movie_quality_policy_lines  ->  the Quality video settings, one per line
+movie_quality_policy_lines() {
+    echo "Quality video policy:"
+    echo "  ${MOVIE_QUALITY_VIDEO_GIB_PER_HOUR} GiB/hour"
+    echo "  minimum preferred video size: ${MOVIE_QUALITY_VIDEO_MIN_GIB} GiB"
+    echo "  bitrate floor: ${MOVIE_QUALITY_VIDEO_FLOOR_MBPS} Mb/s"
+    awk -v m="$MOVIE_QUALITY_VIDEO_MAX_MBPS" 'BEGIN { print "  bitrate max: " ((m > 0) ? m " Mb/s" : "none") }'
 }
 
 # ------------------------------------------------------------

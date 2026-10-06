@@ -134,6 +134,18 @@ exp_clamp() {   # size_gib floor max dur  ->  clamp(bitrate(size), floor, max>0 
         printf "%.3f", t }'
 }
 
+# Quality: max(hours * GiB/hour, min GiB), min(source), cap at max Mb/s
+exp_quality() {   # dur [source_gib]  ->  target Mb/s from the loaded config
+    awk -v r="$MOVIE_QUALITY_VIDEO_GIB_PER_HOUR" -v n="$MOVIE_QUALITY_VIDEO_MIN_GIB" \
+        -v m="$MOVIE_QUALITY_VIDEO_MAX_MBPS" -v d="$1" -v s="${2:-0}" 'BEGIN {
+        g = r * d / 3600; if (g < n) g = n
+        if (s > 0 && s < g) g = s
+        t = g * 1073741824 * 8 / d / 1000000
+        if (m > 0 && t > m) t = m
+        printf "%.3f", t }'
+}
+gib_bytes() { awk -v g="$1" 'BEGIN { printf "%.0f", g * 1073741824 }'; }
+
 check "default compress.conf loads"           "load_policy 2>'$T/pol.err'"
 {
     load_policy 2>/dev/null
@@ -145,13 +157,12 @@ check "default compress.conf loads"           "load_policy 2>'$T/pol.err'"
         done
     done
 
+    for dur in 3600 6000 10800 20000; do
+        movie_video_plan Quality "$dur"
+        eq "movie Quality ${dur}s target from config" "$PLAN_TARGET_MBPS" "$(exp_quality "$dur")"
+    done
     movie_video_plan Quality 5400
-    eq "movie Quality 90 min = min(max Mb/s, size)" "$PLAN_TARGET_MBPS" \
-        "$(awk -v m="$MOVIE_QUALITY_VIDEO_MAX_MBPS" -v g="$MOVIE_QUALITY_VIDEO_MAX_GIB" 'BEGIN {
-            s = g * 1073741824 * 8 / 5400 / 1000000; printf "%.3f", (m < s ? m : s) }')"
     eq "movie Quality 90 min not below floor" "$PLAN_BELOW_FLOOR" 0
-    movie_video_plan Quality 20000
-    eq "movie Quality 5.5 h below floor -> asks" "$PLAN_BELOW_FLOOR" 1
 
     eq "movie High AAC 5.1 from config"   "$(movie_aac_kbps High 6)" "$MOVIE_HIGH_AAC_KBPS_6"
     eq "movie Base AAC stereo from config" "$(movie_aac_kbps Base 2)" "$MOVIE_BASE_AAC_KBPS_2"
@@ -190,10 +201,73 @@ conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the default config
     movie_video_plan High 5400
     eq "MAX_MBPS=0: size decides"         "$PLAN_TARGET_MBPS" "$(exp_clamp 40 "$MOVIE_HIGH_VIDEO_FLOOR_MBPS" 0 5400)"
 
-    COMPRESS_CONF=$(conf_with qnomax MOVIE_QUALITY_VIDEO_MAX_MBPS=0)
+    # Quality: GiB/hour with a minimum size (fixed values, not the defaults)
+    COMPRESS_CONF=$(conf_with q MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=8.4 MOVIE_QUALITY_VIDEO_MIN_GIB=20 \
+        MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=0)
     load_policy 2>/dev/null
-    movie_video_plan Quality 5400
-    eq "Quality MAX_MBPS=0: size ceiling" "$PLAN_TARGET_MBPS" "$(bitrate_for_gib "$MOVIE_QUALITY_VIDEO_MAX_GIB" 5400)"
+
+    # 1 short movie: 8.4 * 1.5 = 12.6 GiB < 20 -> the minimum wins
+    movie_video_plan Quality 5400 "$(gib_bytes 60)"
+    eq "Q1 short: rate-based size"        "$PLAN_RATE_GIB" 12.600
+    eq "Q1 short: minimum size wins"      "$PLAN_TARGET_GIB" 20.000
+    eq "Q1 short: bitrate from 20 GiB"    "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 20 5400)"
+    eq "Q1 short: not source limited"     "$PLAN_SOURCE_LIMITED" 0
+
+    # 2 long movie: 8.4 * 3 = 25.2 GiB > 20 -> GiB/hour wins
+    movie_video_plan Quality 10800 "$(gib_bytes 60)"
+    eq "Q2 long: GiB/hour size wins"      "$PLAN_TARGET_GIB" 25.200
+    eq "Q2 long: bitrate from 25.2 GiB"   "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 25.2 10800)"
+
+    # 3 source video smaller than the target -> source size wins
+    movie_video_plan Quality 10800 "$(gib_bytes 15)"
+    eq "Q3 source: source size wins"      "$PLAN_TARGET_GIB" 15.000
+    eq "Q3 source: flagged as limited"    "$PLAN_SOURCE_LIMITED" 1
+    eq "Q3 source: bitrate from source"   "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 15 10800)"
+    movie_video_plan Quality 10800 "$(gib_bytes 2)"
+    eq "Q3 source below floor: no conflict" "$PLAN_BELOW_FLOOR" 0
+
+    # 7 Grand Budapest-style: 1h40m, 24.38 GiB source video
+    movie_video_plan Quality 6000 "$(gib_bytes 24.38)"
+    eq "Q7 GBH: rate-based ~14 GiB"       "$PLAN_RATE_GIB" 14.000
+    eq "Q7 GBH: minimum 20 GiB"           "$PLAN_MIN_GIB" 20.000
+    eq "Q7 GBH: source 24.38 GiB"         "$PLAN_SOURCE_GIB" 24.380
+    eq "Q7 GBH: target 20 GiB video"      "$PLAN_TARGET_GIB" 20.000
+    eq "Q7 GBH: not limited by source"    "$PLAN_SOURCE_LIMITED" 0
+    eq "Q7 GBH: not capped at 20 Mb/s"    "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 20 6000)"
+    check "Q7 GBH: ~28.6 Mb/s"            "awk -v x='$PLAN_TARGET_MBPS' 'BEGIN { exit !(x > 28.5 && x < 28.7) }'"
+    eq "Q7 GBH: expected size ~20 GiB"    "$(video_size_gib "$PLAN_TARGET_MBPS" 6000)" 20.000
+
+    # 4 nonzero bitrate max limits the calculated bitrate
+    COMPRESS_CONF=$(conf_with qmax MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=8.4 MOVIE_QUALITY_VIDEO_MIN_GIB=20 \
+        MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=25)
+    load_policy 2>/dev/null
+    movie_video_plan Quality 6000 "$(gib_bytes 24.38)"
+    eq "Q4 max: capped at 25 Mb/s"        "$PLAN_TARGET_MBPS" 25.000
+    eq "Q4 max: flagged as limited"       "$PLAN_MAX_LIMITED" 1
+    movie_video_plan Quality 10800
+    eq "Q4 max: below max untouched"      "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 25.2 10800)"
+    eq "Q4 max: not flagged"              "$PLAN_MAX_LIMITED" 0
+
+    # 5 floor conflict: 2 GiB/hour ~ 4.8 Mb/s < 12 Mb/s floor -> menu asks
+    COMPRESS_CONF=$(conf_with qfloor MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=2 MOVIE_QUALITY_VIDEO_MIN_GIB=1 \
+        MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=0)
+    load_policy 2>/dev/null
+    movie_video_plan Quality 7200 "$(gib_bytes 60)"
+    eq "Q5 floor: below floor -> asks"    "$PLAN_BELOW_FLOOR" 1
+    eq "Q5 floor: target not raised"      "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 4 7200)"
+    eq "Q5 floor: floor offered"          "$PLAN_FLOOR_MBPS" 12
+    COMPRESS_CONF=$(conf_with qfloor2 MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=2 MOVIE_QUALITY_VIDEO_MIN_GIB=20 \
+        MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=0)
+    load_policy 2>/dev/null
+    movie_video_plan Quality 3600 "$(gib_bytes 60)"
+    eq "Q5 floor: minimum size lifts above floor" "$PLAN_BELOW_FLOOR" 0
+
+    # 6 changing GiB/hour changes the target
+    COMPRESS_CONF=$(conf_with qrate MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=12 MOVIE_QUALITY_VIDEO_MIN_GIB=20)
+    load_policy 2>/dev/null
+    movie_video_plan Quality 10800
+    eq "Q6 edited GiB/hour: 12 * 3 h"     "$PLAN_TARGET_GIB" 36.000
+    eq "Q6 edited GiB/hour: bitrate"      "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 36 10800)"
 
     COMPRESS_CONF=$(conf_with aac MOVIE_HIGH_AAC_KBPS_6=500 MOVIE_HIGH_AAC_KBPS_2=100)
     load_policy 2>/dev/null
@@ -232,7 +306,14 @@ reject "floor above nonzero max"  "is greater than MOVIE_HIGH_VIDEO_MAX_MBPS" MO
 reject "zero size target"         "must be greater than 0"   MOVIE_BASE_VIDEO_TARGET_GIB=0
 reject "decimal kb/s"             "whole number of kb/s"     SERIES_HIGH_AAC_KBPS_6=640.5
 reject "bad audio mode"           "must be \"copy\" or \"cap\"" MOVIE_QUALITY_AUDIO_MODE=lossless
-reject "Quality without ceiling"  "Quality needs a size or bitrate ceiling" MOVIE_QUALITY_VIDEO_MAX_GIB=0 MOVIE_QUALITY_VIDEO_MAX_MBPS=0
+reject "zero Quality GiB/hour"    'MOVIE_QUALITY_VIDEO_GIB_PER_HOUR="0": must be greater than 0' MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=0
+reject "zero Quality minimum"     'MOVIE_QUALITY_VIDEO_MIN_GIB="0": must be greater than 0' MOVIE_QUALITY_VIDEO_MIN_GIB=0
+reject "negative Quality floor"   'MOVIE_QUALITY_VIDEO_FLOOR_MBPS="-1": must not be negative' MOVIE_QUALITY_VIDEO_FLOOR_MBPS=-1
+reject "negative Quality max"     'MOVIE_QUALITY_VIDEO_MAX_MBPS="-5": must not be negative' MOVIE_QUALITY_VIDEO_MAX_MBPS=-5
+reject "Quality floor above max"  'MOVIE_QUALITY_VIDEO_FLOOR_MBPS (12) is greater than MOVIE_QUALITY_VIDEO_MAX_MBPS (10)' MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=10
+f=$(conf_with qunset); sed -i '/^MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=/d' "$f"
+reject_file "missing Quality GiB/hour" "MOVIE_QUALITY_VIDEO_GIB_PER_HOUR is not set" "$f"
+check "Quality floor 12 max 0 allowed" "( COMPRESS_CONF=\$(conf_with qok MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=0) load_policy )"
 reject "bad Base audio choice"    "is not a size greater than 0" 'MOVIE_BASE_AUDIO_MAX_GIB_CHOICES="1 none"'
 f=$(conf_with unset); sed -i '/^SERIES_MIN_VIDEO_KBPS=/d' "$f"
 reject_file "missing setting"     "SERIES_MIN_VIDEO_KBPS is not set" "$f"
