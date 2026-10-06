@@ -14,7 +14,7 @@ source "$WORK_DIR/lib/hdr_dovi.sh"
 source "$WORK_DIR/lib/policy.sh"
 
 # ============================================================
-# POLICY  (values: ~/compress/compress.conf, loaded by policy.sh)
+# POLICY  (values: ~/compress/work/lib/compress.conf, loaded by policy.sh)
 #
 # Base / High: SERIES_*_TOTAL_GIB_PER_HOUR
 # Custom:      user-entered GiB/hour, High audio rates

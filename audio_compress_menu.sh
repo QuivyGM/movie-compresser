@@ -13,7 +13,7 @@ source "$WORK_DIR/lib/encode_common.sh"
 source "$WORK_DIR/lib/hdr_dovi.sh"
 source "$WORK_DIR/lib/policy.sh"
 
-# Policy values: ~/compress/compress.conf (AUDIO_* settings)
+# Policy values: ~/compress/work/lib/compress.conf (AUDIO_* settings)
 if ! load_policy; then
     exit 1
 fi

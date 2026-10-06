@@ -17,7 +17,7 @@ source "$WORK_DIR/lib/policy.sh"
 declare -a INPUTS OUTPUTS BITRATES FILTERS TIERS AUDIO_ARGS OVERWRITES
 declare -a DV_POLICIES DV_MODES HDR10P_POLICIES
 
-# Compression policy: ~/compress/compress.conf (loaded and validated
+# Compression policy: ~/compress/work/lib/compress.conf (loaded and validated
 # by work/lib/policy.sh). The policy math lives there as well
 # (movie_video_plan, build_audio_args).
 if ! load_policy; then

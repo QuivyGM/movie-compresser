@@ -3,7 +3,7 @@
 # policy math that uses it (movie video targets, AAC rate tables, series
 # / audio-menu rates). Sourced, not executed. Needs bitrate.sh.
 #
-# The config is ~/compress/compress.conf (next to work/); COMPRESS_CONF
+# The config is ~/compress/work/lib/compress.conf; COMPRESS_CONF
 # overrides the path (tests). There are no built-in fallback values:
 # a missing file or setting stops the menu with a clear message, so
 # compress.conf is the only place the numbers live.
@@ -38,7 +38,7 @@ POLICY_KEYS_NONNEG=(
 )
 
 policy_conf_path() {
-    printf '%s' "${COMPRESS_CONF:-$(dirname "${WORK_DIR:-$HOME/compress/work}")/compress.conf}"
+    printf '%s' "${COMPRESS_CONF:-${WORK_DIR:-$HOME/compress/work}/lib/compress.conf}"
 }
 
 _policy_is_num() {

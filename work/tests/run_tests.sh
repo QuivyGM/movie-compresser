@@ -113,8 +113,8 @@ for l in media_probe media_stats bitrate encode_common hdr_dovi policy; do
     source "$WORK_DIR/lib/$l.sh"
 done
 
-# the project's default policy file, as deployed to ~/compress
-cp "$ROOT/compress.conf" "$T/compress.conf"
+# the project's default policy file (work/lib/compress.conf)
+cp "$SRC_WORK/lib/compress.conf" "$T/compress.conf"
 export COMPRESS_CONF="$T/compress.conf"
 
 HAVE_MKV=0
@@ -168,7 +168,7 @@ check "default compress.conf loads"           "load_policy 2>'$T/pol.err'"
 conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the default config
     local f="$T/conf_$1.conf" kv
     shift
-    cp "$ROOT/compress.conf" "$f"
+    cp "$SRC_WORK/lib/compress.conf" "$f"
     for kv in "$@"; do
         sed -i "s|^${kv%%=*}=.*|${kv}|" "$f"
         grep -q "^${kv%%=*}=" "$f" || echo "$kv" >> "$f"
