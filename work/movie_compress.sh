@@ -19,7 +19,7 @@ source "$WORK_DIR/lib/policy.sh"
 # or Quality's two-pass kb/s); EST_VBYTES: pre-encode video estimate
 # (assigned empty: "set -u" rejects ${#INPUTS[@]} of a never-assigned
 # array when every movie was skipped)
-declare -a INPUTS=() OUTPUTS=() VIDEOS=() EST_VBYTES=() FILTERS=() TIERS=() OVERWRITES=()
+declare -a INPUTS=() OUTPUTS=() VIDEOS=() EST_VBYTES=() RETRIES=() FILTERS=() TIERS=() OVERWRITES=()
 declare -a DV_POLICIES=() DV_MODES=() HDR10P_POLICIES=()
 
 # Compression policy: ~/compress/work/lib/compress.conf (loaded and validated
@@ -359,6 +359,7 @@ while true; do
 
         VIDEO_SPEC="$TARGET_KBPS"
         EST_VIDEO_BYTES=""
+        RETRY_SPEC=""
     else
 
         # ====================================================
@@ -406,6 +407,14 @@ while true; do
         EST_VIDEO_BYTES="${CRF_EST[$CRF]}"
         EXPECTED_VIDEO_GIB=$(bytes_to_gib "$EST_VIDEO_BYTES")
         VIDEO_SPEC="crf:$CRF"
+
+        # High / Base: re-encoded at CRF + 1 when the actual video is above
+        # the ceiling, at CRF - 1 when it fits with CRF_DOWN_RETRY_HEADROOM_PCT
+        # to spare (up to CRF_DOWN_RETRY_MAX times, not below CRF_MIN)
+        # (job_runtime.sh item_crf_encode). Not for Custom, and
+        # not when CRF_MAX above the ceiling was already accepted below.
+        RETRY_SPEC=""
+        [[ "$TIER" != "Custom" ]] && RETRY_SPEC="$CRF_CEILING_BYTES:$CRF_MAX:$CRF_MIN:$CRF_DOWN_RETRY_HEADROOM_PCT:$CRF_DOWN_RETRY_MAX"
 
         if ui_verbose; then
             echo
@@ -455,6 +464,9 @@ while true; do
                 skip_movie && continue
                 break
             fi
+
+            # CRF_MAX above the ceiling accepted: nothing left to retry
+            RETRY_SPEC=""
         fi
 
         # Source-quality guard: never make a lossy re-encode that is not
@@ -547,6 +559,7 @@ while true; do
     OUTPUTS+=("$OUT")
     VIDEOS+=("$VIDEO_SPEC")
     EST_VBYTES+=("$EST_VIDEO_BYTES")
+    RETRIES+=("$RETRY_SPEC")
     FILTERS+=("$FILTER")
     TIERS+=("$TIER")
     OVERWRITES+=("$RESOLVED_OVERWRITE")
@@ -728,7 +741,8 @@ done
             "${FILTERS[$i]}" \
             "$PASS_DIR/pass_$i" \
             "${OVERWRITES[$i]}" \
-            "${EST_VBYTES[$i]}"
+            "${EST_VBYTES[$i]}" \
+            "${RETRIES[$i]}"
     done
 
     emit_job_footer

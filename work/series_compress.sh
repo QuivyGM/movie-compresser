@@ -982,6 +982,16 @@ JOB_FILE="$WORK_DIR/${SESSION}.sh"
 # BUILD ENCODE JOB
 # ============================================================
 
+# High / Base: one CRF for the season, re-encoded together at CRF + 1
+# while the median episode's actual video is above the per-episode
+# ceiling, or at CRF - 1 while it fits with CRF_DOWN_RETRY_HEADROOM_PCT
+# to spare (job_runtime.sh job_crf_batch). Not for Custom, and not when
+# CRF_MAX above the ceiling was already accepted.
+RETRY_SPEC=""
+if [[ "$TIER" != "Custom" ]] && (( CRF_OVER_CEILING == 0 )); then
+    RETRY_SPEC="$CRF_CEILING_BYTES:$CRF_MAX:$CRF_MIN:$CRF_DOWN_RETRY_HEADROOM_PCT:$CRF_DOWN_RETRY_MAX:batch"
+fi
+
 {
     emit_job_header "$SESSION" series "$QUEUED"
 
@@ -1000,7 +1010,8 @@ JOB_FILE="$WORK_DIR/${SESSION}.sh"
             "$VIDEO_FILTER" \
             "" \
             "${EP_OVERWRITE[$i]}" \
-            "${EP_EST[$i]}"
+            "${EP_EST[$i]}" \
+            "$RETRY_SPEC"
     done
 
     emit_job_footer

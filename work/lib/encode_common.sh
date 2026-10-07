@@ -1108,6 +1108,7 @@ emit_job_header() {
 }
 
 emit_job_footer() {
+    echo 'job_crf_batch'
     echo 'job_finish'
 }
 
@@ -1166,13 +1167,24 @@ emit_failed_item() {
     printf 'fi\n\n'
 }
 
-# emit_encode_item INDEX IN OUT TIER VIDEO FILTER PASSLOG OVERWRITE [EST_VIDEO_BYTES]
+# emit_encode_item INDEX IN OUT TIER VIDEO FILTER PASSLOG OVERWRITE [EST_VIDEO_BYTES [RETRY]]
 #
 # VIDEO selects the video encode of the main video stream:
 #   crf:N   single-pass libx265 CRF encode (movie / series High, Base,
 #           Custom). No -b:v, no pass logs (PASSLOG is ignored).
 #           EST_VIDEO_BYTES, the pre-encode estimate, is reported against
 #           the actual size afterwards (never a failure).
+#           RETRY "CEILING_BYTES:CRF_MAX:CRF_MIN:HEADROOM_PCT:DOWN_MAX[:batch]"
+#           (High / Base): an attempt whose actual VIDEO bytes are above
+#           the ceiling is re-encoded at CRF + 1 up to CRF_MAX; one that
+#           fits at least HEADROOM_PCT below the ceiling tries CRF - 1
+#           (not below CRF_MIN, at most DOWN_MAX times; job_runtime.sh
+#           item_crf_encode). ":batch" (series): the episode joins the
+#           job's one-CRF season batch (job_crf_batch) instead of being
+#           encoded on its own. "" = no retry (Custom).
+#           The encode commands are a function (item_encode_INDEX) so a
+#           retry can run them again; they carry the planned CRF, which
+#           item_run replaces for a retry attempt.
 #   copy    the source video stream is kept unchanged (source-quality
 #           guard: a CRF encode would not be smaller than the source).
 #           FILTER must be empty.
@@ -1198,8 +1210,9 @@ emit_encode_item() {
     local passlog="$7"
     local overwrite="$8"
     local est="${9:-}"
+    local retry="${10:-}"
 
-    local mode kbps="" crf=""
+    local mode kbps="" crf="" rceil="" rmax="" rmin="" rdpct="" rdmax="" rbatch=""
 
     case "$video" in
         crf:*) mode="crf"; crf="${video#crf:}" ;;
@@ -1210,6 +1223,9 @@ emit_encode_item() {
     # only two-pass encodes write x265 stats files
     [[ "$mode" == "abr" ]] || passlog=""
     [[ "$est" =~ ^[0-9]+$ ]] || est=""
+    if [[ "$mode" == "crf" && -n "$retry" ]]; then
+        IFS=: read -r rceil rmax rmin rdpct rdmax rbatch <<< "$retry"
+    fi
 
     local vidx x265 color dv="" stale=""
     local dv_policy="none" h10p_policy="none" dv_out_profile="" dv_out_compat=""
@@ -1302,25 +1318,62 @@ emit_encode_item() {
     local scaled=0
     [[ -n "$filter" ]] && scaled=1
 
-    printf '# ---- item %s%s\n' "$index" \
-        "$( [[ "$dv_policy" == "preserve" ]] && echo "  (Dolby Vision profile ${HDR_DV_PROFILE} -> $DV_OUT preserved)")"
-    printf 'if item_begin %q %q %q %q %q %q &&\n' \
-        "$index" "$in" "$out" "$tier" "$overwrite" "$passlog"
+    local begin expect steps=()
+
+    begin=$(printf 'item_begin %q %q %q %q %q %q' \
+        "$index" "$in" "$out" "$tier" "$overwrite" "$passlog")
     # atrans= (empty): no audio track is transcoded; ahash=1: the copied
-    # audio payload is hash-compared with the source.
-    printf '   item_expect vidx=%q mode=%q crf=%q kbps=%q est_vbytes=%q dv=%q dv_profile=%q dv_compat=%q hdr10p=%q scaled=%q copyts=%q atrans= ahash=1 &&\n' \
+    # audio payload is hash-compared with the source. ceiling_vbytes /
+    # crf_min / crf_max: the CRF retry (High / Base; empty = none).
+    expect=$(printf 'item_expect vidx=%q mode=%q crf=%q kbps=%q est_vbytes=%q dv=%q dv_profile=%q dv_compat=%q hdr10p=%q scaled=%q copyts=%q atrans= ahash=1' \
         "$vidx" "$mode" "$crf" "$kbps" "$est" \
         "$( (( HDR_DV == 1 )) && echo "$dv_policy" || echo none)" \
         "$dv_out_profile" "$dv_out_compat" "$h10p_policy" "$scaled" \
-        "$( [[ "$dv_policy" == "preserve" ]] && echo 1 || echo 0)"
+        "$( [[ "$dv_policy" == "preserve" ]] && echo 1 || echo 0)")
+    [[ "$mode" == "crf" ]] &&
+        expect+=$(printf ' ceiling_vbytes=%q crf_min=%q crf_max=%q down_headroom_pct=%q down_max=%q' "$rceil" "$rmin" "$rmax" "$rdpct" "$rdmax")
 
-    if [[ "$dv_policy" == "preserve" ]]; then
-        printf '   item_step rpu item_dv_extract %q %q %q &&\n' "$in" "$vidx" "$DV_MODE"
+    # CRF-independent preparation (run once, not per CRF attempt)
+    [[ "$dv_policy" == "preserve" ]] &&
+        steps+=("$(printf 'item_step rpu item_dv_extract %q %q %q' "$in" "$vidx" "$DV_MODE")")
+    [[ "$h10p_policy" == "preserve" ]] &&
+        steps+=("$(printf 'item_step hdr10+ item_hdr10plus_extract %q %q' "$in" "$vidx")")
+
+    printf '# ---- item %s%s\n' "$index" \
+        "$( [[ "$dv_policy" == "preserve" ]] && echo "  (Dolby Vision profile ${HDR_DV_PROFILE} -> $DV_OUT preserved)")$( [[ "$rbatch" == batch ]] && echo "  (season CRF batch: job_crf_batch)")"
+
+    if [[ "$mode" == "crf" ]]; then
+        # the final encode as a function: a CRF retry runs it again
+        printf 'item_encode_%s() {\n' "$index"
+        _emit_final_encode
+        printf '}\n'
     fi
 
-    if [[ "$h10p_policy" == "preserve" ]]; then
-        printf '   item_step hdr10+ item_hdr10plus_extract %q %q &&\n' "$in" "$vidx"
+    if [[ "$rbatch" == batch ]]; then
+        printf 'item_ctx_%s() {\n' "$index"
+        printf '   %s &&\n' "$begin"
+        printf '   %s\n' "$expect"
+        printf '}\n'
+        printf 'item_prep_%s() {\n' "$index"
+        if (( ${#steps[@]} )); then
+            local i
+            for ((i = 0; i < ${#steps[@]}; i++)); do
+                printf '   %s%s\n' "${steps[$i]}" "$( (( i + 1 < ${#steps[@]} )) && echo ' &&')"
+            done
+        else
+            printf '   :\n'
+        fi
+        printf '}\n'
+        printf 'job_batch_add %s\n\n' "$index"
+        return 0
     fi
+
+    printf 'if %s &&\n' "$begin"
+    printf '   %s &&\n' "$expect"
+    local s
+    for s in "${steps[@]+"${steps[@]}"}"; do
+        printf '   %s &&\n' "$s"
+    done
 
     if [[ "$mode" == "abr" ]]; then
         # Pass 1 is the same for every path (the DV path only pins the
@@ -1330,8 +1383,21 @@ emit_encode_item() {
         _emit_x265_lines "$rate" "$dv" "$p1q" "$color"
         [[ "$dv_policy" == "preserve" ]] && printf '      -fps_mode:v:0 passthrough \\\n'
         printf '      -an -sn -dn -f null /dev/null &&\n'
+        _emit_final_encode
+    else
+        printf '   item_crf_encode item_encode_%s\n' "$index"
     fi
 
+    printf 'then\n'
+    printf '    item_succeeded\n'
+    printf 'else\n'
+    printf '    item_failed\n'
+    printf 'fi\n\n'
+}
+
+# _emit_final_encode  ->  the final encode + mux of emit_encode_item
+# into "$ITEM_PART" (covers, chapters); reads emit_encode_item's locals
+_emit_final_encode() {
     if [[ "$dv_policy" == "preserve" ]]; then
         # Final encode -> raw HEVC, RPU injected, wrapped by mkvmerge (DV
         # configuration record + source timestamps), then the same mux
@@ -1360,11 +1426,6 @@ emit_encode_item() {
     printf '      %s\\\n' "$stale"
     printf '      -map_metadata 0 -map_chapters 0 -max_muxing_queue_size 4096 %s\\\n' "$(matroska_mux_args)"
     emit_part_and_covers "$in"
-    printf 'then\n'
-    printf '    item_succeeded\n'
-    printf 'else\n'
-    printf '    item_failed\n'
-    printf 'fi\n\n'
 }
 
 # _emit_x265_lines RATE DV X265_PARAMS_QUOTED COLOR  ->  the libx265

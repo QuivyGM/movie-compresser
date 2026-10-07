@@ -147,6 +147,19 @@ validate_policy() {
         errs+=("SERIES_CONTAINER_RESERVE_PCT=\"$SERIES_CONTAINER_RESERVE_PCT\": not a number 0-99")
     fi
 
+    # post-encode lower-CRF retry: headroom 0-99 %, retries a whole number
+    if [[ -z "${CRF_DOWN_RETRY_HEADROOM_PCT+x}" ]]; then
+        errs+=("CRF_DOWN_RETRY_HEADROOM_PCT is not set")
+    elif ! _policy_is_num "$CRF_DOWN_RETRY_HEADROOM_PCT" ||
+         awk -v x="$CRF_DOWN_RETRY_HEADROOM_PCT" 'BEGIN { exit !(x >= 100) }'; then
+        errs+=("CRF_DOWN_RETRY_HEADROOM_PCT=\"$CRF_DOWN_RETRY_HEADROOM_PCT\": not a number 0-99")
+    fi
+    if [[ -z "${CRF_DOWN_RETRY_MAX+x}" ]]; then
+        errs+=("CRF_DOWN_RETRY_MAX is not set")
+    elif [[ ! "$CRF_DOWN_RETRY_MAX" =~ ^[0-9]+$ ]]; then
+        errs+=("CRF_DOWN_RETRY_MAX=\"$CRF_DOWN_RETRY_MAX\": must be a whole number (0 = off)")
+    fi
+
     if _policy_is_num "${AUDIO_COMPACT_LIMIT_GIB:-}" && _policy_is_num "${AUDIO_COMPACT_TRIGGER_GIB:-}" &&
        awk -v l="$AUDIO_COMPACT_LIMIT_GIB" -v t="$AUDIO_COMPACT_TRIGGER_GIB" 'BEGIN { exit !(l > t) }'; then
         errs+=("AUDIO_COMPACT_LIMIT_GIB ($AUDIO_COMPACT_LIMIT_GIB) is greater than AUDIO_COMPACT_TRIGGER_GIB ($AUDIO_COMPACT_TRIGGER_GIB)")
@@ -179,7 +192,7 @@ load_policy() {
     unset "${POLICY_KEYS_POSITIVE[@]}" "${POLICY_KEYS_NONNEG[@]}" \
         "${POLICY_KEYS_CRF[@]}" "${POLICY_KEYS_COUNT[@]}" \
         "${POLICY_KEYS_RETIRED[@]}" "${POLICY_KEYS_RETIRED_VIDEO[@]}" \
-        SERIES_CONTAINER_RESERVE_PCT
+        SERIES_CONTAINER_RESERVE_PCT CRF_DOWN_RETRY_HEADROOM_PCT CRF_DOWN_RETRY_MAX
 
     # shellcheck source=/dev/null
     if ! source "$conf"; then

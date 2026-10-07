@@ -188,6 +188,11 @@ if command -v mkvpropedit >/dev/null; then
     check "stats cached on the next run" "grep -qE '^Analyzing 3 episodes\\.\\.\\. OK    Source stats: cached    Compatibility: OK\$' '$L'"
 fi
 
+L="$T/series_start.log"
+menu series_compress.sh "2\n2\ny\n" "$L"
+check "job: season batch with CRF retry" "grep -q '^job_batch_add 3\$' '$H/compress/work/series1.sh' && grep -q 'ceiling_vbytes=5368709120 crf_min=18 crf_max=21' '$H/compress/work/series1.sh' && grep -q '^job_crf_batch\$' '$H/compress/work/series1.sh'"
+rm -rf "$H/compress/out/Show"
+
 L="$T/series_mismatch.log"
 menu series_compress.sh "1\n" "$L"
 sed 's/^/  | /' "$L"
@@ -233,6 +238,7 @@ check "CRF result"                       "grep -qE '^Video: +~[0-9.]+ GiB\$' '$L
 check "compact summary"                  "grep -q '^Added: Film.mkv\$' '$L' && grep -q '^  High | CRF 19 | 320x180 | SDR | audio copied\$' '$L' && grep -q '^  Output: Film HEVC High.mkv\$' '$L'"
 check "no long summary"                  "! grep -qE 'Video encode:|Compression tier: +High|^-----|Object audio' '$L'"
 check "compact: no ANSI / tabs / long lines" "compact '$L'"
+check "job: High CRF retry planned"      "grep -q 'mode=crf crf=19 .* ceiling_vbytes=7516192768 crf_min=19 crf_max=23' '$H/compress/work/c1.sh' && grep -q '^   item_crf_encode item_encode_1\$' '$H/compress/work/c1.sh'"
 
 rm -f "$H/compress/work"/c[0-9]*.sh "$H/compress/work"/*.state
 L="$T/movie_verbose.log"

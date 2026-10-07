@@ -12,6 +12,21 @@
 # video size is reported against the pre-encode estimate and the pair
 # is appended to work/logs/crf_estimates.tsv.
 #
+# High / Base CRF encodes (item_expect ceiling_vbytes= crf_max=) are
+# checked against the tier's VIDEO ceiling after encoding: the actual
+# main video bytes (packet scan; audio, subtitles and container are not
+# counted) above the ceiling reject the attempt and the encode is
+# repeated at CRF + 1, up to crf_max (item_crf_encode). A result that
+# fits with at least down_headroom_pct to spare tries CRF - 1 (down to
+# crf_min, at most down_max times); a lower attempt above the ceiling is
+# discarded and the fitting one kept. Series
+# batches (job_crf_batch) keep one CRF for every episode: the MEDIAN
+# episode's actual video decides, and the whole season is re-encoded.
+# Retries write "<output>.retry-crf<N>.part"; a completed earlier
+# attempt is only deleted once a later one has completed, and is kept
+# (not deleted) when the job is interrupted. Custom CRF and Quality
+# never retry.
+#
 # Outputs are written to "<output>.part" and only renamed to the final
 # name after ffmpeg succeeded and the result passed a duration check, so
 # an interrupted or failed encode is never left under the final name.
@@ -58,6 +73,16 @@ job_init() {
     ITEM_CHILD=""
     ITEM_TMP=""
     declare -gA ITEM_EXP=()
+
+    # CRF retry state (item_crf_encode / job_crf_batch)
+    ITEM_BEGIN_MODE=""        # "" | retry | resume (see item_begin)
+    ITEM_BATCH_CRF=""
+    ITEM_CRF_RUN=""           # CRF that replaces the planned -crf:v:0 value
+    ITEM_OVER_CEILING=0
+    ITEM_ATTEMPT_ROWS=()
+    JOB_BATCH=()
+    JOB_OVER_NAMES=()
+    declare -gA JOB_DONE_PARTS=()   # completed attempt files: never deleted on interruption
 
     mkdir -p "$JOB_LOG_DIR"
 
@@ -121,10 +146,16 @@ job_on_exit() {
         return
     fi
 
-    # Killed (tmux kill-session, Ctrl-C, ...) before job_finish.
-    if [[ -n "$ITEM_PART" && -e "$ITEM_PART" ]]; then
+    # Killed (tmux kill-session, Ctrl-C, ...) before job_finish: the
+    # encode in progress is removed, completed CRF attempts are kept.
+    if [[ -n "$ITEM_PART" && -e "$ITEM_PART" && -z "${JOB_DONE_PARTS[$ITEM_PART]:-}" ]]; then
         rm -f -- "$ITEM_PART"
     fi
+
+    local p kept=()
+    for p in "${!JOB_DONE_PARTS[@]}"; do
+        [[ -e "$p" ]] && kept+=("$p")
+    done
 
     # Large intermediates are not useful after an interruption.
     if [[ -n "${ITEM_TMP:-}" && -d "$ITEM_TMP" ]]; then
@@ -137,9 +168,22 @@ job_on_exit() {
 
     echo
     echo "Job interrupted. Logs: $JOB_LOG_DIR"
+
+    if (( ${#kept[@]} )); then
+        echo "Completed CRF attempts kept (not final outputs; rename or delete them):"
+        printf '  %s\n' "${kept[@]}"
+        printf '%s\n' "${kept[@]}" > "$JOB_LOG_DIR/kept_attempts.txt" 2>/dev/null
+    fi
 }
 
 # item_begin INDEX INPUT OUTPUT TIER OVERWRITE PASSLOG
+#
+# ITEM_BEGIN_MODE (series CRF batch, job_crf_batch):
+#   ""      a new item: banner, "<output>.part" must not exist
+#   retry   the item again for a season retry at ITEM_BATCH_CRF (banner;
+#           the attempt file is checked by item_attempt_part)
+#   resume  context only (finalising an accepted attempt): no banner,
+#           no .part checks
 item_begin() {
     ITEM_INDEX="$1"
     ITEM_INPUT="$2"
@@ -156,13 +200,24 @@ item_begin() {
     ITEM_FINAL=""
     ITEM_TMP="$JOB_LOG_DIR/item-$ITEM_INDEX.tmp"
     ITEM_EXP=()
+    ITEM_CRF_RUN=""
+    ITEM_OVER_CEILING=0
+    ITEM_ATTEMPT_ROWS=()
     JOB_STATUS="running"
+
+    if [[ "${ITEM_BEGIN_MODE:-}" == resume ]]; then
+        ITEM_DURATION=$(get_duration "$ITEM_INPUT" 2>/dev/null || true)
+        mkdir -p "$ITEM_TMP"
+        job_write_state
+        return 0
+    fi
 
     echo
     echo "============================================================"
-    printf '%s %s/%s\n' \
+    printf '%s %s/%s%s\n' \
         "$( [[ "$JOB_TYPE" == "series" ]] && echo Episode || echo Item )" \
-        "$ITEM_INDEX" "$JOB_ITEMS"
+        "$ITEM_INDEX" "$JOB_ITEMS" \
+        "$( [[ "${ITEM_BEGIN_MODE:-}" == retry ]] && echo "  (season retry at CRF $ITEM_BATCH_CRF)")"
     echo "Encoding: $ITEM_INPUT"
     echo "Output:   $(basename "$ITEM_OUTPUT")"
     echo "Tier: $ITEM_TIER"
@@ -172,6 +227,7 @@ item_begin() {
         echo "input:  $ITEM_INPUT"
         echo "output: $ITEM_OUTPUT"
         echo "tier:   $ITEM_TIER"
+        [[ "${ITEM_BEGIN_MODE:-}" == retry ]] && echo "season retry at CRF $ITEM_BATCH_CRF"
     } >> "$ITEM_LOG"
 
     if [[ ! -f "$ITEM_INPUT" ]]; then
@@ -181,6 +237,13 @@ item_begin() {
         fi
         job_write_state
         return 1
+    fi
+
+    if [[ "${ITEM_BEGIN_MODE:-}" == retry ]]; then
+        ITEM_DURATION=$(get_duration "$ITEM_INPUT" 2>/dev/null || true)
+        mkdir -p "$ITEM_TMP"
+        job_write_state
+        return 0
     fi
 
     # ffmpeg/mkvpropedit would write THROUGH a symlink at the .part name
@@ -273,6 +336,19 @@ item_run() {
     local rc
 
     shift 2
+
+    # CRF retry: the generated command carries the planned CRF; a retry
+    # attempt replaces the value of -crf:v:0 (nothing else changes)
+    if [[ "$label" == "encode" && -n "${ITEM_CRF_RUN:-}" ]]; then
+        local -a args=()
+        local a prev=""
+        for a in "$@"; do
+            [[ "$prev" == "-crf:v:0" ]] && a="$ITEM_CRF_RUN"
+            args+=("$a")
+            prev="$a"
+        done
+        set -- "${args[@]}"
+    fi
 
     ITEM_PASS="$label"
     job_write_state
@@ -427,16 +503,17 @@ item_restore_mkv_chapters() {
     echo restored > "$ITEM_TMP/chapters_state"
 }
 
-item_succeeded() {
-    local out_dur final short
+# item_part_complete  ->  0 when "$ITEM_PART" was written and covers the
+# whole source (ffmpeg exits 0 when stopped with 'q'); otherwise 1 with
+# ITEM_FAIL_REASON set
+item_part_complete() {
+    local out_dur short
 
     if [[ ! -s "$ITEM_PART" ]]; then
-        item_failed "ffmpeg reported success but no output was written"
+        ITEM_FAIL_REASON="ffmpeg reported success but no output was written"
         return 1
     fi
 
-    # ffmpeg exits 0 when stopped with 'q'; make sure the result covers
-    # the whole source before it gets the final name.
     out_dur=$(get_duration "$ITEM_PART" 2>/dev/null || true)
 
     short=$(awk -v s="$ITEM_DURATION" -v o="$out_dur" 'BEGIN {
@@ -446,7 +523,17 @@ item_succeeded() {
     }')
 
     if (( short == 1 )); then
-        item_failed "output is incomplete ($(format_hms "$out_dur") of $(format_hms "$ITEM_DURATION"))"
+        ITEM_FAIL_REASON="output is incomplete ($(format_hms "$out_dur") of $(format_hms "$ITEM_DURATION"))"
+        return 1
+    fi
+}
+
+item_succeeded() {
+    local final
+
+    # the whole source must be covered before it gets the final name
+    if ! item_part_complete; then
+        item_failed
         return 1
     fi
 
@@ -478,8 +565,10 @@ item_succeeded() {
         return 1
     fi
 
+    unset 'JOB_DONE_PARTS[$ITEM_PART]'
     ITEM_PART=""
     ITEM_FINAL="$final"
+    (( ITEM_OVER_CEILING == 1 )) && JOB_OVER_NAMES+=("$ITEM_NAME")
 
     if [[ -n "$ITEM_PASSLOG" ]]; then
         rm -f -- "$ITEM_PASSLOG" "$ITEM_PASSLOG".*
@@ -514,7 +603,11 @@ item_failed() {
         rm -f -- "$ITEM_PART"
     fi
 
+    [[ -n "$ITEM_PART" ]] && unset 'JOB_DONE_PARTS[$ITEM_PART]'
     ITEM_PART=""
+
+    # CRF attempts of this item (estimate accuracy is still useful)
+    item_record_attempts "" "item failed: $reason"
 
     # Keep x265 pass stats (two-pass encodes) next to the log for diagnosis.
     if [[ -n "$ITEM_PASSLOG" ]]; then
@@ -551,9 +644,9 @@ item_failed() {
 # report_output_stats FILE  ->  actual bitrates/sizes from a packet scan
 #
 # CRF encodes also report the tier, the CRF, the pre-encode estimate and
-# the estimate error. The error is information for improving the
-# estimator (logged to work/logs/crf_estimates.tsv), never a failure:
-# the size ceiling is a selection goal, not a byte guarantee.
+# the estimate error, and for High / Base every CRF attempt against the
+# video ceiling. The estimate error is information for improving the
+# estimator (logged to work/logs/crf_estimates.tsv), never a failure.
 report_output_stats() {
     local out="$1"
     local dur bytes totals vbytes abytes est
@@ -586,9 +679,25 @@ report_output_stats() {
     echo "  Actual video size:    $(bytes_to_gib "$vbytes") GiB"
 
     if [[ "${ITEM_EXP[mode]:-}" == "crf" && -n "$est" ]]; then
-        echo "  Estimated video size: $(bytes_to_gib "$est") GiB"
-        echo "  Estimate error:       $(estimate_error_pct "$est" "$vbytes")  (actual vs pre-encode estimate; for information)"
-        record_crf_estimate "$out" "$est" "$vbytes" "$dur"
+        if [[ "${ITEM_EXP[crf]:-}" == "${ITEM_EXP[crf_planned]:-${ITEM_EXP[crf]:-}}" ]]; then
+            echo "  Estimated video size: $(bytes_to_gib "$est") GiB"
+            echo "  Estimate error:       $(estimate_error_pct "$est" "$vbytes")  (actual vs pre-encode estimate; for information)"
+        else
+            echo "  Estimated video size: $(bytes_to_gib "$est") GiB at the planned CRF ${ITEM_EXP[crf_planned]}"
+        fi
+    fi
+
+    if (( ${#ITEM_ATTEMPT_ROWS[@]} )); then
+        echo "  CRF attempts:"
+        item_attempt_lines | sed 's/^/    /'
+    fi
+
+    if [[ "${ITEM_EXP[mode]:-}" == "crf" ]]; then
+        if (( ${#ITEM_ATTEMPT_ROWS[@]} )); then
+            item_record_attempts "$out"
+        elif [[ -n "$est" ]]; then
+            record_crf_estimate "$out" "${ITEM_EXP[crf]:-}" "$est" "$vbytes" "$dur"
+        fi
     fi
 
     echo "  Actual audio size:    $(bytes_to_gib "$abytes") GiB"
@@ -599,24 +708,681 @@ report_output_stats() {
     fi
 }
 
-# record_crf_estimate OUTPUT EST_BYTES ACTUAL_BYTES DURATION
+# Columns of work/logs/crf_estimates.tsv. CRF_LOG_HEADER_V1 is the
+# header of logs written before the retry columns existed.
+CRF_LOG_HEADER_V1=$'date\ttier\tcrf\tresolution\tduration_s\testimated_video_bytes\tactual_video_bytes\terror_pct\tsession\tinput'
+CRF_LOG_HEADER="$CRF_LOG_HEADER_V1"$'\tceiling_video_bytes\tresult\treason'
+
+# crf_log_prepare FILE  ->  FILE exists with the current header
 #
-# Appends one line to work/logs/crf_estimates.tsv (estimate accuracy,
-# for tuning the sampling later). A failure to write is ignored.
+# An old log (10-column header) is migrated in place: new header, older
+# rows padded with "-" for the new columns (written to a temporary file
+# and renamed, so the log is never half-written). A file with any other
+# first line is not a log of this format: it is moved aside to
+# FILE.unknown-<date> and a new log is started. Never fails the caller.
+crf_log_prepare() {
+    local f="$1" first tmp
+
+    if [[ ! -s "$f" ]]; then
+        printf '%s\n' "$CRF_LOG_HEADER" >> "$f" 2>/dev/null
+        return 0
+    fi
+
+    IFS= read -r first < "$f" 2>/dev/null || first=""
+    [[ "$first" == "$CRF_LOG_HEADER" ]] && return 0
+
+    if [[ "$first" == "$CRF_LOG_HEADER_V1" ]]; then
+        tmp="$f.migrate.$$"
+        if awk -F'\t' -v OFS='\t' -v h="$CRF_LOG_HEADER" '
+                NR == 1 { print h; next }
+                { while (NF < 13) $(NF + 1) = "-"; print }' "$f" > "$tmp" 2>/dev/null; then
+            mv -f -- "$tmp" "$f" 2>/dev/null || rm -f -- "$tmp"
+        else
+            rm -f -- "$tmp"
+        fi
+        return 0
+    fi
+
+    mv -f -- "$f" "$f.unknown-$(date +%Y%m%d-%H%M%S)" 2>/dev/null &&
+        printf '%s\n' "$CRF_LOG_HEADER" > "$f" 2>/dev/null
+    return 0
+}
+
+# record_crf_estimate OUTPUT CRF EST_BYTES ACTUAL_BYTES DURATION [CEILING_BYTES RESULT REASON]
+#
+# Appends one line to work/logs/crf_estimates.tsv (estimate accuracy and
+# the CRF retry decision of each attempt). EST_BYTES "" = no estimate at
+# that CRF (a retry). A failure to write is ignored.
 record_crf_estimate() {
-    local out="$1" est="$2" act="$3" dur="$4"
-    local f="$JOB_WORK/logs/crf_estimates.tsv" res
+    local out="$1" crf="$2" est="$3" act="$4" dur="$5" ceil="${6:-}" result="${7:-}" reason="${8:-}"
+    local f="$JOB_WORK/logs/crf_estimates.tsv" res="" err="-"
 
-    res=$(get_resolution "$out" "$(main_video_index "$out")" 2>/dev/null || true)
+    [[ -n "$out" && -e "$out" ]] &&
+        res=$(get_resolution "$out" "$(main_video_index "$out")" 2>/dev/null || true)
+    [[ -n "$est" ]] && err=$(estimate_error_pct "$est" "$act")
 
-    {
-        [[ -s "$f" ]] ||
-            printf 'date\ttier\tcrf\tresolution\tduration_s\testimated_video_bytes\tactual_video_bytes\terror_pct\tsession\tinput\n'
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$(date '+%F %T')" "$ITEM_TIER" "${ITEM_EXP[crf]:-}" "${res:-?}" \
-            "$(awk -v d="$dur" 'BEGIN { printf "%.0f", d }')" "$est" "$act" \
-            "$(estimate_error_pct "$est" "$act")" "$JOB_SESSION" "$ITEM_INPUT"
-    } >> "$f" 2>/dev/null || true
+    crf_log_prepare "$f"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$(date '+%F %T')" "$ITEM_TIER" "$crf" "${res:-?}" \
+        "$(awk -v d="$dur" 'BEGIN { printf "%.0f", d }')" "${est:--}" "$act" \
+        "$err" "$JOB_SESSION" "$ITEM_INPUT" "${ceil:--}" "${result:--}" "${reason:--}" \
+        >> "$f" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------
+# CRF retry against the tier's video ceiling (High / Base)
+#
+# Two directional phases, so a CRF is never encoded twice and the
+# search always ends:
+#   1. up:   while the actual video is above the ceiling, CRF + 1 (up
+#            to crf_max) until an attempt fits
+#   2. down: from the attempt that fits, while its video is at least
+#            down_headroom_pct below the ceiling, try CRF - 1 (not below
+#            crf_min, at most down_max times, never a CRF already found
+#            above the ceiling). A lower attempt that fits replaces the
+#            accepted one; one above the ceiling (or failing) is
+#            discarded and the accepted encode is kept. The accepted
+#            encode is renamed to "<output>.accepted-crf<N>.part" first
+#            and only deleted after a lower attempt has fitted.
+# The ceiling is a hard upper bound: an attempt above it is never
+# chosen over one that fits.
+# ------------------------------------------------------------
+
+# item_retry_enabled  ->  0 for a CRF item with a video ceiling and a
+# tier CRF_MAX (Custom / Quality / copy items have none)
+item_retry_enabled() {
+    [[ "${ITEM_EXP[mode]:-}" == crf &&
+       "${ITEM_EXP[ceiling_vbytes]:-}" =~ ^[0-9]+$ && "${ITEM_EXP[crf_max]:-}" =~ ^[0-9]+$ &&
+       "${ITEM_EXP[crf]:-}" =~ ^[0-9]+$ ]] && (( ITEM_EXP[ceiling_vbytes] > 0 ))
+}
+
+# item_video_bytes FILE  ->  actual main video bytes (packet scan; audio,
+# subtitles, attachments and container overhead are not counted)
+item_video_bytes() {
+    local v a
+    read -r v a <<< "$(media_stream_totals "$1")"
+    [[ "$v" =~ ^[0-9]+$ ]] || v=0
+    printf '%s' "$v"
+}
+
+# _down_threshold CEILING_BYTES HEADROOM_PCT  ->  bytes at or below which
+# a fitting result may try CRF - 1 ("" = downward retry off)
+_down_threshold() {
+    [[ "$1" =~ ^[0-9]+$ && "$2" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
+    awk -v c="$1" -v p="$2" 'BEGIN { if (p < 100) printf "%.0f", c * (100 - p) / 100 }'
+}
+
+# field separator of attempt rows (not whitespace: empty fields such as
+# a missing estimate must not collapse)
+_RS=$'\x1f'
+
+# _gib BYTES  ->  "7.40"
+_gib() { awk -v b="${1:-0}" 'BEGIN { printf "%.2f", b / 1073741824 }'; }
+
+# attempt_line TIER CRF EST ACTUAL CEILING RESULT [REASON]
+#   ->  "High | CRF 19 | est 6.80 GiB | actual 7.40 GiB | ceiling 7.00 | REJECTED -> retry CRF 20"
+attempt_line() {
+    local est="n/a"
+    [[ -n "$3" ]] && est="$(_gib "$3") GiB"
+    printf '%s | CRF %s | est %s | actual %s GiB | ceiling %s | %s%s' \
+        "$1" "$2" "$est" "$(_gib "$4")" "$(_gib "$5")" "$6" "${7:+ -> $7}"
+}
+
+# item_attempt_note CRF ACTUAL RESULT [REASON]  ->  one attempt of the
+# current item: item log line now, report line and estimate log row when
+# the item ends. RESULT ACCEPTED-CANDIDATE: fits; becomes ACCEPTED when
+# it is the final CRF (item_rows_final), stays a candidate when a lower
+# CRF replaced it.
+item_attempt_note() {
+    local crf="$1" act="$2" result="$3" reason="${4:-}" est=""
+
+    [[ "$crf" == "${ITEM_EXP[crf_planned]:-}" ]] && est="${ITEM_EXP[est_vbytes]:-}"
+    ITEM_ATTEMPT_ROWS+=("$crf$_RS$est$_RS$act$_RS$result$_RS$reason")
+    attempt_line "$ITEM_TIER" "$crf" "$est" "$act" "${ITEM_EXP[ceiling_vbytes]}" "$result" "$reason" >> "$ITEM_LOG"
+    echo >> "$ITEM_LOG"
+}
+
+# item_rows_final CRF  ->  the attempt at CRF (the final one) is ACCEPTED
+item_rows_final() {
+    local i crf est act result reason
+
+    for i in "${!ITEM_ATTEMPT_ROWS[@]}"; do
+        IFS="$_RS" read -r crf est act result reason <<< "${ITEM_ATTEMPT_ROWS[$i]}"
+        [[ "$crf" == "$1" && "$result" == ACCEPTED-CANDIDATE ]] &&
+            ITEM_ATTEMPT_ROWS[$i]="$crf$_RS$est$_RS$act${_RS}ACCEPTED$_RS$reason"
+    done
+    return 0
+}
+
+# item_attempt_lines  ->  report line per attempt
+item_attempt_lines() {
+    local r crf est act result reason
+
+    for r in "${ITEM_ATTEMPT_ROWS[@]+"${ITEM_ATTEMPT_ROWS[@]}"}"; do
+        IFS="$_RS" read -r crf est act result reason <<< "$r"
+        attempt_line "$ITEM_TIER" "$crf" "$est" "$act" "${ITEM_EXP[ceiling_vbytes]:-0}" "$result" "$reason"
+        echo
+    done
+}
+
+# item_record_attempts OUTPUT [NOTE]  ->  crf_estimates.tsv rows of the
+# item's attempts (once); NOTE is added to the final attempt's reason
+item_record_attempts() {
+    local out="$1" note="${2:-}" r crf est act result reason
+
+    for r in "${ITEM_ATTEMPT_ROWS[@]+"${ITEM_ATTEMPT_ROWS[@]}"}"; do
+        IFS="$_RS" read -r crf est act result reason <<< "$r"
+        [[ -n "$note" && "$result" != REJECTED && "$result" != ACCEPTED-CANDIDATE ]] &&
+            reason="${reason:+$reason; }$note"
+        record_crf_estimate "$out" "$crf" "$est" "$act" "$ITEM_DURATION" \
+            "${ITEM_EXP[ceiling_vbytes]:-}" "$result" "$reason"
+    done
+    ITEM_ATTEMPT_ROWS=()
+}
+
+# item_attempt_part CRF  ->  ITEM_PART = "<output>.retry-crf<CRF>.part"
+# (1 with ITEM_FAIL_REASON when that name is taken: never written through)
+item_attempt_part() {
+    local p="$ITEM_OUTPUT.retry-crf$1.part"
+
+    if [[ -L "$p" || -e "$p" ]]; then
+        ITEM_FAIL_REASON="$(basename "$p") already exists"
+        return 1
+    fi
+    ITEM_PART="$p"
+}
+
+# _keep_accepted FILE OUTPUT CRF  ->  KEPT_PART = the accepted encode,
+# renamed to "OUTPUT.accepted-crfCRF.part" (no-clobber); 1 when it
+# cannot be set aside safely (then no lower CRF is tried). Runs in the
+# current shell (JOB_DONE_PARTS), not in $(...).
+_keep_accepted() {
+    local f="$1" acc="$2.accepted-crf$3.part"
+
+    KEPT_PART="$f"
+    if [[ "$f" != "$acc" ]]; then
+        [[ -e "$acc" || -L "$acc" ]] && return 1
+        mv -nT -- "$f" "$acc" 2>/dev/null || return 1
+        [[ -e "$acc" && ! -e "$f" ]] || return 1
+        unset 'JOB_DONE_PARTS[$f]'
+        JOB_DONE_PARTS[$acc]=1
+    fi
+    KEPT_PART="$acc"
+}
+
+# _drop_attempt FILE  ->  delete a completed attempt that a later one
+# replaced
+_drop_attempt() {
+    [[ -n "$1" ]] || return 0
+    rm -f -- "$1"
+    unset 'JOB_DONE_PARTS[$1]'
+}
+
+# item_crf_encode ENCODE_FUNCTION
+#
+# Runs the item's encode (ENCODE_FUNCTION writes "$ITEM_PART", covers
+# and chapters included). Without a ceiling (Custom) that is all. High /
+# Base: phase 1 (up) and phase 2 (down) as described above. At crf_max
+# still above the ceiling the last attempt is kept with a warning
+# (ITEM_OVER_CEILING; the job keeps its session open at the end); when
+# an upward retry fails, the completed earlier attempt is kept the same
+# way. Leaves the accepted attempt in ITEM_PART and its CRF in
+# ITEM_EXP[crf] (what item_verify_output checks).
+item_crf_encode() {
+    local fn="$1"
+    local planned="${ITEM_EXP[crf]:-}" ceil max min c act prev="" prev_crf="" ok
+    local thr down_max downs=0 nc a2 acc
+    local -A over=()
+
+    ITEM_EXP[crf_planned]="$planned"
+    ITEM_CRF_RUN=""
+
+    if ! item_retry_enabled; then
+        "$fn"
+        return
+    fi
+
+    ceil="${ITEM_EXP[ceiling_vbytes]}"
+    max="${ITEM_EXP[crf_max]}"
+    min="${ITEM_EXP[crf_min]:-}"
+    [[ "$min" =~ ^[0-9]+$ ]] || min="$planned"
+    down_max="${ITEM_EXP[down_max]:-0}"
+    [[ "$down_max" =~ ^[0-9]+$ ]] || down_max=0
+    thr=$(_down_threshold "$ceil" "${ITEM_EXP[down_headroom_pct]:-}")
+    c="$planned"
+
+    # ---- phase 1: up until an attempt fits
+    while true; do
+        ok=1
+        if (( c != planned )); then
+            ITEM_EXP[crf]="$c"
+            ITEM_CRF_RUN="$c"
+            item_attempt_part "$c" || ok=0
+        fi
+        (( ok == 1 )) && { "$fn" && item_part_complete || ok=0; }
+
+        if (( ok == 0 )); then
+            [[ -z "$prev" ]] && return 1
+
+            # keep the completed earlier attempt (above the ceiling)
+            [[ "$ITEM_PART" != "$prev" && "${ITEM_FAIL_REASON:-}" != *"already exists" ]] &&
+                rm -f -- "$ITEM_PART"
+            item_attempt_note "$c" 0 FAILED "${ITEM_FAIL_REASON:-encode failed}; kept CRF $prev_crf"
+            echo
+            echo "WARNING: retry at CRF $c failed (${ITEM_FAIL_REASON:-encode failed})."
+            echo "         Keeping the completed CRF $prev_crf encode (above the $(_gib "$ceil") GiB video ceiling)."
+            ITEM_PART="$prev"
+            ITEM_EXP[crf]="$prev_crf"
+            ITEM_CRF_RUN=""
+            ITEM_FAIL_REASON=""
+            ITEM_OVER_CEILING=1
+            return 0
+        fi
+
+        JOB_DONE_PARTS[$ITEM_PART]=1
+        act=$(item_video_bytes "$ITEM_PART")
+
+        echo
+        echo "CRF $c actual: $(_gib "$act") GiB / $(_gib "$ceil") GiB ceiling"
+
+        if (( act <= ceil )); then
+            echo "Result: accepted"
+            item_attempt_note "$c" "$act" ACCEPTED-CANDIDATE
+            _drop_attempt "$prev"
+            ITEM_CRF_RUN=""
+            break
+        fi
+
+        over[$c]=1
+        if (( c < max )); then
+            echo "Result: over ceiling -> retrying CRF $((c + 1))"
+            item_attempt_note "$c" "$act" REJECTED "retry CRF $((c + 1))"
+            _drop_attempt "$prev"
+            prev="$ITEM_PART"
+            prev_crf="$c"
+            c=$((c + 1))
+            continue
+        fi
+
+        echo "Result: over ceiling; CRF $max is the $ITEM_TIER limit"
+        echo "WARNING: the $(_gib "$ceil") GiB video ceiling cannot be met within the $ITEM_TIER"
+        echo "         CRF range ($min-$max); keeping CRF $max ($(_gib "$act") GiB video)."
+        item_attempt_note "$c" "$act" "OVER CEILING" "kept: CRF $max is the $ITEM_TIER limit"
+        _drop_attempt "$prev"
+        ITEM_CRF_RUN=""
+        ITEM_OVER_CEILING=1
+        return 0
+    done
+
+    # ---- phase 2: down while the accepted result has enough headroom
+    while [[ -n "$thr" ]] && (( act <= thr )); do
+        nc=$((c - 1))
+        if (( c <= min )); then
+            echo "Headroom large, but CRF $min is the $ITEM_TIER minimum"
+            break
+        fi
+        if (( downs >= down_max )); then
+            (( down_max > 0 )) && echo "Headroom large, but the lower-CRF retry limit ($down_max) is reached"
+            break
+        fi
+        [[ -n "${over[$nc]:-}" ]] && break
+
+        if ! _keep_accepted "$ITEM_PART" "$ITEM_OUTPUT" "$c"; then
+            ITEM_PART="$KEPT_PART"
+            echo "Headroom large, but the CRF $c encode cannot be set aside safely; keeping it"
+            break
+        fi
+        acc="$KEPT_PART"
+        ITEM_PART="$acc"
+
+        echo "Headroom large -> trying CRF $nc"
+        ((downs += 1))
+        ITEM_EXP[crf]="$nc"
+        ITEM_CRF_RUN="$nc"
+
+        ok=1
+        item_attempt_part "$nc" || ok=0
+        (( ok == 1 )) && { "$fn" && item_part_complete || ok=0; }
+
+        if (( ok == 0 )); then
+            [[ "$ITEM_PART" != "$acc" ]] && rm -f -- "$ITEM_PART"
+            item_attempt_note "$nc" 0 FAILED "${ITEM_FAIL_REASON:-encode failed}; keep CRF $c"
+            echo
+            echo "Result: CRF $nc failed (${ITEM_FAIL_REASON:-encode failed}) -> keeping CRF $c"
+            ITEM_PART="$acc"
+            ITEM_FAIL_REASON=""
+            break
+        fi
+
+        JOB_DONE_PARTS[$ITEM_PART]=1
+        a2=$(item_video_bytes "$ITEM_PART")
+
+        echo
+        echo "CRF $nc actual: $(_gib "$a2") GiB / $(_gib "$ceil") GiB ceiling"
+
+        if (( a2 <= ceil )); then
+            echo "Result: accepted"
+            item_attempt_note "$nc" "$a2" ACCEPTED-CANDIDATE
+            _drop_attempt "$acc"
+            c="$nc"
+            act="$a2"
+            continue
+        fi
+
+        echo "Result: over ceiling -> keeping CRF $c"
+        item_attempt_note "$nc" "$a2" REJECTED "over ceiling; keep CRF $c"
+        _drop_attempt "$ITEM_PART"
+        ITEM_PART="$acc"
+        break
+    done
+
+    ITEM_EXP[crf]="$c"
+    ITEM_CRF_RUN=""
+    item_rows_final "$c"
+    return 0
+}
+
+# job_batch_add INDEX  ->  episode INDEX belongs to the series CRF batch
+# (generated functions item_ctx_INDEX, item_prep_INDEX, item_encode_INDEX)
+job_batch_add() {
+    JOB_BATCH+=("$1")
+}
+
+# _median_bytes VALUE...  ->  median (whole number)
+_median_bytes() {
+    printf '%s\n' "$@" | sort -n | awk '{ v[NR] = $1 } END {
+        if (NR == 0) { print 0; exit }
+        if (NR % 2) printf "%.0f", v[(NR + 1) / 2]
+        else printf "%.0f", (v[NR / 2] + v[NR / 2 + 1]) / 2 }'
+}
+
+# _batch_note ID CRF ACTUAL RESULT [REASON]  ->  attempt of episode ID
+# (kept per episode until it is finalised)
+_batch_note() {
+    local id="$1" crf="$2" act="$3" result="$4" reason="${5:-}" est=""
+
+    [[ "$crf" == "$BATCH_PLANNED" ]] && est="${BATCH_EST[$id]:-}"
+    BATCH_ROWS[$id]+="$crf$_RS$est$_RS$act$_RS$result$_RS$reason"$'\n'
+    { attempt_line "$BATCH_TIER" "$crf" "$est" "$act" "$BATCH_CEIL" "$result" "$reason"; echo; } \
+        >> "$JOB_LOG_DIR/item-$id.log"
+}
+
+# _batch_notes_fit CRF VB_ARRAY_NAME  ->  ACCEPTED-CANDIDATE for every
+# active episode at CRF (outliers above the nominal ceiling noted)
+_batch_notes_fit() {
+    local -n _vb="$2"
+    local id
+
+    for id in "${active[@]}"; do
+        if (( _vb[$id] > BATCH_CEIL )); then
+            _batch_note "$id" "$1" "${_vb[$id]}" ACCEPTED-CANDIDATE "above the nominal ceiling; season median fits"
+        else
+            _batch_note "$id" "$1" "${_vb[$id]}" ACCEPTED-CANDIDATE
+        fi
+    done
+}
+
+# _batch_season CRF  ->  every active episode encoded at CRF into its
+# retry file (npart / nvb of job_crf_batch). 1 at the first failure
+# (fail_id / why set); nothing of the earlier attempt is touched.
+_batch_season() {
+    local nc="$1" id
+
+    npart=()
+    nvb=()
+    fail_id=""
+    why=""
+
+    for id in "${active[@]}"; do
+        ITEM_BEGIN_MODE=retry
+        ITEM_BATCH_CRF="$nc"
+        if ! "item_ctx_$id"; then
+            fail_id="$id"
+            why="${ITEM_FAIL_REASON:-episode not available}"
+            break
+        fi
+        ITEM_EXP[crf_planned]="$BATCH_PLANNED"
+        ITEM_EXP[crf]="$nc"
+        ITEM_CRF_RUN="$nc"
+
+        if ! item_attempt_part "$nc"; then
+            fail_id="$id"
+            why="$ITEM_FAIL_REASON"
+            break
+        fi
+        if ! "item_encode_$id" || ! item_part_complete; then
+            fail_id="$id"
+            why="${ITEM_FAIL_REASON:-encode failed}"
+            rm -f -- "$ITEM_PART"
+            break
+        fi
+
+        JOB_DONE_PARTS[$ITEM_PART]=1
+        npart[$id]="$ITEM_PART"
+        nvb[$id]=$(item_video_bytes "$ITEM_PART")
+        ITEM_PART=""
+    done
+
+    ITEM_BEGIN_MODE=""
+    ITEM_CRF_RUN=""
+    ITEM_PART=""
+
+    if [[ -n "$fail_id" ]]; then
+        for id in "${!npart[@]}"; do
+            _drop_attempt "${npart[$id]}"
+        done
+        return 1
+    fi
+}
+
+# job_crf_batch  ->  encodes the series batch (job_batch_add) with ONE
+# CRF for every episode
+#
+# Every episode is encoded at the planned CRF into its .part file. With
+# a ceiling (High / Base) the MEDIAN episode's actual main video bytes
+# decide, in the two phases described above, always for the whole
+# season (one CRF for every episode; single episodes above the nominal
+# ceiling are only listed): up while the median is above the ceiling,
+# then down while the median has enough headroom. A season attempt is
+# only replaced once the next one has completed for every episode; a
+# failing or over-ceiling lower attempt is discarded and the previous
+# season kept. Then every episode is verified at the accepted CRF and
+# gets its final name (item_succeeded).
+job_crf_batch() {
+    (( ${#JOB_BATCH[@]} )) || return 0
+
+    local id c="" max="" min="" med m2 fits=0 nc fail_id why n_above
+    local thr="" down_max=0 downs=0 acc
+    local -a active=()
+    local -A part=() vb=() npart=() nvb=() over=() outp=()
+
+    declare -gA BATCH_ROWS=() BATCH_EST=()
+    BATCH_PLANNED="" BATCH_CEIL="" BATCH_TIER=""
+
+    # ---- attempt 1: every episode at the planned CRF
+    for id in "${JOB_BATCH[@]}"; do
+        ITEM_BEGIN_MODE=""
+        if ! "item_ctx_$id" || ! "item_prep_$id"; then
+            item_failed
+            continue
+        fi
+
+        if [[ -z "$c" ]]; then
+            c="${ITEM_EXP[crf]}"
+            BATCH_PLANNED="$c"
+            BATCH_TIER="$ITEM_TIER"
+            if item_retry_enabled; then
+                BATCH_CEIL="${ITEM_EXP[ceiling_vbytes]}"
+                max="${ITEM_EXP[crf_max]}"
+                min="${ITEM_EXP[crf_min]:-}"
+                [[ "$min" =~ ^[0-9]+$ ]] || min="$c"
+                down_max="${ITEM_EXP[down_max]:-0}"
+                [[ "$down_max" =~ ^[0-9]+$ ]] || down_max=0
+                thr=$(_down_threshold "$BATCH_CEIL" "${ITEM_EXP[down_headroom_pct]:-}")
+            fi
+        fi
+        ITEM_EXP[crf_planned]="$BATCH_PLANNED"
+        BATCH_EST[$id]="${ITEM_EXP[est_vbytes]:-}"
+
+        if ! "item_encode_$id" || ! item_part_complete; then
+            item_failed
+            continue
+        fi
+
+        JOB_DONE_PARTS[$ITEM_PART]=1
+        part[$id]="$ITEM_PART"
+        outp[$id]="$ITEM_OUTPUT"
+        [[ -n "$BATCH_CEIL" ]] && vb[$id]=$(item_video_bytes "$ITEM_PART")
+        active+=("$id")
+        ITEM_PART=""
+    done
+
+    (( ${#active[@]} )) || return 0
+
+    if [[ -n "$BATCH_CEIL" ]]; then
+        echo
+        echo "============================================================"
+        echo "Season CRF check ($BATCH_TIER, ${#active[@]} episode(s))"
+    fi
+
+    # ---- phase 1: up while the median episode is above the ceiling
+    while [[ -n "$BATCH_CEIL" ]]; do
+        med=$(_median_bytes "${vb[@]}")
+        echo
+        echo "CRF $c actual median: $(_gib "$med") GiB / $(_gib "$BATCH_CEIL") GiB ceiling"
+
+        if (( med <= BATCH_CEIL )); then
+            fits=1
+            echo "Result: accepted"
+            _batch_notes_fit "$c" vb
+            break
+        fi
+
+        over[$c]=1
+        if (( c >= max )); then
+            echo "Result: over ceiling; CRF $max is the $BATCH_TIER limit"
+            echo "WARNING: the $(_gib "$BATCH_CEIL") GiB per-episode video ceiling cannot be met within the"
+            echo "         $BATCH_TIER CRF range ($min-$max); keeping CRF $max for every episode."
+            for id in "${active[@]}"; do
+                _batch_note "$id" "$c" "${vb[$id]}" "OVER CEILING" "kept: season median $(_gib "$med") GiB; CRF $max is the $BATCH_TIER limit"
+            done
+            break
+        fi
+
+        nc=$((c + 1))
+        echo "Result: over ceiling -> retrying season at CRF $nc"
+        for id in "${active[@]}"; do
+            _batch_note "$id" "$c" "${vb[$id]}" REJECTED "season median $(_gib "$med") GiB > ceiling; retry CRF $nc"
+        done
+
+        # the previous season attempt is kept until every episode completed
+        if ! _batch_season "$nc"; then
+            _batch_note "$fail_id" "$nc" 0 FAILED "$why; season kept at CRF $c"
+            echo
+            echo "WARNING: season retry at CRF $nc failed (episode $fail_id: $why)."
+            echo "         Keeping the completed CRF $c encodes (above the ceiling) for every episode."
+            break
+        fi
+
+        for id in "${active[@]}"; do
+            _drop_attempt "${part[$id]}"
+            part[$id]="${npart[$id]}"
+            vb[$id]="${nvb[$id]}"
+        done
+        c="$nc"
+    done
+
+    # ---- phase 2: down while the median episode has enough headroom
+    while (( fits == 1 )) && [[ -n "$thr" ]] && (( med <= thr )); do
+        nc=$((c - 1))
+        if (( c <= min )); then
+            echo "Headroom large, but CRF $min is the $BATCH_TIER minimum"
+            break
+        fi
+        if (( downs >= down_max )); then
+            (( down_max > 0 )) && echo "Headroom large, but the lower-CRF retry limit ($down_max) is reached"
+            break
+        fi
+        [[ -n "${over[$nc]:-}" ]] && break
+
+        # the accepted season stays under its own names meanwhile
+        acc=1
+        for id in "${active[@]}"; do
+            _keep_accepted "${part[$id]}" "${outp[$id]}" "$c" || acc=0
+            part[$id]="$KEPT_PART"
+        done
+        if (( acc == 0 )); then
+            echo "Headroom large, but the CRF $c season cannot be set aside safely; keeping it"
+            break
+        fi
+
+        echo "Headroom large -> trying season at CRF $nc"
+        ((downs += 1))
+
+        if ! _batch_season "$nc"; then
+            _batch_note "$fail_id" "$nc" 0 FAILED "$why; keep CRF $c"
+            echo
+            echo "Result: season at CRF $nc failed (episode $fail_id: $why) -> keeping CRF $c"
+            break
+        fi
+
+        m2=$(_median_bytes "${nvb[@]}")
+        echo
+        echo "CRF $nc actual median: $(_gib "$m2") GiB / $(_gib "$BATCH_CEIL") GiB ceiling"
+
+        if (( m2 > BATCH_CEIL )); then
+            echo "Result: over ceiling -> keeping CRF $c"
+            for id in "${active[@]}"; do
+                _batch_note "$id" "$nc" "${nvb[$id]}" REJECTED "season median $(_gib "$m2") GiB > ceiling; keep CRF $c"
+                _drop_attempt "${npart[$id]}"
+            done
+            break
+        fi
+
+        echo "Result: accepted"
+        _batch_notes_fit "$nc" nvb
+        for id in "${active[@]}"; do
+            _drop_attempt "${part[$id]}"
+            part[$id]="${npart[$id]}"
+            vb[$id]="${nvb[$id]}"
+        done
+        c="$nc"
+        med="$m2"
+    done
+
+    if [[ -n "$BATCH_CEIL" ]]; then
+        if (( fits == 1 )); then
+            n_above=0
+            for id in "${active[@]}"; do
+                (( vb[$id] > BATCH_CEIL )) && ((n_above += 1))
+            done
+            if (( n_above == 1 )); then
+                echo "Warning: 1 episode remains above nominal ceiling"
+            elif (( n_above > 1 )); then
+                echo "Warning: $n_above episodes remain above nominal ceiling"
+            fi
+        fi
+        echo "Season CRF: $c"
+        echo "============================================================"
+    fi
+
+    # ---- finalise: verify every episode at the accepted CRF, final name
+    for id in "${active[@]}"; do
+        ITEM_BEGIN_MODE=resume
+        "item_ctx_$id"
+        ITEM_BEGIN_MODE=""
+        ITEM_EXP[crf_planned]="$BATCH_PLANNED"
+        ITEM_EXP[crf]="$c"
+        ITEM_PART="${part[$id]}"
+        [[ -n "$BATCH_CEIL" ]] && (( fits == 0 )) && ITEM_OVER_CEILING=1
+
+        mapfile -t ITEM_ATTEMPT_ROWS < <(printf '%s' "${BATCH_ROWS[$id]:-}")
+        item_rows_final "$c"
+
+        echo
+        echo "Finalising episode $id/$JOB_ITEMS: $ITEM_NAME (CRF $c)"
+        item_succeeded || true
+    done
 }
 
 job_finish() {
@@ -656,10 +1422,20 @@ job_finish() {
         echo "Logs and pass stats: $JOB_LOG_DIR"
     fi
 
+    if (( ${#JOB_OVER_NAMES[@]} )); then
+        echo
+        echo "Above the video ceiling (kept: the ceiling cannot be met within the tier's CRF range):"
+        for n in "${JOB_OVER_NAMES[@]}"; do
+            echo "  $n"
+        done
+        echo "CRF attempts: $JOB_WORK/logs/crf_estimates.tsv"
+    fi
+
     echo "============================================================"
 
-    if (( JOB_FAILED > 0 )); then
-        # Keep the tmux session open so the failure is noticed.
+    if (( JOB_FAILED > 0 || ${#JOB_OVER_NAMES[@]} > 0 )); then
+        # Keep the tmux session open so a failure or a kept over-ceiling
+        # result is noticed.
         echo
         read -rp "Press Enter to close this session... " _ || true
     fi

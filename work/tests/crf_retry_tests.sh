@@ -1,0 +1,446 @@
+#!/usr/bin/env bash
+# Post-encode CRF retry tests (High / Base video ceiling; upward and
+# lower-CRF retries, CRF log header).
+#
+#   bash ~/compress/work/tests/crf_retry_tests.sh
+#
+# Part 1 runs generated-style jobs with a stand-in encoder (sizes per
+# CRF, no ffmpeg): movie retry rules, series one-CRF batch on the median
+# episode, logging, temporary files, interruption, other sessions.
+# Part 2 (ffmpeg with libx265 needed) generates real jobs for a 2 s
+# synthetic source and checks that the output verification expects the
+# ACCEPTED CRF after retries.
+set -uo pipefail
+
+SRC_WORK="$(cd "$(dirname "$0")/.." && pwd)"
+T=$(mktemp -d)
+if [[ "${RETRY_TESTS_KEEP:-0}" == 1 ]]; then echo "Kept: $T"; else trap 'rm -rf -- "$T"' EXIT; fi
+PASS=0
+FAIL=0
+
+ok()    { echo "  ok    $1"; ((PASS += 1)); }
+bad()   { echo "  FAIL  $1"; ((FAIL += 1)); }
+check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
+eq()    { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1  (got \"$2\", want \"$3\")"; fi; }
+
+unset COMPRESS_VERBOSE
+G=1073741824
+gib() { awk -v g="$1" -v G=$G 'BEGIN { printf "%.0f", g * G }'; }   # GiB -> bytes
+
+W="$T/work"
+mkdir -p "$W/logs" "$T/in/Show" "$T/out/Show" "$T/stub"
+cp -r "$SRC_WORK/lib" "$W/"
+WORK_DIR="$W"
+for l in media_probe media_stats bitrate encode_common hdr_dovi job_runtime; do
+    source "$W/lib/$l.sh" > /dev/null
+done
+printf '#!/usr/bin/env bash\n[[ "$1" == has-session ]] && exit 1\nexit 0\n' > "$T/stub/tmux"
+chmod +x "$T/stub/tmux"
+export PATH="$T/stub:$PATH"
+
+echo movie > "$T/in/M.mkv"
+for e in 1 2 3 4 5; do echo "episode $e" > "$T/in/Show/E0$e.mkv"; done
+
+# Stand-ins: the "encoder" writes "VIDEO_BYTES AUDIO_BYTES CRF" into
+# $ITEM_PART; the size of each attempt comes from SIZES[CRF] (movie) or
+# SIZES[EPISODE:CRF] (series); "fail" = the encode fails, "sleep" = a
+# long encode (interruption test). Verification records the CRF it was
+# asked to verify.
+STUBS='
+get_duration() { echo 100; }
+media_stream_totals() { local v a c; read -r v a c < "$1"; echo "$v $a"; }
+item_verify_output() { echo "$ITEM_INDEX:${ITEM_EXP[crf]}" >> "'"$T"'/$JOB_SESSION.verified"; }
+refresh_mkv_stats() { return 0; }
+get_resolution() { echo 1920x1080; }
+main_video_index() { echo 0; }
+declare -A SIZES=()
+fake_encode() {
+    local c="${ITEM_EXP[crf]}" s
+    s="${SIZES[$ITEM_INDEX:$c]:-${SIZES[$c]:-}}"
+    echo "$ITEM_INDEX:$c" >> "'"$T"'/$JOB_SESSION.encoded"
+    # accepted encodes kept aside while this attempt runs
+    local a
+    for a in "$ITEM_OUTPUT".accepted-crf*.part; do
+        [[ -e "$a" ]] && echo "$ITEM_INDEX:$c:${a##*/}" >> "'"$T"'/$JOB_SESSION.seen"
+    done
+    case "$s" in
+        fail)  return 1 ;;
+        sleep) sleep 30 & ITEM_CHILD=$!; wait "$ITEM_CHILD"; return 1 ;;
+    esac
+    echo "$s $c" > "$ITEM_PART"
+}
+'
+
+# job SESSION BODY  ->  work/<SESSION>.sh (generated header / footer)
+job() {
+    {
+        emit_job_header "$1" "${3:-movie}" "${4:-1}"
+        printf '%s\n' "$STUBS" "$2"
+        emit_job_footer
+    } > "$W/$1.sh"
+}
+run_job() { bash "$W/$1.sh" < /dev/null > "$T/$1.log" 2>&1; }
+encoded()  { tr '\n' ' ' < "$T/$1.encoded" 2>/dev/null; }
+verified() { tr '\n' ' ' < "$T/$1.verified" 2>/dev/null; }
+leftovers() { find "$T/out" \( -name '*.part' -o -name '*.retry-crf*' \) | sort | tr '\n' ' '; }
+rows() { awk -F'\t' -v s="$1" '$9 == s { print $3 "/" $6 "/" $12 }' "$W/logs/crf_estimates.tsv" | tr '\n' ' '; }
+
+# movie_job SESSION TIER CRF EXPECT_EXTRA SIZES...  (High: ceiling 7 GiB, CRF 19-23)
+movie_job() {
+    local s="$1" tier="$2" crf="$3" extra="$4"
+    shift 4
+    rm -f "$T/out/M.mkv" "$T/$s.encoded" "$T/$s.verified"
+    job "$s" "SIZES=($*)
+item_encode_1() { fake_encode; }
+if item_begin 1 '$T/in/M.mkv' '$T/out/M.mkv' $tier 0 '' &&
+   item_expect vidx=0 mode=crf crf=$crf kbps= est_vbytes=$(gib 6.8) atrans= ahash=1 $extra &&
+   item_crf_encode item_encode_1
+then
+    item_succeeded
+else
+    item_failed
+fi"
+    run_job "$s"
+}
+HIGH="ceiling_vbytes=$(gib 7) crf_min=19 crf_max=23"
+
+# ------------------------------------------------------------
+echo "== movie"
+
+movie_job m1 High 19 "$HIGH" "[19]='$(gib 6.5) $(gib 1)'"
+eq    "1 under ceiling: no retry"              "$(encoded m1)" "1:19 "
+check "1 accepted, final output written"       "grep -q '^Result: accepted\$' '$T/m1.log' && [[ \$(awk '{print \$3}' '$T/out/M.mkv') == 19 ]]"
+check "1 session not held open"                "! grep -q 'Above the video ceiling' '$T/m1.log'"
+
+movie_job m2 High 19 "$HIGH" "[19]='$(gib 7) 0'"
+eq    "2 exactly the ceiling: accepted"        "$(encoded m2)" "1:19 "
+check "2 accepted line"                        "grep -q '^CRF 19 actual: 7.00 GiB / 7.00 GiB ceiling\$' '$T/m2.log' && grep -q '^Result: accepted\$' '$T/m2.log'"
+
+movie_job m3 High 19 "$HIGH" "[19]='$(gib 7.4) $(gib 1)' [20]='$(gib 6.6) $(gib 1)'"
+eq    "3 slightly above: retried at CRF 20"    "$(encoded m3)" "1:19 1:20 "
+check "3 compact pane output" \
+    "grep -q '^CRF 19 actual: 7.40 GiB / 7.00 GiB ceiling\$' '$T/m3.log' && grep -q '^Result: over ceiling -> retrying CRF 20\$' '$T/m3.log' && grep -q '^CRF 20 actual: 6.60 GiB / 7.00 GiB ceiling\$' '$T/m3.log' && grep -q '^Result: accepted\$' '$T/m3.log'"
+check "4 retry accepted: output is CRF 20"     "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 20 ]]"
+eq    "4/15 verification expects CRF 20"       "$(verified m3)" "1:20 "
+check "4 report lists both attempts" \
+    "grep -q 'Selected CRF: *20' '$T/m3.log' && grep -q 'High | CRF 19 | est 6.80 GiB | actual 7.40 GiB | ceiling 7.00 | REJECTED -> retry CRF 20' '$T/m3.log' && grep -q 'High | CRF 20 | est n/a | actual 6.60 GiB | ceiling 7.00 | ACCEPTED' '$T/m3.log'"
+eq    "4 estimate log: both attempts"          "$(rows m3)" "19/$(gib 6.8)/REJECTED 20/-/ACCEPTED "
+check "4 estimate log: error % and ceiling"    "awk -F'\\t' '\$9 == \"m3\" && \$3 == 19 { f = (\$8 ~ /%\$/ && \$11 == $(gib 7)) } END { exit !f }' '$W/logs/crf_estimates.tsv'"
+eq    "16 rejected attempt removed"            "$(leftovers)" ""
+
+movie_job m5 High 19 "$HIGH" "[19]='$(gib 9) 0' [20]='$(gib 8) 0' [21]='$(gib 7.5) 0' [22]='$(gib 6.9) 0'"
+eq    "5 retries until it fits"                "$(encoded m5)" "1:19 1:20 1:21 1:22 "
+check "5 accepted CRF 22"                      "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 22 ]] && [[ '$(verified m5)' == '1:22 ' ]]"
+eq    "16 no retry files left"                 "$(leftovers)" ""
+
+movie_job m6 High 19 "$HIGH" "[19]='$(gib 9) 0' [20]='$(gib 9) 0' [21]='$(gib 9) 0' [22]='$(gib 8) 0' [23]='$(gib 7.5) 0'"
+eq    "6 never beyond CRF_MAX"                 "$(encoded m6)" "1:19 1:20 1:21 1:22 1:23 "
+check "6 warning: ceiling cannot be met" \
+    "grep -q '^Result: over ceiling; CRF 23 is the High limit\$' '$T/m6.log' && grep -q 'WARNING: the 7.00 GiB video ceiling cannot be met within the High' '$T/m6.log' && grep -q 'CRF range (19-23); keeping CRF 23' '$T/m6.log'"
+check "6 kept CRF 23, flagged at the end"      "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 23 ]] && grep -q '^Above the video ceiling' '$T/m6.log'"
+check "6 logged OVER CEILING"                  "[[ '$(rows m6)' == *'23/-/OVER CEILING '* ]]"
+
+movie_job m7 High 19 "$HIGH" "[19]='$(gib 6.9) $(gib 2)'"
+eq    "7 total over only by audio: no retry"   "$(encoded m7)" "1:19 "
+check "7 accepted on video bytes"              "grep -q '^CRF 19 actual: 6.90 GiB / 7.00 GiB ceiling\$' '$T/m7.log'"
+
+movie_job m8 Custom 24 "ceiling_vbytes= crf_min= crf_max=" "[24]='$(gib 50) 0'"
+eq    "8 Custom: never retried"                "$(encoded m8)" "1:24 "
+check "8 Custom: no ceiling check output"      "! grep -q 'ceiling' '$T/m8.log' && [[ -f '$T/out/M.mkv' ]]"
+
+declare -A ITEM_EXP=()
+check "9 Quality (two-pass): no CRF retry"    "ITEM_EXP=([mode]=abr [crf]= [ceiling_vbytes]=$(gib 7) [crf_max]=23); ! item_retry_enabled"
+check "9 Custom: no CRF retry"                 "ITEM_EXP=([mode]=crf [crf]=24 [ceiling_vbytes]= [crf_max]=); ! item_retry_enabled"
+check "9 High: CRF retry"                      "ITEM_EXP=([mode]=crf [crf]=19 [ceiling_vbytes]=$(gib 7) [crf_max]=23); item_retry_enabled"
+
+movie_job m9 High 19 "$HIGH" "[19]='$(gib 7.4) 0' [20]=fail"
+check "retry fails: completed CRF 19 kept"     "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 19 ]] && [[ '$(verified m9)' == '1:19 ' ]] && grep -q 'WARNING: retry at CRF 20 failed' '$T/m9.log'"
+eq    "retry fails: no temp files left"        "$(leftovers)" ""
+
+# ------------------------------------------------------------
+echo
+echo "== series (one CRF per season, median episode decides)"
+
+# series_job SESSION N SIZES...  (High: ceiling 5 GiB/episode, CRF 18-21)
+series_job() {
+    local s="$1" n="$2" body="" e
+    shift 2
+    rm -f "$T"/out/Show/* "$T/$s.encoded" "$T/$s.verified"
+    for ((e = 1; e <= n; e++)); do
+        body+="item_encode_$e() { fake_encode; }
+item_ctx_$e() {
+   item_begin $e '$T/in/Show/E0$e.mkv' '$T/out/Show/E0$e.mkv' High 0 '' &&
+   item_expect vidx=0 mode=crf crf=${SERIES_CRF:-18} kbps= est_vbytes=$(gib 4.8) atrans= ahash=1 ${SERIES_EXTRA:-ceiling_vbytes=$(gib 5) crf_min=18 crf_max=21}
+}
+item_prep_$e() {
+   :
+}
+job_batch_add $e
+"
+    done
+    job "$s" "SIZES=($*)
+$body" series "$n"
+    run_job "$s"
+}
+final_crfs() { for f in "$T"/out/Show/E0?.mkv; do awk '{ printf "%s ", $3 }' "$f"; done; }
+
+series_job s10 3 "[1:18]='$(gib 4.2) 1' [2:18]='$(gib 4.6) 1' [3:18]='$(gib 4.9) 1'"
+eq    "10 median under: no retry"              "$(encoded s10)" "1:18 2:18 3:18 "
+check "10 accepted, all final at CRF 18"       "grep -q '^CRF 18 actual median: 4.60 GiB / 5.00 GiB ceiling\$' '$T/s10.log' && grep -q '^Result: accepted\$' '$T/s10.log' && [[ '$(final_crfs)' == '18 18 18 ' ]]"
+
+series_job s11 5 "[1:18]='$(gib 5.0) 1' [2:18]='$(gib 5.2) 1' [3:18]='$(gib 5.3) 1' [4:18]='$(gib 6.1) 1' [5:18]='$(gib 4.0) 1'" \
+    "[1:19]='$(gib 4.3) 1' [2:19]='$(gib 4.5) 1' [3:19]='$(gib 4.6) 1' [4:19]='$(gib 5.4) 1' [5:19]='$(gib 3.5) 1'"
+eq    "11 median over: whole season retried"   "$(encoded s11)" "1:18 2:18 3:18 4:18 5:18 1:19 2:19 3:19 4:19 5:19 "
+check "11 pane output" \
+    "grep -q '^CRF 18 actual median: 5.20 GiB / 5.00 GiB ceiling\$' '$T/s11.log' && grep -q '^Result: over ceiling -> retrying season at CRF 19\$' '$T/s11.log' && grep -q '^CRF 19 actual median: 4.50 GiB / 5.00 GiB ceiling\$' '$T/s11.log' && grep -q '^Warning: 1 episode remains above nominal ceiling\$' '$T/s11.log'"
+eq    "14 one CRF for every episode"           "$(final_crfs)" "19 19 19 19 19 "
+eq    "15 verification expects the accepted CRF" "$(verified s11)" "1:19 2:19 3:19 4:19 5:19 "
+check "11 outlier noted, not re-encoded alone" "grep -q 'High | CRF 19 | est n/a | actual 5.40 GiB | ceiling 5.00 | ACCEPTED -> above the nominal ceiling' '$T/s11.log' && [[ \$(grep -c '^4:' '$T/s11.encoded') == 2 ]]"
+check "11 logs: both season attempts"          "[[ '$(rows s11)' == *'18/$(gib 4.8)/REJECTED'*'19/-/ACCEPTED'* && \$(awk -F'\\t' '\$9 == \"s11\"' '$W/logs/crf_estimates.tsv' | grep -c .) == 10 ]]"
+eq    "16 series: rejected attempts removed"   "$(leftovers)" ""
+
+series_job s12 3 "[1:18]='$(gib 4.0) 1' [2:18]='$(gib 4.5) 1' [3:18]='$(gib 7.0) 1'"
+eq    "12 one outlier, median fits: no retry"  "$(encoded s12)" "1:18 2:18 3:18 "
+check "12 outlier warned"                      "grep -q '^Warning: 1 episode remains above nominal ceiling\$' '$T/s12.log' && [[ '$(final_crfs)' == '18 18 18 ' ]]"
+
+series_job s13 5 "[1:18]='$(gib 4.0) 1' [2:18]='$(gib 4.5) 1' [3:18]='$(gib 4.8) 1' [4:18]='$(gib 6.0) 1' [5:18]='$(gib 7.0) 1'"
+eq    "13 two outliers, median fits: no retry" "$(encoded s13)" "1:18 2:18 3:18 4:18 5:18 "
+check "13 outliers warned"                     "grep -q '^Warning: 2 episodes remain above nominal ceiling\$' '$T/s13.log'"
+
+series_job s14 3 "[1:18]='$(gib 6) 1' [2:18]='$(gib 6) 1' [3:18]='$(gib 6) 1' [1:19]='$(gib 4) 1' [2:19]=fail"
+check "14 retry fails: season kept at CRF 18"  "[[ '$(final_crfs)' == '18 18 18 ' && '$(verified s14)' == '1:18 2:18 3:18 ' ]] && grep -q 'WARNING: season retry at CRF 19 failed (episode 2' '$T/s14.log'"
+eq    "14 retry fails: partial retry removed"  "$(leftovers)" ""
+
+series_job s15 2 "[1:18]='$(gib 6) 1' [2:18]='$(gib 6) 1' [1:19]='$(gib 6) 1' [2:19]='$(gib 6) 1' [1:20]='$(gib 6) 1' [2:20]='$(gib 6) 1' [1:21]='$(gib 5.5) 1' [2:21]='$(gib 5.5) 1'"
+check "season CRF_MAX still over: warned, kept 21" \
+    "[[ '$(final_crfs)' == '21 21 ' ]] && grep -q 'per-episode video ceiling cannot be met within the' '$T/s15.log' && grep -q '^Above the video ceiling' '$T/s15.log' && ! grep -q 'CRF 22' '$T/s15.log'"
+
+# ------------------------------------------------------------
+echo
+echo "== movie: lower-CRF retry (ceiling 5 GiB, 20 % headroom -> <= 4 GiB, CRF 15-21)"
+
+DOWN="ceiling_vbytes=$(gib 5) crf_min=15 crf_max=21 down_headroom_pct=20 down_max=2"
+seen() { tr '\n' ' ' < "$T/$1.seen" 2>/dev/null; }
+
+movie_job d1 High 18 "$DOWN" "[18]='$(gib 4.4) $(gib 1)'"
+eq    "d1 near the ceiling: no lower CRF"     "$(encoded d1)" "1:18 "
+check "d1 accepted CRF 18, no headroom line"  "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 18 ]] && ! grep -q 'Headroom' '$T/d1.log'"
+
+movie_job d2 High 18 "$DOWN" "[18]='$(gib 3.1) $(gib 1)' [17]='$(gib 4.6) $(gib 1)'"
+eq    "d2 far below: CRF 17 tried"            "$(encoded d2)" "1:18 1:17 "
+check "d2 compact output" \
+    "grep -q '^CRF 18 actual: 3.10 GiB / 5.00 GiB ceiling\$' '$T/d2.log' && grep -q '^Headroom large -> trying CRF 17\$' '$T/d2.log' && grep -q '^CRF 17 actual: 4.60 GiB / 5.00 GiB ceiling\$' '$T/d2.log'"
+check "d3 lower CRF fits: CRF 17 accepted"    "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 17 ]] && grep -q 'Selected CRF: *17' '$T/d2.log'"
+eq    "d24 verification expects CRF 17"       "$(verified d2)" "1:17 "
+eq    "d19 accepted CRF 18 kept aside during the trial" "$(seen d2)" "1:17:M.mkv.accepted-crf18.part "
+eq    "d21 only the final output is left"     "$(leftovers)" ""
+eq    "d23 logs: candidate + accepted"        "$(rows d2)" "18/$(gib 6.8)/ACCEPTED-CANDIDATE 17/-/ACCEPTED "
+
+movie_job d4 High 18 "$DOWN" "[18]='$(gib 3.0) 0' [17]='$(gib 3.5) 0' [16]='$(gib 4.5) 0'"
+eq    "d4 second lower CRF within the limit"  "$(encoded d4)" "1:18 1:17 1:16 "
+check "d4 CRF 16 accepted"                    "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 16 && '$(verified d4)' == '1:16 ' ]]"
+
+movie_job d5 High 18 "$DOWN" "[18]='$(gib 3.2) 0' [17]='$(gib 3.9) 0' [16]='$(gib 5.3) 0'"
+eq    "d5 lower CRF over the ceiling: stop"   "$(encoded d5)" "1:18 1:17 1:16 "
+check "d5 completed CRF 17 kept"              "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 17 && '$(verified d5)' == '1:17 ' ]] && grep -q '^Result: over ceiling -> keeping CRF 17\$' '$T/d5.log'"
+eq    "d20 rejected lower trial removed"      "$(leftovers)" ""
+check "d23 report: every attempt" \
+    "grep -q 'High | CRF 18 | est 6.80 GiB | actual 3.20 GiB | ceiling 5.00 | ACCEPTED-CANDIDATE' '$T/d5.log' && grep -q 'High | CRF 17 | est n/a | actual 3.90 GiB | ceiling 5.00 | ACCEPTED\$' '$T/d5.log' && grep -q 'High | CRF 16 | est n/a | actual 5.30 GiB | ceiling 5.00 | REJECTED -> over ceiling; keep CRF 17' '$T/d5.log'"
+eq    "d23 estimate log: every attempt"       "$(rows d5)" "18/$(gib 6.8)/ACCEPTED-CANDIDATE 17/-/ACCEPTED 16/-/REJECTED "
+
+movie_job d6 High 15 "$DOWN" "[15]='$(gib 2) 0'"
+eq    "d6 CRF_MIN: no lower CRF"              "$(encoded d6)" "1:15 "
+check "d6 says why"                           "grep -q '^Headroom large, but CRF 15 is the High minimum\$' '$T/d6.log'"
+
+movie_job d7 High 18 "${DOWN/down_max=2/down_max=1}" "[18]='$(gib 2) 0' [17]='$(gib 2.5) 0'"
+eq    "d7 retry limit respected"              "$(encoded d7)" "1:18 1:17 "
+check "d7 says why, CRF 17 kept"              "grep -q 'lower-CRF retry limit (1) is reached' '$T/d7.log' && [[ \$(awk '{print \$3}' '$T/out/M.mkv') == 17 ]]"
+
+movie_job d7b High 18 "${DOWN/down_max=2/down_max=0}" "[18]='$(gib 2) 0'"
+eq    "d7 limit 0: never lower"               "$(encoded d7b)" "1:18 "
+
+movie_job d8 High 18 "$DOWN" "[18]='$(gib 3) 0' [17]=fail"
+check "d8 lower trial fails: CRF 18 kept"     "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 18 && '$(verified d8)' == '1:18 ' ]] && grep -q 'Result: CRF 17 failed' '$T/d8.log'"
+eq    "d8 no temp files"                      "$(leftovers)" ""
+
+movie_job d8b High 18 "$DOWN" "[18]='$(gib 5.5) 0' [19]='$(gib 2) 0'"
+eq    "no oscillation: CRF 18 known over"     "$(encoded d8b)" "1:18 1:19 "
+check "no oscillation: CRF 19 final"          "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 19 && '$(verified d8b)' == '1:19 ' ]]"
+
+movie_job d10 Custom 24 "ceiling_vbytes= crf_min= crf_max= down_headroom_pct=20 down_max=2" "[24]='$(gib 1) 0'"
+eq    "d10 Custom: never a lower CRF"         "$(encoded d10)" "1:24 "
+check "d11 Quality: no CRF retry at all"      "ITEM_EXP=([mode]=abr [crf]= [ceiling_vbytes]=$(gib 5) [crf_max]=21 [down_headroom_pct]=20 [down_max]=2); ! item_retry_enabled"
+
+# d9: interrupted during the lower trial
+echo "old final" > "$T/out/M.mkv"
+rm -f "$T/d9.encoded"
+job d9 "SIZES=([18]='$(gib 3) 0' [17]=sleep)
+item_encode_1() { fake_encode; }
+if item_begin 1 '$T/in/M.mkv' '$T/out/M.mkv' High 1 '' &&
+   item_expect vidx=0 mode=crf crf=18 kbps= est_vbytes=$(gib 4) atrans= ahash=1 $DOWN &&
+   item_crf_encode item_encode_1
+then item_succeeded; else item_failed; fi"
+bash "$W/d9.sh" < /dev/null > "$T/d9.log" 2>&1 &
+pid=$!
+for _ in $(seq 100); do grep -q '1:17' "$T/d9.encoded" 2>/dev/null && break; sleep 0.1; done
+sleep 0.3
+kill -TERM "$pid"; wait "$pid" 2>/dev/null
+check "d9 interrupted: accepted CRF 18 recoverable" "[[ \$(awk '{print \$3}' '$T/out/M.mkv.accepted-crf18.part') == 18 ]] && grep -q 'M.mkv.accepted-crf18.part' '$T/d9.log'"
+check "d9 unfinished CRF 17 trial removed"    "[[ ! -e '$T/out/M.mkv.retry-crf17.part' ]]"
+check "d9 final output untouched"             "[[ \$(cat '$T/out/M.mkv') == 'old final' ]]"
+rm -f "$T"/out/M.mkv*
+
+# ------------------------------------------------------------
+echo
+echo "== series: lower-CRF retry (one CRF per season, median decides)"
+
+SERIES_EXTRA="$DOWN"
+series_job e12 3 "[1:18]='$(gib 3.0) 1' [2:18]='$(gib 3.2) 1' [3:18]='$(gib 3.4) 1'" \
+    "[1:17]='$(gib 4.3) 1' [2:17]='$(gib 4.5) 1' [3:17]='$(gib 4.8) 1'"
+eq    "e12 median far below: season at CRF 17" "$(encoded e12)" "1:18 2:18 3:18 1:17 2:17 3:17 "
+check "e13 lower season accepted" \
+    "grep -q '^CRF 18 actual median: 3.20 GiB / 5.00 GiB ceiling\$' '$T/e12.log' && grep -q '^Headroom large -> trying season at CRF 17\$' '$T/e12.log' && grep -q '^CRF 17 actual median: 4.50 GiB / 5.00 GiB ceiling\$' '$T/e12.log' && grep -q '^Season CRF: 17\$' '$T/e12.log'"
+eq    "e16 one CRF for every episode"         "$(final_crfs)" "17 17 17 "
+eq    "e24 verified at the season CRF"        "$(verified e12)" "1:17 2:17 3:17 "
+check "e19 accepted season kept aside"        "[[ \$(grep -c ':17:E0[123].mkv.accepted-crf18.part' '$T/e12.seen') == 3 ]]"
+eq    "e21 only final outputs left"           "$(leftovers)" ""
+
+series_job e14 3 "[1:18]='$(gib 3.0) 1' [2:18]='$(gib 3.2) 1' [3:18]='$(gib 3.4) 1'" \
+    "[1:17]='$(gib 3.7) 1' [2:17]='$(gib 3.9) 1' [3:17]='$(gib 4.0) 1'" \
+    "[1:16]='$(gib 5.0) 1' [2:16]='$(gib 5.3) 1' [3:16]='$(gib 5.6) 1'"
+eq    "e14 lower season over: stop"           "$(encoded e14)" "1:18 2:18 3:18 1:17 2:17 3:17 1:16 2:16 3:16 "
+check "e14 completed CRF 17 season kept"      "[[ '$(final_crfs)' == '17 17 17 ' ]] && grep -q '^CRF 16 actual median: 5.30 GiB / 5.00 GiB ceiling\$' '$T/e14.log' && grep -q '^Result: over ceiling -> keeping CRF 17\$' '$T/e14.log'"
+eq    "e20 rejected season trial removed"     "$(leftovers)" ""
+check "e23 logs: all three season attempts"   "[[ \$(awk -F'\\t' '\$9 == \"e14\"' '$W/logs/crf_estimates.tsv' | grep -c .) == 9 ]] && [[ '$(rows e14)' == *'16/-/REJECTED'* ]]"
+
+SERIES_EXTRA="${DOWN/down_max=2/down_max=1}"
+series_job e15 3 "[1:18]='$(gib 2.0) 1' [2:18]='$(gib 2.5) 1' [3:18]='$(gib 5.5) 1'" \
+    "[1:17]='$(gib 3.0) 1' [2:17]='$(gib 3.5) 1' [3:17]='$(gib 6.5) 1'"
+check "e15 outlier above, median fits: CRF 17" "[[ '$(final_crfs)' == '17 17 17 ' ]] && grep -q '^Warning: 1 episode remains above nominal ceiling\$' '$T/e15.log'"
+check "e17 retry limit respected"             "[[ '$(encoded e15)' == '1:18 2:18 3:18 1:17 2:17 3:17 ' ]] && grep -q 'lower-CRF retry limit (1) is reached' '$T/e15.log'"
+
+SERIES_EXTRA="$DOWN" SERIES_CRF=15
+series_job e18 2 "[1:15]='$(gib 2) 1' [2:15]='$(gib 2) 1'"
+check "e18 CRF_MIN respected"                 "[[ '$(encoded e18)' == '1:15 2:15 ' ]] && grep -q 'CRF 15 is the High minimum' '$T/e18.log'"
+SERIES_CRF=18
+
+series_job e8 3 "[1:18]='$(gib 3) 1' [2:18]='$(gib 3) 1' [3:18]='$(gib 3) 1' [1:17]='$(gib 4) 1' [2:17]=fail"
+check "season trial fails: CRF 18 kept"       "[[ '$(final_crfs)' == '18 18 18 ' && '$(verified e8)' == '1:18 2:18 3:18 ' ]] && grep -q 'season at CRF 17 failed (episode 2' '$T/e8.log'"
+eq    "season trial fails: no temp files"     "$(leftovers)" ""
+unset SERIES_EXTRA
+
+# ------------------------------------------------------------
+echo
+echo "== CRF log header"
+
+L="$T/logtest"
+mkdir -p "$L"
+printf '%s\n' "$CRF_LOG_HEADER_V1" > "$L/a.tsv"
+printf 'd\tHigh\t19\t1920x1080\t100\t5\t6\t20%%\ts\tin\n' >> "$L/a.tsv"
+printf 'd\tHigh\t20\t1920x1080\t100\t5\t6\t20%%\ts\tin\t7\tACCEPTED\t-\n' >> "$L/a.tsv"
+crf_log_prepare "$L/a.tsv"
+eq    "old header migrated"                   "$(head -1 "$L/a.tsv")" "$CRF_LOG_HEADER"
+eq    "old rows padded to 13 columns"         "$(awk -F'\t' '{ print NF }' "$L/a.tsv" | sort -u | tr '\n' ' ')" "13 "
+check "old row values kept"                   "sed -n 2p '$L/a.tsv' | grep -q \$'\\t19\\t1920x1080\\t100\\t5\\t6\\t20%\\ts\\tin\\t-\\t-\\t-\$'"
+echo "permanent result" > "$L/b.tsv"
+crf_log_prepare "$L/b.tsv"
+check "unknown file moved aside, not lost"    "grep -qx 'permanent result' '$L'/b.tsv.unknown-* && [[ \$(cat '$L/b.tsv') == \"\$CRF_LOG_HEADER\" ]]"
+eq    "job log: one header, all rows 13 columns" "$(awk -F'\t' '{ print NF }' "$W/logs/crf_estimates.tsv" | sort -u | tr '\n' ' ')/$(grep -c '^date' "$W/logs/crf_estimates.tsv")" "13 /1"
+
+# ------------------------------------------------------------
+echo
+echo "== interruption / other sessions / cleanup"
+
+echo "other job" > "$W/c80.sh"
+printf 'version=1\nsession=c80\nstatus=running\nstarted=1234\n' > "$W/c80.state"
+echo "other output" > "$T/out/Other.mkv.part"
+echo "old final" > "$T/out/M.mkv"
+
+rm -f "$T/i1.encoded"
+job i1 "SIZES=([19]='$(gib 7.4) 0' [20]=sleep)
+item_encode_1() { fake_encode; }
+if item_begin 1 '$T/in/M.mkv' '$T/out/M.mkv' High 1 '' &&
+   item_expect vidx=0 mode=crf crf=19 kbps= est_vbytes=$(gib 6.8) atrans= ahash=1 $HIGH &&
+   item_crf_encode item_encode_1
+then item_succeeded; else item_failed; fi"
+bash "$W/i1.sh" < /dev/null > "$T/i1.log" 2>&1 &
+pid=$!
+for _ in $(seq 100); do grep -q '1:20' "$T/i1.encoded" 2>/dev/null && break; sleep 0.1; done
+sleep 0.3
+kill -TERM "$pid"; wait "$pid" 2>/dev/null
+check "18 interrupted: final output untouched" "[[ \$(cat '$T/out/M.mkv') == 'old final' ]]"
+check "18 completed CRF 19 attempt kept"       "[[ \$(awk '{print \$3}' '$T/out/M.mkv.part') == 19 ]] && grep -q 'Completed CRF attempts kept' '$T/i1.log'"
+check "18 unfinished retry removed"            "[[ ! -e '$T/out/M.mkv.retry-crf20.part' ]]"
+check "18 state says interrupted"              "grep -qx 'status=interrupted' '$W/i1.state'"
+rm -f "$T/out/M.mkv.part" "$T/out/M.mkv"
+
+movie_job c81 High 19 "$HIGH" "[19]='$(gib 7.4) 0' [20]='$(gib 6) 0'"
+check "19 another session's files untouched"   "[[ \$(cat '$W/c80.sh') == 'other job' ]] && grep -qx 'started=1234' '$W/c80.state' && [[ \$(cat '$T/out/Other.mkv.part') == 'other output' ]]"
+check "20 finished retry job removed its runtime files" "[[ ! -e '$W/c81.sh' && ! -e '$W/c81.state' && ! -e '$W/c81.progress' ]]"
+check "17 accepted output preserved"           "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 20 ]]"
+rm -f "$T/out/Other.mkv.part"
+
+if bash "$SRC_WORK/tests/job_cleanup_tests.sh" > "$T/cleanup.log" 2>&1; then
+    ok "20 job_cleanup_tests.sh passes"
+else
+    bad "20 job_cleanup_tests.sh passes"; tail -20 "$T/cleanup.log"
+fi
+
+# ------------------------------------------------------------
+echo
+echo "== generated jobs, real 2 s encodes"
+
+if ! command -v ffmpeg >/dev/null || [[ "$(ffmpeg -hide_banner -encoders 2>/dev/null)" != *libx265* ]]; then
+    echo "  (ffmpeg with libx265 not found: skipped)"
+else
+    source "$W/lib/policy.sh"
+    COMPRESS_CONF="$W/lib/compress.conf" load_policy > /dev/null
+    R="$T/real"
+    mkdir -p "$R/in" "$R/out"
+    for e in 1 2; do
+        ffmpeg -v error -y -f lavfi -i "testsrc2=s=320x180:r=24:d=2" -f lavfi -i "sine=f=440:r=48000:d=2" \
+            -c:v libx264 -preset ultrafast -qp 0 -c:a aac -b:a 96k "$R/in/E0$e.mkv"
+    done
+    DV_POLICY=none HDR10P_POLICY=none
+
+    # movie High, ceiling 1 byte: CRF 19, 20, 21 all above -> CRF 21 kept
+    { emit_job_header r1 movie 1
+      emit_encode_item 1 "$R/in/E01.mkv" "$R/out/M.mkv" High crf:19 "" "" 0 1000 "1:21:19"
+      emit_job_footer; } > "$W/r1.sh"
+    check "generated: encode is a function + retry" "grep -q '^item_encode_1() {' '$W/r1.sh' && grep -q '^   item_crf_encode item_encode_1\$' '$W/r1.sh' && grep -q 'ceiling_vbytes=1 crf_min=19 crf_max=21' '$W/r1.sh' && grep -q -- '-crf:v:0 19 ' '$W/r1.sh'"
+    bash -n "$W/r1.sh" && run_job r1
+    check "real movie: verified at accepted CRF 21" "grep -q 'Selected CRF: *21' '$T/r1.log' && grep -qE 'AS PLANNED .*CRF 21(\.0)? \(single pass\)' '$T/r1.log' && [[ -f '$R/out/M.mkv' ]]"
+    check "real movie: three attempts encoded"  "grep -q 'ENCODING (single pass, CRF 20)' '$T/r1.log' && grep -q 'ENCODING (single pass, CRF 21)' '$T/r1.log' && grep -q 'Result: over ceiling; CRF 21 is the High limit' '$T/r1.log'"
+    check "real movie: no temp files"           "[[ -z \$(find '$R/out' -name '*.part') ]]"
+
+    # movie High, huge ceiling: planned 21, lower CRFs 20 and 19 (limit 2)
+    { emit_job_header r4 movie 1
+      emit_encode_item 1 "$R/in/E01.mkv" "$R/out/D.mkv" High crf:21 "" "" 0 1000 "$(gib 100):23:19:20:2"
+      emit_job_footer; } > "$W/r4.sh"
+    check "generated: lower-CRF settings"       "grep -q 'crf_min=19 crf_max=23 down_headroom_pct=20 down_max=2' '$W/r4.sh'"
+    bash -n "$W/r4.sh" && run_job r4
+    check "real movie: lower CRF 19 verified"   "grep -q 'Selected CRF: *19' '$T/r4.log' && grep -qE 'AS PLANNED .*CRF 19(\\.0)? \\(single pass\\)' '$T/r4.log' && grep -q 'ENCODING (single pass, CRF 20)' '$T/r4.log' && [[ -f '$R/out/D.mkv' && -z \$(find '$R/out' -name '*.part') ]]"
+
+    # series High, ceiling 1 byte: season 18 -> 19 (CRF_MAX), both verified at 19
+    { emit_job_header r2 series 2
+      for e in 1 2; do
+          emit_encode_item "$e" "$R/in/E0$e.mkv" "$R/out/E0$e.mkv" High crf:18 "" "" 0 1000 "1:19:18:::batch"
+      done
+      emit_job_footer; } > "$W/r2.sh"
+    check "generated: season batch functions"   "grep -q '^item_ctx_2() {' '$W/r2.sh' && grep -q '^item_prep_2() {' '$W/r2.sh' && grep -q '^job_batch_add 2\$' '$W/r2.sh' && grep -q '^job_crf_batch\$' '$W/r2.sh'"
+    bash -n "$W/r2.sh" && run_job r2
+    check "real series: both verified at CRF 19" "[[ \$(grep -cE 'AS PLANNED .*CRF 19(\\.0)? \\(single pass\\)' '$T/r2.log') == 2 ]] && [[ -f '$R/out/E01.mkv' && -f '$R/out/E02.mkv' ]] && grep -q 'retrying season at CRF 19' '$T/r2.log'"
+    check "real series: no temp files"          "[[ -z \$(find '$R/out' -name '*.part') ]]"
+
+    # Quality (two-pass) and Custom: no retry in the generated job
+    { emit_job_header r3 movie 2
+      emit_encode_item 1 "$R/in/E01.mkv" "$R/out/Q.mkv" Quality 800 "" "$W/p" 0 ""
+      emit_encode_item 2 "$R/in/E01.mkv" "$R/out/C.mkv" Custom crf:24 "" "" 0 1000 ""
+      emit_job_footer; } > "$W/r3.sh"
+    check "generated: Quality has no CRF retry" "! sed -n '/item 1/,/item 2/p' '$W/r3.sh' | grep -q 'item_crf_encode\\|ceiling_vbytes'"
+    check "generated: Custom has no ceiling"    "grep -qF \"ceiling_vbytes='' crf_min='' crf_max=''\" '$W/r3.sh'"
+fi
+
+echo
+echo "passed: $PASS  failed: $FAIL"
+exit $(( FAIL > 0 ))
