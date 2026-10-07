@@ -576,6 +576,34 @@ echo "== series CRF: one CRF per batch, median episode"
 }
 COMPRESS_CONF="$T/compress.conf"
 
+# ------------------------------------------------------------
+echo
+echo "== series output naming (no encodes)"
+{
+    source "$WORK_DIR/lib/naming.sh"
+    O=/home/u/compress/out
+    for d in "Slow-Horses" "True Detective" "The-Last-of-Us" "Mr. Robot (2015) - S1, Part [A]! & 'B'" "UPPER lower 4K HDR"; do
+        eq "series dir '$d' -> out/'$d'"     "$(series_output_dir "$O" "/home/u/compress/in/$d")" "$O/$d"
+        eq "series dir '$d/' (trailing /)"   "$(series_output_dir "$O/" "/home/u/compress/in/$d/")" "$O/$d"
+    done
+    for t in High Base Custom; do
+        for r in 0 1; do
+            od=$(series_output_dir "$O" "/home/u/compress/in/Slow-Horses")
+            eq "dir for $t (downscaled=$r) has no encode info" "$od" "$O/Slow-Horses"
+            ep=$(series_episode_output "$od" "/x/Slow Horses - S01E01 - Failure's Contagious.mkv" "$t" "$r")
+            eq "episode name $t (downscaled=$r) unchanged" "$ep" \
+                "$O/Slow-Horses/Slow Horses - S01E01 - Failure's Contagious$( (( r )) && echo " 1080p") HEVC $t.mkv"
+        done
+    done
+    check "series menu uses the naming functions" \
+        "grep -q 'OUT_SERIES=\$(series_output_dir \"\$OUT_DIR\" \"\$SERIES_DIR\")' '$SRC_WORK/series_compress.sh' && grep -q 'series_episode_output \"\$OUT_SERIES\"' '$SRC_WORK/series_compress.sh'"
+    check "series menu: no encode info in the folder name" \
+        "! grep -nE 'OUT_SERIES=.*(HEVC|1080p|TIER|CRF)' '$SRC_WORK/series_compress.sh'"
+    check "movie naming unchanged: <name>[ 1080p] HEVC <Tier>.mkv in out/" \
+        "grep -qF 'OUT=\"\$OUT_DIR/\${NAME} 1080p HEVC \${TIER}.mkv\"' '$SRC_WORK/movie_compress.sh' && grep -qF 'OUT=\"\$OUT_DIR/\${NAME} HEVC \${TIER}.mkv\"' '$SRC_WORK/movie_compress.sh'"
+    unset O od ep
+}
+
 reject() {   # LABEL PATTERN KEY=VALUE...
     local label="$1" pat="$2"
     shift 2
@@ -1456,6 +1484,7 @@ if [[ -s "$MH/compress/in/Multi.mkv" ]]; then
     # 23 the High (CRF) job: all tracks identical, estimate reported
     bash "$AC/movie_High_job.sh" < /dev/null > "$AC/movie_high_run.log" 2>&1
     hout="$MH/compress/out/Multi HEVC High.mkv"
+    check "movie naming unchanged: out/<name> HEVC <Tier>.mkv" "[[ -f '$hout' && -f '$mout' && '$(basename "$mout")' == 'Multi HEVC Quality.mkv' ]]"
     check "23 movie High job succeeded"              "grep -q 'All encodes finished: 1 ok, 0 failed' '$AC/movie_high_run.log'"
     eq    "23 movie High: payload identical (all tracks)" "$(_audio_payload_md5 "$hout" | tr '\n' ' ')" "$(_audio_payload_md5 "$MH/compress/in/Multi.mkv" | tr '\n' ' ')"
     check "23 movie High: Atmos PRESERVED"           "grep -q 'Audio 1 object: *Dolby Atmos PRESERVED (stream copy)' '$AC/movie_high_run.log'"
@@ -1987,6 +2016,81 @@ check "22 series downscale: estimate at 1920x960" "grep -q 'Estimating video siz
 run_menu "$SH" "$SH/compress/work/series_compress.sh" "2\n1\n3\n20\nn\nn\n" "$T/ss_uhd_keep.log"
 check "23 series 4K kept: estimate at 3840x1920"  "grep -q 'Estimating video size from sample encodes (1 of 1 episodes, 3840x1920 output)' '$T/ss_uhd_keep.log'"
 unset -f sjobs sclean crfs_in
+
+echo
+echo "== series output folder = source folder name, exactly"
+# one 2 s lossless episode (no source-quality guard), copied per case
+av_source -c:v libx264 -preset ultrafast -qp 0 "$T/ep.mkv"
+EP_NAME="Slow Horses - S01E01 - Failure's Contagious"
+# name_case LABEL FOLDER TIER_INPUT TIER  ->  fresh HOME, one series run
+name_case() {
+    local label="$1" dir="$2" in="$3" tier="$4" h job want
+    h=$(new_home "name$RANDOM")
+    mkdir -p "$h/compress/in/$dir"
+    cp "$T/ep.mkv" "$h/compress/in/$dir/$EP_NAME.mkv"
+    run_menu "$h" "$h/compress/work/series_compress.sh" "1\n${in}y\n" "$T/name_$label.log"
+    job=$(first_job "$h" series)
+    want="$h/compress/out/$dir"
+    eq    "$label: only output folder is exactly '$dir'" "$(cd "$h/compress/out" && find . -mindepth 1 -maxdepth 1 | sed 's|^\./||')" "$dir"
+    check "$label: folder created"                       "[[ -d \"\$want\" && ! -L \"\$want\" ]]"
+    check "$label: job writes '$EP_NAME HEVC $tier.mkv' there" "grep -qF -- \"\$(printf '%q' \"\$want/\$EP_NAME HEVC $tier.mkv\")\" '$job'"
+    check "$label: menu shows the folder"                "grep -qxF \"  \$want\" '$T/name_$label.log'"
+    NAME_HOME="$h"
+}
+name_case slow    "Slow-Horses"    "2\n" High
+name_case true    "True Detective" "2\n" High
+name_case tlou    "The-Last-of-Us" "1\n" Base
+name_case punct   "Mr. Robot (2015) - S1, Part [A]! & 'B'" "3\n20\n" Custom
+
+# 4 High / Base / Custom of one series share the same preserved folder
+NH=$(new_home tiers)
+mkdir -p "$NH/compress/in/Slow-Horses"
+cp "$T/ep.mkv" "$NH/compress/in/Slow-Horses/$EP_NAME.mkv"
+for sel in "2\n:High" "1\n:Base" "3\n16\n:Custom"; do
+    rm -f "$NH/compress/work"/series[0-9]*.sh
+    run_menu "$NH" "$NH/compress/work/series_compress.sh" "1\n${sel%%:*}y\n" "$T/name_tier_${sel##*:}.log"
+    check "tiers ${sel##*:}: output in out/Slow-Horses" "grep -qF -- \"\$(printf '%q' \"$NH/compress/out/Slow-Horses/$EP_NAME HEVC ${sel##*:}.mkv\")\" '$(first_job "$NH" series)'"
+done
+eq    "tiers: one folder for all three tiers"    "$(cd "$NH/compress/out" && find . -mindepth 1 -maxdepth 1 | sed 's|^\./||')" "Slow-Horses"
+
+# existing outputs in the preserved folder: keep both -> " (2)"
+: > "$NH/compress/out/Slow-Horses/$EP_NAME HEVC High.mkv"
+rm -f "$NH/compress/work"/series[0-9]*.sh
+run_menu "$NH" "$NH/compress/work/series_compress.sh" "1\n2\n1\ny\n" "$T/name_exist.log"
+check "existing output: reported in the folder" "grep -q '1 of 1 outputs already exist in:' '$T/name_exist.log' && grep -qxF \"  $NH/compress/out/Slow-Horses\" '$T/name_exist.log'"
+check "existing output: keep both -> (2)"       "grep -qF -- \"\$(printf '%q' \"$NH/compress/out/Slow-Horses/$EP_NAME HEVC High (2).mkv\")\" '$(first_job "$NH" series)'"
+# existing output symlink in the folder: notice, never written through
+ln -s "$T/ep.mkv" "$NH/compress/out/Slow-Horses/$EP_NAME HEVC Base.mkv"
+rm -f "$NH/compress/work"/series[0-9]*.sh
+run_menu "$NH" "$NH/compress/work/series_compress.sh" "1\n1\n2\ny\n" "$T/name_link.log"
+check "existing output symlink: notice"         "grep -q 'Existing output is a symlink:' '$T/name_link.log' && grep -q 'The target file will NOT be modified.' '$T/name_link.log'"
+# a file (or broken symlink) with the folder's name: stop before anything
+NF=$(new_home namefile)
+mkdir -p "$NF/compress/in/Slow-Horses"
+cp "$T/ep.mkv" "$NF/compress/in/Slow-Horses/E01.mkv"
+: > "$NF/compress/out/Slow-Horses"
+run_menu "$NF" "$NF/compress/work/series_compress.sh" "1\n2\ny\n" "$T/name_file.log"
+check "folder name taken by a file: cancelled"  "grep -q 'Output folder name is taken by something that is not a folder' '$T/name_file.log' && [[ -z \"\$(first_job '$NF' series)\" && -f '$NF/compress/out/Slow-Horses' ]]"
+rm -f "$NF/compress/out/Slow-Horses"; ln -s "$NF/nowhere" "$NF/compress/out/Slow-Horses"
+run_menu "$NF" "$NF/compress/work/series_compress.sh" "1\n2\ny\n" "$T/name_broken.log"
+check "folder name is a broken symlink: cancelled" "grep -q '(broken symlink)' '$T/name_broken.log' && [[ -z \"\$(first_job '$NF' series)\" && ! -e '$NF/nowhere' ]]"
+
+# verification pairs outputs in the preserved folder with their source,
+# also when another series has an episode of the same name
+VH=$(new_home namever)
+mkdir -p "$VH/compress/in/Slow-Horses" "$VH/compress/in/True Detective" \
+    "$VH/compress/out/Slow-Horses" "$VH/compress/out/True Detective"
+cp "$T/ep.mkv" "$VH/compress/in/Slow-Horses/E01.mkv"
+cp "$T/ep.mkv" "$VH/compress/in/True Detective/E01.mkv"
+source "$WORK_DIR/lib/naming.sh"   # verify.sh's output <-> source pairing
+build_source_index "$VH/compress/in"
+eq    "verify: Slow-Horses output -> its source"     "$(find_source_for_output "$VH/compress/out/Slow-Horses/E01 HEVC High.mkv" "$VH/compress/in" "$VH/compress/out")" \
+    "$(printf 'OK\t%s' "$VH/compress/in/Slow-Horses/E01.mkv")"
+eq    "verify: True Detective output -> its source"  "$(find_source_for_output "$VH/compress/out/True Detective/E01 1080p HEVC Custom.mkv" "$VH/compress/in" "$VH/compress/out")" \
+    "$(printf 'OK\t%s' "$VH/compress/in/True Detective/E01.mkv")"
+eq    "verify: older '<series> HEVC High' folders still pair" "$(find_source_for_output "$VH/compress/out/Slow-Horses HEVC High/E01 HEVC High.mkv" "$VH/compress/in" "$VH/compress/out")" \
+    "$(printf 'OK\t%s' "$VH/compress/in/Slow-Horses/E01.mkv")"
+unset -f name_case
 
 echo
 echo "== source-quality guard (source already below the CRF demand)"

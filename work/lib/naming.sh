@@ -3,12 +3,32 @@
 #
 # Output names produced by the menus:
 #   movie:   "<name>[ 1080p] HEVC <Tier>[ EAC3][ (N)].mkv"
-#   series:  "<series>[ 1080p] HEVC <Tier>/<episode>[ 1080p] HEVC <Tier>.mkv"
+#   series:  "<series>/<episode>[ 1080p] HEVC <Tier>.mkv"  (folder = source
+#            folder name; older runs: "<series>[ 1080p] HEVC <Tier>/...")
 #   audio:   "<any of the above> AudioCompressed[ N].mkv"
 # Tier: Quality | High | Base | Normal | Custom | CRF<nn>
 
 NAMING_SUFFIX_RE=' AudioCompressed( [0-9]+)?$'
 NAMING_TIER_RE='( 1080p)? HEVC (Quality|High|Base|Normal|Custom|CRF[0-9]+)( EAC3)?( \([0-9]+\))?$'
+
+# series_output_dir OUT_ROOT SERIES_DIR  ->  OUT_ROOT/<SERIES_DIR basename>
+# The source folder name exactly (spaces, hyphens, punctuation, case);
+# no resolution / codec / tier / CRF: the episode names carry those.
+series_output_dir() {
+    local name
+    name=$(basename -- "$2")
+    printf '%s/%s' "${1%/}" "$name"
+}
+
+# series_episode_output OUT_SERIES EPISODE_FILE TIER DOWNSCALED
+#   ->  OUT_SERIES/<episode>[ 1080p] HEVC <TIER>.mkv
+series_episode_output() {
+    local name res=""
+    name=$(basename -- "$2")
+    name="${name%.*}"
+    [[ "$4" == "1" ]] && res=" 1080p"
+    printf '%s/%s%s HEVC %s.mkv' "$1" "$name" "$res" "$3"
+}
 
 # output_source_stem NAME  ->  source name without extension
 # (NAME may include the extension; unknown names are returned as-is).

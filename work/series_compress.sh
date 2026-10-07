@@ -12,6 +12,7 @@ source "$WORK_DIR/lib/bitrate.sh"
 source "$WORK_DIR/lib/encode_common.sh"
 source "$WORK_DIR/lib/hdr_dovi.sh"
 source "$WORK_DIR/lib/policy.sh"
+source "$WORK_DIR/lib/naming.sh"
 
 # ============================================================
 # POLICY  (values: ~/compress/work/lib/compress.conf; math: policy.sh
@@ -657,24 +658,28 @@ echo
 # OUTPUT
 # ============================================================
 
-if (( DOWNSCALED == 1 )); then
-    OUT_SERIES="$OUT_DIR/${SERIES_NAME} 1080p HEVC ${TIER}"
-else
-    OUT_SERIES="$OUT_DIR/${SERIES_NAME} HEVC ${TIER}"
+# The output folder has exactly the source folder's name (no resolution /
+# codec / tier); the episode file names carry the encode information, so
+# High, Base and Custom outputs of one series can share the folder.
+OUT_SERIES=$(series_output_dir "$OUT_DIR" "$SERIES_DIR")
+
+if path_taken "$OUT_SERIES" && [[ ! -d "$OUT_SERIES" ]]; then
+    echo "Output folder name is taken by something that is not a folder:"
+    if [[ -L "$OUT_SERIES" ]]; then
+        echo "  $OUT_SERIES -> $(readlink -- "$OUT_SERIES")$( [[ -e "$OUT_SERIES" ]] || echo " (broken symlink)")"
+    else
+        echo "  $OUT_SERIES"
+    fi
+    echo "Move or rename it, then run the menu again."
+    echo "Compression cancelled."
+    exit 1
 fi
 
 declare -a EP_OUT EP_OVERWRITE EP_SKIP
 EXISTING=0
 
 for i in "${!FILES[@]}"; do
-    NAME="$(basename "${FILES[$i]}")"
-    NAME="${NAME%.*}"
-
-    if (( DOWNSCALED == 1 )); then
-        EP_OUT[$i]="$OUT_SERIES/${NAME} 1080p HEVC ${TIER}.mkv"
-    else
-        EP_OUT[$i]="$OUT_SERIES/${NAME} HEVC ${TIER}.mkv"
-    fi
+    EP_OUT[$i]=$(series_episode_output "$OUT_SERIES" "${FILES[$i]}" "$TIER" "$DOWNSCALED")
 
     EP_OVERWRITE[$i]=0
     EP_SKIP[$i]="${EP_GUARD_SKIP[$i]}"
