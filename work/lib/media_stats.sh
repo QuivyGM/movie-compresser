@@ -175,10 +175,39 @@ _stats_is_matroska() {
     awk -F'|' '$1 == "format" && /format_name=matroska/ { m = 1 } END { exit !m }' <<< "$1"
 }
 
-# _stats_from_tags PROBE FILE_BYTES DURATION
+# mkvmerge command used by _stats_compressed_tracks (tests replace it).
+STATS_MKVMERGE="${STATS_MKVMERGE:-mkvmerge}"
+
+# _stats_compressed_tracks FILE  ->  " 0 2 " : stream indexes of Matroska
+# tracks stored with content compression (zlib, header removal, ...;
+# mkvmerge compresses PGS / VobSub subtitles with zlib by default).
+# Their frames - what packet scans and NUMBER_OF_BYTES count - are
+# larger than the bytes stored in the file, so such tracks can make the
+# statistics add up to more than the file size. " " when there are none
+# or mkvmerge is not available. Track IDs of mkvmerge are the ffprobe
+# stream indexes (attachments are listed after the tracks by both).
+_stats_compressed_tracks() {
+    local out
+
+    command -v "$STATS_MKVMERGE" >/dev/null 2>&1 || { printf ' '; return 0; }
+    out=$("$STATS_MKVMERGE" -J "$1" 2>/dev/null) || { printf ' '; return 0; }
+
+    awk '
+        /"tracks": *\[/ { t = 1; next }
+        t && /^  \]/ { t = 0 }
+        t && /"id": *[0-9]+/ { match($0, /[0-9]+/); id = substr($0, RSTART, RLENGTH) }
+        t && /"content_encoding_algorithms"/ && id != "" { c[id] = 1 }
+        END { printf " "; for (i in c) printf "%s ", i }' <<< "$out"
+}
+
+# _stats_from_tags PROBE FILE_BYTES DURATION [COMPRESSED]
 #   ->  "OK" + stream lines | "MISSING" | "REJECT reason"
+#
+# COMPRESSED (_stats_compressed_tracks): content-compressed tracks may
+# legitimately count more bytes than the file holds, so they are left
+# out of the "larger than the file" checks (every other check applies).
 _stats_from_tags() {
-    awk -v fsize="$2" -v D="$3" \
+    awk -v fsize="$2" -v D="$3" -v comp="${4:- }" \
         -v slack_pct="$STATS_SLACK_PCT" -v slack_min="$STATS_SLACK_MIN_BYTES" \
         "$_STATS_AWK_PARSE"'
         function R(m) { if (reason == "") reason = m }
@@ -195,7 +224,7 @@ _stats_from_tags() {
             return ((d[1] * 12 + d[2]) * 31 + d[3]) * 86400 + d[4] * 3600 + d[5] * 60 + d[6]
         }
         END {
-            reason = ""; present = 0; sum = 0; attach = 0
+            reason = ""; present = 0; sum = 0; plain = 0; attach = 0
             for (i = 1; i <= n; i++) {
                 if (typ[i] == "attachment" && ext[i] ~ /^[0-9]+$/) attach += ext[i]
                 if (!skip(i) && (nb[i] != "" || bps[i] != "")) present = 1
@@ -220,7 +249,8 @@ _stats_from_tags() {
                     R("DURATION tag is longer than the file for " w)
                 if (D > 0 && (typ[i] == "video" || typ[i] == "audio") && d < D * 0.9 - 1)
                     R("DURATION tag is much shorter than the file for " w " (statistics of another file?)")
-                if (nb[i] + 0 > fsize + 0)
+                cmp = index(comp, " " idx[i] " ") > 0
+                if (!cmp && nb[i] + 0 > fsize + 0)
                     R("NUMBER_OF_BYTES is larger than the file for " w " (stale, copied from another file?)")
                 if ((cod[i] == "ac3" || cod[i] == "eac3") && br[i] ~ /^[0-9]+$/ && br[i] + 0 > 0 &&
                     abs(bps[i] - br[i]) > br[i] * 0.03)
@@ -228,9 +258,13 @@ _stats_from_tags() {
                 if (sd[i] != "" && cdate != "" && when(sd[i]) >= 0 && when(cdate) - when(sd[i]) > 3600)
                     R("statistics are older than the file for " w " (copied from the source?)")
                 sum += nb[i]
+                if (!cmp) plain += nb[i]
             }
 
-            if (reason == "" && sum > fsize + 0)
+            # Uncompressed tracks are stored byte for byte: together they
+            # cannot exceed the file. (Content-compressed tracks count
+            # their decompressed frames and are left out of this bound.)
+            if (reason == "" && plain > fsize + 0)
                 R("statistics add up to more than the file size (stale, copied from another file?)")
             if (reason == "") {
                 slack = fsize * slack_pct / 100
@@ -365,8 +399,10 @@ source_in_active_job() {
 #
 # After a packet scan (STATS_LINES): rewrite the track statistics tags,
 # then re-read them metadata-only (no second scan). Success only when
-# the re-read passes _stats_from_tags and every stream's byte count
-# equals the scan. Sets STATS_REFRESH; never fails the caller.
+# every scanned stream's stored statistics equal the scan
+# (_stats_match_scan) and the next run's metadata check
+# (_stats_from_tags) accepts them, so a refresh is never repeated on
+# every run. Sets STATS_REFRESH; never fails the caller.
 _stats_refresh() {
     local file="$1" dur="$2" probe="$3"
     local res bad why=""
@@ -408,23 +444,18 @@ _stats_refresh() {
 
     _stats_say "MKV statistics updated."
 
+    # Metadata-only re-read, checked stream by stream against the scan
+    # (the authority) rather than with file-size heuristics.
     probe=$(_stats_probe "$file")
-    res=$(_stats_from_tags "$probe" "$(file_bytes "$file" 2>/dev/null || echo 0)" "$dur")
+    bad=$(_stats_match_scan "$probe" "$dur")
 
-    if [[ "$res" != OK* ]]; then
-        bad="re-read ${res#REJECT }"
-    else
-        # every stream the scan measured must have the same byte count
-        bad=$(awk '
-            NR == FNR { if ($4 != "N/A") scan[$1] = $4; next }
-            { tag[$1] = $4 }
-            END {
-                for (i in scan)
-                    if (!(i in tag) || tag[i] != scan[i]) {
-                        printf "stream %s: tag %s, scan %s bytes", i, (i in tag) ? tag[i] : "none", scan[i]
-                        exit
-                    }
-            }' <(printf '%s\n' "$STATS_LINES") <(printf '%s\n' "${res#OK$'\n'}"))
+    # ... and the next run must be able to use them (otherwise it would
+    # scan and refresh again on every run)
+    if [[ -z "$bad" ]]; then
+        res=$(_stats_from_tags "$probe" "$(file_bytes "$file" 2>/dev/null || echo 0)" "$dur" \
+            "$(_stats_compressed_tracks "$file")")
+        [[ "$res" == OK* ]] ||
+            bad="statistics match the scan, but the metadata check rejects them: ${res#REJECT }"
     fi
 
     if [[ -z "$bad" ]]; then
@@ -433,7 +464,74 @@ _stats_refresh() {
     else
         STATS_REFRESH="verify-failed: $bad"
         _stats_say "WARNING: Metadata-first re-read: DIFFERENT ($bad); using the packet scan."
+        _stats_diag "$file" "$probe" "$bad"
     fi
+}
+
+# _stats_match_scan PROBE DURATION  ->  "" when the stored statistics of
+# every stream the packet scan measured (STATS_LINES) are present,
+# numeric, self-consistent (BPS = NUMBER_OF_BYTES / DURATION, DURATION
+# not longer than the file) and NUMBER_OF_BYTES equals the scanned bytes
+# exactly; otherwise the first problem
+_stats_match_scan() {
+    awk -v scan="$STATS_LINES" -v D="$2" "$_STATS_AWK_PARSE"'
+        function abs(x) { return x < 0 ? -x : x }
+        function hms(s,   a) {
+            if (split(s, a, ":") != 3) return -1
+            if (a[1] !~ /^[0-9]+$/ || a[2] !~ /^[0-9]+$/ || a[3] !~ /^[0-9]+([.][0-9]+)?$/) return -1
+            return a[1] * 3600 + a[2] * 60 + a[3]
+        }
+        END {
+            m = split(scan, l, "\n")
+            for (j = 1; j <= m; j++) {
+                split(l[j], q, " ")
+                if (q[1] != "" && q[4] ~ /^[0-9]+$/) sb[q[1]] = q[4]
+            }
+            for (i = 1; i <= n; i++) {
+                if (skip(i) || !(idx[i] in sb)) continue
+                w = "stream " idx[i] " (" typ[i] ")"
+                if (nb[i] !~ /^[0-9]+$/ || bps[i] !~ /^[0-9]+$/ || (d = hms(dt[i])) <= 0) {
+                    print "statistics missing or not numeric for " w; exit
+                }
+                if (nb[i] != sb[idx[i]]) {
+                    printf "%s: NUMBER_OF_BYTES %s, scan %s bytes\n", w, nb[i], sb[idx[i]]; exit
+                }
+                x = nb[i] * 8 / d
+                if (abs(bps[i] - x) > x * 0.01 + 64) { print "BPS does not match NUMBER_OF_BYTES/duration for " w; exit }
+                if (D > 0 && d > D * 1.01 + 1) { print "DURATION tag is longer than the file for " w; exit }
+            }
+        }' <<< "$1"
+}
+
+# _stats_diag FILE PROBE REASON  ->  per-stream comparison (verbose
+# menus only: COMPRESS_VERBOSE=1 with STATS_PROGRESS=1): file size,
+# packet-scan bytes (when scanned), stored NUMBER_OF_BYTES, content
+# compression, the stored sum against the file size, and the reason
+_stats_diag() {
+    [[ "${STATS_PROGRESS:-0}" == 1 && "${COMPRESS_VERBOSE:-0}" == 1 ]] || return 0
+
+    local fsize comp
+    fsize=$(file_bytes "$1" 2>/dev/null || echo 0)
+    comp=$(_stats_compressed_tracks "$1")
+
+    awk -v fsize="$fsize" -v comp="$comp" -v scan="$STATS_LINES" -v why="$3" \
+        -v ind="${STATS_INDENT:-}" "$_STATS_AWK_PARSE"'
+        END {
+            m = split(scan, l, "\n")
+            for (j = 1; j <= m; j++) { split(l[j], q, " "); if (q[1] != "") sb[q[1]] = q[4] }
+            printf "%sMKV statistics check: %s\n", ind, why
+            printf "%s  file size:  %.0f bytes\n", ind, fsize
+            printf "%s  %-6s %-10s %14s %24s  %s\n", ind, "stream", "type", "scan bytes", "stored NUMBER_OF_BYTES", "compressed"
+            for (i = 1; i <= n; i++) {
+                if (skip(i)) continue
+                c = index(comp, " " idx[i] " ") ? "yes" : ""
+                printf "%s  %-6s %-10s %14s %24s  %s\n", ind, idx[i], typ[i],
+                    (idx[i] in sb && sb[idx[i]] != "") ? sb[idx[i]] : "-", nb[i] != "" ? nb[i] : "-", c
+                if (nb[i] ~ /^[0-9]+$/) { sum += nb[i]; if (!c) plain += nb[i] }
+            }
+            printf "%s  stored sum: %.0f bytes (%+.0f vs the file size); uncompressed tracks: %.0f bytes (%+.0f)\n",
+                ind, sum, sum - fsize, plain, plain - fsize
+        }' <<< "$2"
 }
 
 stats_load() {
@@ -453,7 +551,7 @@ stats_load() {
     probe=$(_stats_probe "$file")
 
     if _stats_is_matroska "$probe"; then
-        res=$(_stats_from_tags "$probe" "$fsize" "$dur")
+        res=$(_stats_from_tags "$probe" "$fsize" "$dur" "$(_stats_compressed_tracks "$file")")
         case "$res" in
             OK*)
                 STATS_LINES="${res#OK$'\n'}"
@@ -476,8 +574,9 @@ stats_load() {
     fi
 
     if [[ "${STATS_PROGRESS:-0}" == 1 ]]; then
-        [[ -n "$STATS_REJECTED" ]] &&
+        if [[ -n "$STATS_REJECTED" ]]; then
             echo "${STATS_INDENT:-}Stored statistics rejected: $STATS_REJECTED"
+        fi
         echo "${STATS_INDENT:-}Scanning packets..."
     fi
 
@@ -486,6 +585,7 @@ stats_load() {
     STATS_KIND="packets"
     STATS_SCANNED=1
     _stats_say "Packet scan complete."
+    [[ -n "$STATS_REJECTED" ]] && _stats_diag "$file" "$probe" "stored statistics rejected: $STATS_REJECTED"
 
     # For the next run only: this run keeps the scanned values.
     if [[ "$refresh" == "refresh" ]]; then
