@@ -31,6 +31,9 @@ if ! load_policy; then
     exit 1
 fi
 
+# runtime files of earlier jobs confirmed finished (encode_common.sh)
+cleanup_finished_jobs "$WORK_DIR"
+
 echo "Policy: $(policy_conf_path)"
 for t in Quality High Base Custom; do
     printf "  %-8s %s\n" "$t" "$(movie_policy_line "$t")"

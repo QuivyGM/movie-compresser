@@ -18,6 +18,9 @@ if ! load_policy; then
     exit 1
 fi
 
+# runtime files of earlier jobs confirmed finished (encode_common.sh)
+cleanup_finished_jobs "$WORK_DIR"
+
 echo "Policy: $(policy_conf_path)"
 printf "  High above %s kb/s; Compact for tracks >= %s GiB, result < %s GiB\n" \
     "$AUDIO_HIGH_TRIGGER_KBPS" "$AUDIO_COMPACT_TRIGGER_GIB" "$AUDIO_COMPACT_LIMIT_GIB"

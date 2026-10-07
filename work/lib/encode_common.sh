@@ -17,6 +17,46 @@ next_tmux_session() {
     echo "${prefix}${n}"
 }
 
+# cleanup_finished_jobs [WORK]  ->  menu start: remove the runtime files
+# (<session>.sh / .state / .progress, empty <session>_passes) of jobs left
+# by older versions or interrupted cleanups, but only when every check
+# confirms the job is over and fully successful:
+#   - the name is a job session (c<N>, series<N>, a<N>)
+#   - its state says status=finished and session=<name>
+#   - tmux works and has no session of that name
+#   - the script is a regular file not newer than the state (a newer
+#     script was written for a new job reusing the name)
+# Failed, interrupted, running or unknown jobs, scripts without a state
+# (old job format) and anything when tmux is missing are left alone.
+cleanup_finished_jobs() {
+    local work="${1:-$WORK_DIR}" st s script n=0
+
+    command -v tmux >/dev/null 2>&1 || return 0
+
+    for st in "$work"/*.state; do
+        [[ -f "$st" && ! -L "$st" ]] || continue
+        s=$(basename "$st" .state)
+        [[ "$s" =~ ^(c|a|series)[0-9]+$ ]] || continue
+        [[ "$(sed -n 's/^status=//p' "$st" 2>/dev/null)" == "finished" ]] || continue
+        [[ "$(sed -n 's/^session=//p' "$st" 2>/dev/null)" == "$s" ]] || continue
+        tmux has-session -t "=$s" 2>/dev/null && continue
+
+        script="$work/$s.sh"
+        if [[ -e "$script" || -L "$script" ]]; then
+            [[ -f "$script" && ! -L "$script" && ! "$script" -nt "$st" ]] || continue
+            rm -f -- "$script"
+        fi
+        rm -f -- "$st" "$work/$s.progress"
+        rmdir -- "$work/${s}_passes" 2>/dev/null || true
+        n=$((n + 1))
+    done
+
+    if (( n > 0 )); then
+        echo "Removed the runtime files of $n finished job(s) from $work."
+    fi
+    return 0
+}
+
 # Refresh MKV track statistics tags (BPS, NUMBER_OF_BYTES, ...) from
 # the actual file contents. Returns non-zero when not possible.
 refresh_mkv_stats() {

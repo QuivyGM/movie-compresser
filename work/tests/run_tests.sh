@@ -2148,7 +2148,14 @@ check "21 CRF job: one encode step with its CRF" "grep -q 'Tier: High .*Encoding
 check "21 CRF job: no pass 1/2 or 2/2"           "! grep -q 'Pass' <<< \"\$c7\""
 check "21 CRF job: progress and ETA"             "grep -q '50.0%.*ETA 00:15:00' <<< \"\$c7\""
 check "20 Quality job: still Pass 1/2"           "grep -q 'Tier: Quality .*Pass: 1/2' <<< \"\$c8\""
-check "21 job state records mode / CRF"          "grep -qx 'mode=crf' '$WORK_DIR/sdrcrf.state' && grep -qx 'crf=24' '$WORK_DIR/sdrcrf.state'"
+check "21 sdrcrf job: own .sh / .state removed after success" "[[ ! -e '$WORK_DIR/sdrcrf.sh' && ! -e '$WORK_DIR/sdrcrf.state' ]]"
+
+echo
+echo "== job runtime cleanup (job_cleanup_tests.sh; incl. state mode / CRF)"
+bash "$SRC_WORK/tests/job_cleanup_tests.sh" > "$T/job_cleanup.out" 2>&1
+grep -E '^  (ok|FAIL) ' "$T/job_cleanup.out"
+PASS=$((PASS + $(grep -c '^  ok ' "$T/job_cleanup.out")))
+FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/job_cleanup.out")))
 
 echo
 echo "============================================================"

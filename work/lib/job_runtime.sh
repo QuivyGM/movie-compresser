@@ -18,6 +18,9 @@
 #
 # State for progress-check.sh is written to work/<session>.state
 # (key=value lines) and ffmpeg progress to work/<session>.progress.
+# When the job ends normally, job_cleanup_runtime removes its own
+# work/<session>.sh and .state (failed jobs: moved into the log dir);
+# interrupted jobs keep them.
 #
 # Each item has a scratch directory ($ITEM_TMP, under the job log dir)
 # for Dolby Vision / HDR10+ intermediates and the metadata report. It is
@@ -660,4 +663,41 @@ job_finish() {
         echo
         read -rp "Press Enter to close this session... " _ || true
     fi
+
+    job_cleanup_runtime
+}
+
+# job_own_state  ->  0 when JOB_STATE is still this job's state file
+# (same session and start time), so another job's file is never touched
+job_own_state() {
+    [[ -f "$JOB_STATE" ]] &&
+        [[ "$(sed -n 's/^session=//p' "$JOB_STATE" 2>/dev/null)" == "$JOB_SESSION" ]] &&
+        [[ "$(sed -n 's/^started=//p' "$JOB_STATE" 2>/dev/null)" == "$JOB_STARTED" ]]
+}
+
+# job_cleanup_runtime  ->  after job_finish: remove this job's own
+# runtime files from the work directory. Logs (work/logs/) are kept.
+#   all items ok:   work/<session>.sh and .state are deleted
+#   some failed:    both are moved into the job's log directory
+#                   (job.sh / job.state) next to the item logs
+# The script is only touched when it is the file this job runs from
+# ($0), the state only when it is still this job's (job_own_state).
+# Interrupted jobs never get here (job_on_exit keeps their files).
+job_cleanup_runtime() {
+    local script="$JOB_WORK/$JOB_SESSION.sh" own_script=0 own_state=0
+
+    [[ -f "$script" && "$(readlink -f -- "$0" 2>/dev/null)" == "$(readlink -f -- "$script" 2>/dev/null)" ]] &&
+        own_script=1
+    job_own_state && own_state=1
+
+    rm -f -- "$JOB_STATE.tmp" "$JOB_PROGRESS"
+
+    if (( JOB_FAILED > 0 )) && [[ -d "$JOB_LOG_DIR" ]]; then
+        (( own_script )) && mv -f -- "$script" "$JOB_LOG_DIR/job.sh" 2>/dev/null
+        (( own_state )) && mv -f -- "$JOB_STATE" "$JOB_LOG_DIR/job.state" 2>/dev/null
+    else
+        (( own_script )) && rm -f -- "$script"
+        (( own_state )) && rm -f -- "$JOB_STATE"
+    fi
+    return 0
 }
