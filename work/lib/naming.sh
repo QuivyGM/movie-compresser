@@ -144,3 +144,46 @@ find_source_for_output() {
         printf '\n'
     fi
 }
+
+# episode_label FILE  ->  short episode id for the menus: "S01E03" (also
+# from "1x03"), "E03", else the file name without extension, shortened
+# to 20 characters
+episode_label() {
+    local n
+    n=$(basename -- "$1")
+    n="${n%.*}"
+
+    if [[ "$n" =~ [Ss]([0-9]{1,2})[\ ._-]?[Ee]([0-9]{1,3})([^0-9]|$) ]]; then
+        printf 'S%02dE%02d' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))"
+    elif [[ "$n" =~ (^|[^0-9A-Za-z])([0-9]{1,2})[xX]([0-9]{2,3})([^0-9]|$) ]]; then
+        printf 'S%02dE%02d' "$((10#${BASH_REMATCH[2]}))" "$((10#${BASH_REMATCH[3]}))"
+    elif [[ "$n" =~ (^|[^0-9A-Za-z])[Ee][Pp]?\ ?([0-9]{1,3})([^0-9]|$) ]]; then
+        printf 'E%02d' "$((10#${BASH_REMATCH[2]}))"
+    elif (( ${#n} > 20 )); then
+        printf '%s~' "${n:0:19}"
+    else
+        printf '%s' "$n"
+    fi
+}
+
+# episode_labels FILE...  ->  one episode_label per line; when two files
+# would get the same label, every file is listed by its (shortened) name
+episode_labels() {
+    local f labels=()
+
+    for f in "$@"; do
+        labels+=("$(episode_label "$f")")
+    done
+
+    if [[ -n "$(printf '%s\n' "${labels[@]}" | sort | uniq -d)" ]]; then
+        labels=()
+        for f in "$@"; do
+            f=$(basename -- "$f")
+            f="${f%.*}"
+            (( ${#f} > 24 )) && f="${f:0:23}~"
+            labels+=("$f")
+        done
+    fi
+
+    printf '%s\n' "${labels[@]}"
+}

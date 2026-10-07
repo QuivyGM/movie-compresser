@@ -39,6 +39,10 @@
 # with real discs (real Profile 8 / 7 sources are not covered).
 set -uo pipefail
 
+# The menu checks below read the detailed (verbose) menu output; the
+# compact default output is covered by tests/ui_tests.sh.
+export COMPRESS_VERBOSE=1
+
 KEEP=0
 [[ "${1:-}" == "--keep" ]] && KEEP=1
 

@@ -2,6 +2,9 @@
 # Shared helpers for the encode menus (movie / series / audio) and the
 # generated job scripts. Sourced, not executed. Needs media_probe.sh.
 
+# shellcheck source=ui.sh
+[[ -n "${UI_LOADED:-}" ]] || source "$(dirname "${BASH_SOURCE[0]}")/ui.sh"
+
 # ------------------------------------------------------------
 # tmux / files
 # ------------------------------------------------------------
@@ -418,17 +421,25 @@ crf_sample_title() {
 crf_title_estimate() {
     local crf="$1" n
 
-    n=$(crf_sample_points "$CRF_TITLE_DURATION" "$CRF_TITLE_POINTS" "$CRF_SAMPLE_SECONDS" | grep -c .)
-    printf '  sampling CRF %s (%s section%s)... ' "$crf" "$n" "$( (( n == 1 )) || echo s)"
+    if ui_verbose; then
+        n=$(crf_sample_points "$CRF_TITLE_DURATION" "$CRF_TITLE_POINTS" "$CRF_SAMPLE_SECONDS" | grep -c .)
+        printf '  sampling CRF %s (%s section%s)... ' "$crf" "$n" "$( (( n == 1 )) || echo s)"
+    else
+        printf '  CRF %-4s ' "$crf"
+    fi
 
     if ! crf_sample_title "$CRF_TITLE_FILE" "$CRF_TITLE_VIDX" "$CRF_TITLE_FILTER" "$crf" \
             "$CRF_TITLE_DURATION" "$CRF_TITLE_POINTS"; then
-        echo "FAILED"
+        ui_err FAILED; echo
         return 1
     fi
 
     CRF_EST_RESULT=$(crf_extrapolate "$CRF_SAMPLE_BYTES" "$CRF_SAMPLE_SECS" "$CRF_TITLE_DURATION")
-    echo "~$(size_text "$CRF_EST_RESULT") video"
+    if ui_verbose; then
+        echo "~$(size_text "$CRF_EST_RESULT") video"
+    else
+        echo "~$(bytes_to_gib "$CRF_EST_RESULT") GiB"
+    fi
 }
 
 # crf_series_estimate CRF  (ESTIMATOR for crf_select / crf_select_exact)
@@ -439,22 +450,41 @@ crf_title_estimate() {
 # episode estimate in CRF_EST_RESULT. Per-episode estimates are kept in
 # CRF_SERIES_EP_BYTES[crf] ("b0 b1 ...") and CRF_SERIES_EP_FROM[crf].
 crf_series_estimate() {
-    local crf="$1" i rates=() k=0
+    local crf="$1" i rates=() k=0 w=0 label
 
     for i in "${!EP_DUR[@]}"; do
         rates[$i]="-"
     done
 
+    # compact output: "CRF 18", then one "  S01E01  ~0.88 GiB" line per
+    # sampled episode (CRF_SERIES_LABELS: episode ids, else file names)
+    if ! ui_verbose; then
+        for i in "${CRF_SERIES_SAMPLED[@]}"; do
+            label="${CRF_SERIES_LABELS[$i]:-$(basename "${FILES[$i]}")}"
+            (( ${#label} > w )) && w=${#label}
+        done
+        echo
+        echo "CRF $crf"
+    fi
+
     for i in "${CRF_SERIES_SAMPLED[@]}"; do
         ((k += 1))
-        printf '  sampling CRF %s, episode %d/%d (%s)... ' "$crf" "$k" "${#CRF_SERIES_SAMPLED[@]}" "$(basename "${FILES[$i]}")"
+        if ui_verbose; then
+            printf '  sampling CRF %s, episode %d/%d (%s)... ' "$crf" "$k" "${#CRF_SERIES_SAMPLED[@]}" "$(basename "${FILES[$i]}")"
+        else
+            printf '  %-*s  ' "$w" "${CRF_SERIES_LABELS[$i]:-$(basename "${FILES[$i]}")}"
+        fi
         if ! crf_sample_title "${FILES[$i]}" "${EP_VIDX[$i]}" "$CRF_SERIES_FILTER" "$crf" \
                 "${EP_DUR[$i]}" "$SERIES_CRF_SAMPLE_POINTS"; then
-            echo "FAILED"
+            ui_err FAILED; echo
             return 1
         fi
         rates[$i]=$(awk -v b="$CRF_SAMPLE_BYTES" -v s="$CRF_SAMPLE_SECS" 'BEGIN { printf "%.3f", b / s }')
-        echo "~$(size_text "$(crf_extrapolate "$CRF_SAMPLE_BYTES" "$CRF_SAMPLE_SECS" "${EP_DUR[$i]}")") video"
+        if ui_verbose; then
+            echo "~$(size_text "$(crf_extrapolate "$CRF_SAMPLE_BYTES" "$CRF_SAMPLE_SECS" "${EP_DUR[$i]}")") video"
+        else
+            echo "~$(bytes_to_gib "$(crf_extrapolate "$CRF_SAMPLE_BYTES" "$CRF_SAMPLE_SECS" "${EP_DUR[$i]}")") GiB"
+        fi
     done
 
     series_crf_spread "${rates[@]}" || return 1

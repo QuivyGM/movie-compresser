@@ -416,6 +416,19 @@ hdr_type_label() {
     printf '%s' "$d"
 }
 
+# hdr_compact_label  ->  "Dolby Vision 8.1 + HDR10 + HDR10+", "HDR10",
+# "SDR", ... (menu header; from the probe_hdr globals)
+hdr_compact_label() {
+    local d="$HDR_KIND"
+
+    (( HDR_HDR10PLUS == 1 )) && d+=" + HDR10+"
+    if (( HDR_DV == 1 )); then
+        d="Dolby Vision ${HDR_DV_PROFILE:-?}${HDR_DV_COMPAT:+.$HDR_DV_COMPAT} + $d"
+    fi
+
+    printf '%s' "$d"
+}
+
 # Human readable one-liner for the probe_hdr globals.
 hdr_description() {
     local d="$HDR_KIND"

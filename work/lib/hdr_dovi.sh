@@ -24,6 +24,9 @@
 # static dovi_tool / hdr10plus_tool binaries can simply be dropped into
 # ~/compress/work/bin (no sudo needed).
 
+# shellcheck source=ui.sh
+[[ -n "${UI_LOADED:-}" ]] || source "$(dirname "${BASH_SOURCE[0]}")/ui.sh"
+
 # ------------------------------------------------------------
 # Capability detection
 # ------------------------------------------------------------
@@ -204,35 +207,51 @@ dv_plan_source() {
 # Returns 1 when the source should be skipped.
 confirm_dynamic_range() {
     local label="$1"
-    local ans
+    local ans verbose=0 tools_shown=0
 
     DV_POLICY="none"
     DV_MODE=""
     HDR10P_POLICY="none"
 
-    echo "Dynamic range:  $(hdr_description)"
+    # Compact (normal) output: the menu header already shows the dynamic
+    # range; only PRESERVED lines, or the details of a warning / error.
+    ui_verbose && verbose=1
 
-    case "$HDR_KIND" in
-        HDR10)
-            if [[ -n "$HDR_MASTER" || -n "$HDR_CLL" ]]; then
-                echo "                HDR10 kept: PQ/BT.2020 signalling + mastering display${HDR_CLL:+ + MaxCLL/MaxFALL ($HDR_CLL)}"
-            else
-                echo "                HDR10 kept: PQ/BT.2020 signalling (source has no mastering metadata)"
-            fi
-            ;;
-        HLG)
-            echo "                HLG kept: BT.2020/HLG signalling"
-            ;;
-    esac
+    # tool paths / versions: always in verbose mode, otherwise only
+    # before a warning or error they explain
+    _hdr_tools_once() {
+        (( verbose == 1 || tools_shown == 1 )) && return 0
+        tools_shown=1
+        echo
+        hdr_tools_report
+        echo
+    }
+
+    if (( verbose == 1 )); then
+        echo "Dynamic range:  $(hdr_description)"
+
+        case "$HDR_KIND" in
+            HDR10)
+                if [[ -n "$HDR_MASTER" || -n "$HDR_CLL" ]]; then
+                    echo "                HDR10 kept: PQ/BT.2020 signalling + mastering display${HDR_CLL:+ + MaxCLL/MaxFALL ($HDR_CLL)}"
+                else
+                    echo "                HDR10 kept: PQ/BT.2020 signalling (source has no mastering metadata)"
+                fi
+                ;;
+            HLG)
+                echo "                HLG kept: BT.2020/HLG signalling"
+                ;;
+        esac
+    fi
 
     (( HDR_DV == 1 || HDR_HDR10PLUS == 1 )) || return 0
 
     echo
-    hdr_tools_report
+    (( verbose == 1 )) && hdr_tools_report
 
     # -------- HDR10+
     if (( HDR_HDR10PLUS == 1 )); then
-        echo
+        (( verbose == 1 )) && echo
 
         local why=""
         if [[ -z "$HDR10PLUS_TOOL" ]]; then
@@ -243,9 +262,14 @@ confirm_dynamic_range() {
 
         if [[ -z "$why" ]]; then
             HDR10P_POLICY="preserve"
-            echo "HDR10+:         PRESERVED (extracted with hdr10plus_tool, re-encoded by x265)"
+            if (( verbose == 1 )); then
+                echo "HDR10+:         PRESERVED (extracted with hdr10plus_tool, re-encoded by x265)"
+            else
+                echo "HDR10+:         $(ui_ok PRESERVED)"
+            fi
         else
-            echo "WARNING: $label contains HDR10+ dynamic metadata that cannot be preserved:"
+            _hdr_tools_once
+            echo "$(ui_warn WARNING): $label contains HDR10+ dynamic metadata that cannot be preserved:"
             echo "  $why"
             echo "  The static HDR10 layer is kept; HDR10+ players fall back to static HDR10."
             read -rp "Encode without HDR10+? [y/N]: " ans
@@ -258,10 +282,11 @@ confirm_dynamic_range() {
 
     # -------- Dolby Vision
     dv_plan_source
-    echo
+    (( verbose == 1 )) && echo
 
     if (( DV_BASE_OK == 0 )); then
-        echo "ERROR: $label contains Dolby Vision profile ${HDR_DV_PROFILE:-?}${HDR_DV_COMPAT:+ (compatibility id $HDR_DV_COMPAT)}."
+        _hdr_tools_once
+        echo "$(ui_err ERROR): $label contains Dolby Vision profile ${HDR_DV_PROFILE:-?}${HDR_DV_COMPAT:+ (compatibility id $HDR_DV_COMPAT)}."
         echo "  ${DV_WHY:-The base layer is not a valid HDR10/SDR/HLG stream on its own.}"
         echo "  Simply removing Dolby Vision would give WRONG colours on every player,"
         echo "  and no valid conversion to a supported output is implemented."
@@ -272,12 +297,18 @@ confirm_dynamic_range() {
     if (( DV_SUPPORTED == 1 )) && (( DOVI_TOOL_OK == 1 )) && [[ -n "$MKVMERGE" ]]; then
         DV_POLICY="preserve"
 
-        echo "Dolby Vision:   PRESERVED as profile $DV_OUT (RPU re-injected with dovi_tool;"
-        echo "                $HDR_KIND base layer kept as fallback; verified after encoding)"
+        if (( verbose == 1 )); then
+            echo "Dolby Vision:   PRESERVED as profile $DV_OUT (RPU re-injected with dovi_tool;"
+            echo "                $HDR_KIND base layer kept as fallback; verified after encoding)"
+        elif [[ "$DV_OUT" == "${HDR_DV_PROFILE}.${HDR_DV_COMPAT}" ]]; then
+            echo "Dolby Vision:   $(ui_ok PRESERVED)"
+        else
+            echo "Dolby Vision:   $(ui_ok PRESERVED) as profile $DV_OUT"
+        fi
 
         if [[ "$HDR_DV_PROFILE" == "7" ]]; then
             echo
-            echo "NOTE: profile 7 is dual-layer. The enhancement layer (FEL or MEL) is NOT"
+            echo "$(ui_warn NOTE): profile 7 is dual-layer. The enhancement layer (FEL or MEL) is NOT"
             echo "  retained: a single-layer x265 encode can only carry the RPU, which is"
             echo "  converted to profile 8.1 (dovi_tool mode 2). For FEL sources the extra"
             echo "  detail of the enhancement layer is lost."
@@ -288,7 +319,8 @@ confirm_dynamic_range() {
         return 0
     fi
 
-    echo "WARNING: Dolby Vision profile ${HDR_DV_PROFILE:-?} cannot be preserved safely:"
+    _hdr_tools_once
+    echo "$(ui_warn WARNING): Dolby Vision profile ${HDR_DV_PROFILE:-?} cannot be preserved safely:"
     if (( DV_SUPPORTED == 0 )); then
         echo "  $DV_WHY"
     else
@@ -327,6 +359,21 @@ hdr_policy_summary() {
     esac
 
     printf '%s' "$s"
+}
+
+# hdr_policy_short  ->  "DV/HDR10+ preserved", "HDR10+ preserved, DV
+# DROPPED", "HDR10", "SDR" (compact confirmation line; DROPPED in yellow)
+hdr_policy_short() {
+    local kept=() s=""
+
+    [[ "${DV_POLICY:-none}" == preserve ]] && kept+=(DV)
+    [[ "${HDR10P_POLICY:-none}" == preserve ]] && kept+=(HDR10+)
+    (( ${#kept[@]} )) && s="$(IFS=/; echo "${kept[*]}") preserved"
+
+    [[ "${DV_POLICY:-none}" == drop ]] && s+="${s:+, }$(ui_warn "DV DROPPED")"
+    [[ "${HDR10P_POLICY:-none}" == drop ]] && s+="${s:+, }$(ui_warn "HDR10+ DROPPED")"
+
+    printf '%s' "${s:-${HDR_KIND:-SDR}}"
 }
 
 # ------------------------------------------------------------

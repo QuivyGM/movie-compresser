@@ -6,6 +6,7 @@ IN_DIR="$BASE/in"
 OUT_DIR="$BASE/out"
 WORK_DIR="$BASE/work"
 
+source "$WORK_DIR/lib/ui.sh"
 source "$WORK_DIR/lib/media_probe.sh"
 source "$WORK_DIR/lib/media_stats.sh"
 source "$WORK_DIR/lib/bitrate.sh"
@@ -35,6 +36,9 @@ source "$WORK_DIR/lib/naming.sh"
 # Atmos / DTS:X, titles, flags) and comes on top of the video size;
 # audio compression is only done by audio_compress_menu.sh. All
 # subtitles are retained.
+#
+# Output is compact; COMPRESS_VERBOSE=1 shows the detailed policy,
+# per-file verification, HDR tool and sampling diagnostics (lib/ui.sh).
 # ============================================================
 
 if ! load_policy; then
@@ -44,13 +48,15 @@ fi
 # runtime files of earlier jobs confirmed finished (encode_common.sh)
 cleanup_finished_jobs "$WORK_DIR"
 
-echo "Policy: $(policy_conf_path)"
-for t in High Base Custom; do
+if ui_verbose; then
+    echo "Policy: $(policy_conf_path)"
+    for t in High Base Custom; do
+        echo
+        crf_policy_lines series "$t"
+    done
     echo
-    crf_policy_lines series "$t"
-done
-echo
-audio_copy_policy_lines
+    audio_copy_policy_lines
+fi
 
 # ============================================================
 # FIND SERIES FOLDERS
@@ -68,20 +74,18 @@ fi
 
 echo
 echo "Select series:"
-echo
 
 for i in "${!SERIES_DIRS[@]}"; do
 
     COUNT=$(DISCOVERY_QUIET=1 video_files_in_dir "${SERIES_DIRS[$i]}" | wc -l)
 
-    printf "%2d) %s [%d files]\n" \
+    printf "%d) %s [%s]\n" \
         "$((i+1))" \
         "$(basename "${SERIES_DIRS[$i]}")" \
-        "$COUNT"
+        "$(ui_plural "$COUNT" episode)"
 done
 
 while true; do
-    echo
     read -rp "Choice: " choice
 
     if [[ "$choice" =~ ^[0-9]+$ ]] &&
@@ -107,16 +111,38 @@ FILE_COUNT=${#FILES[@]}
 # stream bit rates for non-MKV, or a packet scan), dynamic range.
 # ============================================================
 
+# short episode ids ("S01E03") for the compact output
+mapfile -t EP_LABEL < <(episode_labels "${FILES[@]}")
+CRF_SERIES_LABELS=("${EP_LABEL[@]}")
+LABEL_W=7
+for l in "${EP_LABEL[@]}"; do
+    (( ${#l} > LABEL_W )) && LABEL_W=${#l}
+done
+
+# file name (verbose) or episode id (compact) of episode I
+ep_name() {
+    if ui_verbose; then basename "${FILES[$1]}"; else printf '%s' "${EP_LABEL[$1]}"; fi
+}
+
 echo
-echo "Analyzing ${FILE_COUNT} files..."
+ANALYZE_TEXT="Analyzing $(ui_plural "$FILE_COUNT" episode)... "
+if ui_verbose; then
+    echo "Analyzing ${FILE_COUNT} files..."
+elif (( UI_TTY == 0 )); then
+    printf '%s' "$ANALYZE_TEXT"
+fi
 
 declare -a EP_DUR EP_VIDX EP_VKBPS EP_VBYTES EP_AKBPS EP_ABYTES EP_ACH EP_ACODEC EP_ASR
-declare -a EP_RES EP_VCODEC EP_PIX EP_FPS EP_RANGE EP_SUBS EP_OTHER EP_HOW EP_H10P EP_REFRESH
+declare -a EP_RES EP_VCODEC EP_PIX EP_FPS EP_RANGE EP_SUBS EP_OTHER EP_HOW EP_H10P EP_REFRESH EP_KIND
 
 for i in "${!FILES[@]}"; do
     file="${FILES[$i]}"
 
-    printf "  %s\n" "$(basename "$file")"
+    if ui_verbose; then
+        printf "  %s\n" "$(basename "$file")"
+    else
+        ui_progress "$ANALYZE_TEXT$((i + 1))/$FILE_COUNT"
+    fi
 
     info=$(stream_info "$file")
     vidx=$(awk -F'\t' '$2 == "video" && $4 == 0 { print $1; exit }' <<< "$info")
@@ -131,12 +157,15 @@ for i in "${!FILES[@]}"; do
     dur=$(get_duration "$file")
     # Only episodes that needed a packet scan get their MKV statistics
     # refreshed; valid ones are read and left untouched.
-    STATS_PROGRESS=1 STATS_INDENT="      " stats_load "$file" "$dur" estimate refresh
+    STATS_PROGRESS=$(ui_verbose && echo 1 || echo 0) STATS_INDENT="      " \
+        stats_load "$file" "$dur" estimate refresh
 
     EP_DUR[$i]="$dur"
     EP_VIDX[$i]="$vidx"
     EP_VKBPS[$i]=$(stats_field "$vidx" kbps)
     EP_HOW[$i]="$STATS_SOURCE"
+    EP_KIND[$i]="$STATS_KIND"
+    [[ "$STATS_REFRESH" == refreshed ]] && EP_KIND[$i]+=":refreshed"
     EP_REFRESH[$i]="$STATS_REFRESH"
     EP_AKBPS[$i]=$(stats_audio_kbps)
     # source video (source-quality guard) and copied source audio (all
@@ -172,9 +201,11 @@ done
 #   rates, subtitle tracks, attachments
 # ============================================================
 
-echo
-echo "Verifying ${FILE_COUNT} files against $(basename "${FILES[0]}")..."
-echo
+if ui_verbose; then
+    echo
+    echo "Verifying ${FILE_COUNT} files against $(basename "${FILES[0]}")..."
+    echo
+fi
 
 describe_list() {
     local s="${1% }"
@@ -183,6 +214,7 @@ describe_list() {
 
 INCOMPATIBLE=0
 DIFFERENT=0
+VERIFY_DETAILS=()   # compact output: only mismatches / differences
 
 for i in "${!FILES[@]}"; do
     hard=()
@@ -212,19 +244,50 @@ for i in "${!FILES[@]}"; do
     [[ "${EP_H10P[$i]}" == "${EP_H10P[0]}" ]] ||
         soft+=("HDR10+ $( (( EP_H10P[$i] == 1 )) && echo present || echo absent)")
 
+    lines=()
     if (( ${#hard[@]} )); then
-        printf "MISMATCH  %s\n" "$(basename "${FILES[$i]}")"
-        for d in "${hard[@]}"; do printf "            - %s\n" "$d"; done
-        for d in "${soft[@]+"${soft[@]}"}"; do printf "            (also: %s)\n" "$d"; done
+        lines+=("$(ui_err MISMATCH)  $(basename "${FILES[$i]}")")
+        for d in "${hard[@]}"; do lines+=("            - $d"); done
+        for d in "${soft[@]+"${soft[@]}"}"; do lines+=("            (also: $d)"); done
         INCOMPATIBLE=1
     elif (( ${#soft[@]} )); then
-        printf "OK*       %s\n" "$(basename "${FILES[$i]}")"
-        for d in "${soft[@]}"; do printf "            differs: %s\n" "$d"; done
+        lines+=("$(ui_warn "OK*")       $(basename "${FILES[$i]}")")
+        for d in "${soft[@]}"; do lines+=("            differs: $d"); done
         DIFFERENT=1
+    elif ui_verbose; then
+        lines+=("OK        $(basename "${FILES[$i]}")")
+    fi
+
+    if ui_verbose; then
+        printf '%s\n' "${lines[@]+"${lines[@]}"}"
     else
-        printf "OK        %s\n" "$(basename "${FILES[$i]}")"
+        VERIFY_DETAILS+=("${lines[@]+"${lines[@]}"}")
     fi
 done
+
+# compact: "Analyzing 6 episodes... OK    Source stats: cached    Compatibility: OK"
+if ! ui_verbose; then
+    ui_progress "$ANALYZE_TEXT"
+    printf '%s    Source stats: %s    Compatibility: %s\n' "$(ui_ok OK)" \
+        "$(ui_stats_summary "${EP_KIND[@]}")" \
+        "$( if (( INCOMPATIBLE == 1 )); then ui_err MISMATCH
+            elif (( DIFFERENT == 1 )); then ui_warn "OK*"
+            else ui_ok OK; fi)"
+
+    # MKV statistics that could not be refreshed after a scan
+    for i in "${!FILES[@]}"; do
+        case "${EP_REFRESH[$i]}" in
+            ""|refreshed) ;;
+            *) printf '  %s %s: %s\n' "$(ui_warn "Stats not refreshed")" "${EP_LABEL[$i]}" \
+                   "$(STATS_REFRESH="${EP_REFRESH[$i]}"; stats_refresh_note)" ;;
+        esac
+    done
+
+    if (( ${#VERIFY_DETAILS[@]} )); then
+        echo
+        printf '%s\n' "${VERIFY_DETAILS[@]}"
+    fi
+fi
 
 if (( INCOMPATIBLE == 1 )); then
     echo
@@ -234,12 +297,17 @@ if (( INCOMPATIBLE == 1 )); then
     exit 1
 fi
 
-echo
-if (( DIFFERENT == 1 )); then
-    echo "All files compatible. Differences marked OK* do not affect the shared"
-    echo "encode settings; every stream of every episode is still kept."
-else
-    echo "All files match."
+if ui_verbose; then
+    echo
+    if (( DIFFERENT == 1 )); then
+        echo "All files compatible. Differences marked OK* do not affect the shared"
+        echo "encode settings; every stream of every episode is still kept."
+    else
+        echo "All files match."
+    fi
+elif (( DIFFERENT == 1 )); then
+    echo "(OK*: differences that do not affect the shared encode settings;"
+    echo " every stream of every episode is still kept)"
 fi
 
 # ============================================================
@@ -260,27 +328,44 @@ for i in "${!FILES[@]}"; do
 done
 
 echo
-echo "------------------------------------------------------------"
-echo "Series:        $SERIES_NAME"
-echo "Files:         ${FILE_COUNT}"
-echo "Resolution:    ${WIDTH}x${HEIGHT}"
-echo "Video:         ${EP_VCODEC[0]} / ${EP_PIX[0]}"
-echo "Frame rate:    ${EP_FPS[0]}"
-echo "Audio tracks:  ${#AUDIO_CHANNELS[@]}"
-echo "Values from:"
-{
-    printf "%s\n" "${EP_HOW[@]}"
-    for r in "${EP_REFRESH[@]+"${EP_REFRESH[@]}"}"; do
-        case "$r" in
-            refreshed)       echo "refreshed statistics" ;;
-            skipped:*)       echo "statistics not refreshed (${r#skipped: })" ;;
-            failed:*)        echo "statistics refresh failed" ;;
-            verify-failed:*) echo "statistics refreshed, re-read did not match" ;;
-        esac
-    done
-} | awk '{ n[$0]++; if (!($0 in seen)) { seen[$0] = 1; order[++k] = $0 } }
-    END { for (i = 1; i <= k; i++) printf "  %s: %d file%s\n", order[i], n[order[i]], (n[order[i]] == 1 ? "" : "s") }'
-echo "------------------------------------------------------------"
+if ui_verbose; then
+    echo "------------------------------------------------------------"
+    echo "Series:        $SERIES_NAME"
+    echo "Files:         ${FILE_COUNT}"
+    echo "Resolution:    ${WIDTH}x${HEIGHT}"
+    echo "Video:         ${EP_VCODEC[0]} / ${EP_PIX[0]}"
+    echo "Frame rate:    ${EP_FPS[0]}"
+    echo "Audio tracks:  ${#AUDIO_CHANNELS[@]}"
+    echo "Values from:"
+    {
+        printf "%s\n" "${EP_HOW[@]}"
+        for r in "${EP_REFRESH[@]+"${EP_REFRESH[@]}"}"; do
+            case "$r" in
+                refreshed)       echo "refreshed statistics" ;;
+                skipped:*)       echo "statistics not refreshed (${r#skipped: })" ;;
+                failed:*)        echo "statistics refresh failed" ;;
+                verify-failed:*) echo "statistics refreshed, re-read did not match" ;;
+            esac
+        done
+    } | awk '{ n[$0]++; if (!($0 in seen)) { seen[$0] = 1; order[++k] = $0 } }
+        END { for (i = 1; i <= k; i++) printf "  %s: %d file%s\n", order[i], n[order[i]], (n[order[i]] == 1 ? "" : "s") }'
+    echo "------------------------------------------------------------"
+else
+    # average source video from the loaded statistics (no rescan):
+    # bytes per episode and the runtime-weighted bitrate
+    AVG_VIDEO=$(
+        for i in "${!FILES[@]}"; do
+            printf '%s %s\n' "${EP_VBYTES[$i]:-N/A}" "${EP_DUR[$i]}"
+        done | awk '$1 ~ /^[0-9]+$/ && $1 > 0 { b += $1; s += $2; n++ }
+            END { if (n && s > 0) printf "%.2f GiB/episode   %.1f Mb/s", b / n / 1073741824, b * 8 / s / 1000000 }'
+    )
+
+    printf '%-16s%-18s %s\n' "Series:" "$SERIES_NAME" "Episodes: $FILE_COUNT"
+    printf '%-16s%s %s %s\n' "Video:" "${WIDTH}x${HEIGHT}" "${EP_VCODEC[0]^^}" "$(ui_bit_depth "${EP_PIX[0]}")"
+    printf '%-16s%s\n' "Dynamic range:" "$(hdr_compact_label)"
+    printf '%-16s%s, copied unchanged\n' "Audio:" "$(ui_plural "${#AUDIO_CHANNELS[@]}" track)"
+    [[ -n "$AVG_VIDEO" ]] && printf '%-16s%s\n' "Avg video:" "$AVG_VIDEO"
+fi
 
 if ! confirm_dynamic_range "this series"; then
     echo "Compression cancelled."
@@ -299,8 +384,13 @@ DOWNSCALED=0
 if (( WIDTH > 1920 || HEIGHT > 1080 )); then
     echo
     echo "Output resolution:"
-    echo "1) Keep original  [${WIDTH}x${HEIGHT}]"
-    echo "2) Downscale to 1080p"
+    if ui_verbose; then
+        echo "1) Keep original  [${WIDTH}x${HEIGHT}]"
+        echo "2) Downscale to 1080p"
+    else
+        printf '1) %-9s %s\n' "Original" "${WIDTH}x${HEIGHT}"
+        printf '2) %-9s %s\n' "1080p" "$(downscale_1080p_dims "$WIDTH" "$HEIGHT" | tr ' ' x)"
+    fi
 
     while true; do
         read -rp "Select [1-2]: " r
@@ -332,16 +422,24 @@ per_file() {
 
 echo
 echo "Compression tier:"
-crf_tier_load series Base
-echo "1) Base        CRF ${CRF_MIN}-${CRF_MAX}, nominal video ceiling ${CRF_CEILING_GIB} GiB/episode (audio copied unchanged)"
-crf_tier_load series High
-echo "2) High        CRF ${CRF_MIN}-${CRF_MAX}, nominal video ceiling ${CRF_CEILING_GIB} GiB/episode (audio copied unchanged)"
-echo "3) Custom CRF  exactly the CRF you enter, any 0-${CRF_LIMIT} (no range or ceiling; audio copied unchanged)"
+if ui_verbose; then
+    crf_tier_load series Base
+    echo "1) Base        CRF ${CRF_MIN}-${CRF_MAX}, nominal video ceiling ${CRF_CEILING_GIB} GiB/episode (audio copied unchanged)"
+    crf_tier_load series High
+    echo "2) High        CRF ${CRF_MIN}-${CRF_MAX}, nominal video ceiling ${CRF_CEILING_GIB} GiB/episode (audio copied unchanged)"
+    echo "3) Custom CRF  exactly the CRF you enter, any 0-${CRF_LIMIT} (no range or ceiling; audio copied unchanged)"
+else
+    crf_tier_load series Base
+    printf '1) %-7s CRF %-7s <=%s GiB/episode\n' Base "${CRF_MIN}-${CRF_MAX}" "$CRF_CEILING_GIB"
+    crf_tier_load series High
+    printf '2) %-7s CRF %-7s <=%s GiB/episode\n' High "${CRF_MIN}-${CRF_MAX}" "$CRF_CEILING_GIB"
+    printf '3) %-7s exact CRF (0-%s)\n' Custom "$CRF_LIMIT"
+fi
 
 CUSTOM_CRF=""
 
 while true; do
-    echo
+    ui_verbose && echo
     read -rp "Select [1-3]: " t
 
     case "$t" in
@@ -362,8 +460,10 @@ done
 
 crf_tier_load series "$TIER" "$CUSTOM_CRF"
 
-echo
-crf_policy_lines series "$TIER" "$CUSTOM_CRF"
+if ui_verbose; then
+    echo
+    crf_policy_lines series "$TIER" "$CUSTOM_CRF"
+fi
 
 # ============================================================
 # CRF ANALYSIS  (policy.sh: crf_select, series_crf_spread;
@@ -378,20 +478,54 @@ mapfile -t CRF_SERIES_SAMPLED < <(series_sample_episodes "$FILE_COUNT" "$SERIES_
 CRF_SERIES_FILTER="$VIDEO_FILTER"
 declare -A CRF_SERIES_EP_BYTES=() CRF_SERIES_EP_FROM=()
 
+# crf_series_estimate_shown CRF  (ESTIMATOR: crf_series_estimate, then
+# in compact output the result of this CRF right below its samples;
+# the same median-vs-ceiling test crf_select applies)
+crf_series_estimate_shown() {
+    local c="$1" eb
+
+    crf_series_estimate "$c" || return 1
+    ui_verbose && return 0
+
+    read -ra eb <<< "${CRF_SERIES_EP_BYTES[$c]}"
+    series_batch_stats "$CRF_CEILING_BYTES" "${eb[@]}" || return 0
+
+    echo
+    printf '%-10s%s GiB\n' "Median:" "$(bytes_to_gib "$CRF_EST_RESULT")"
+    if (( CRF_CEILING_BYTES <= 0 || CRF_EST_RESULT <= CRF_CEILING_BYTES )); then
+        printf '%-10s%s GiB\n' "Largest:" "$(bytes_to_gib "$SB_LARGEST")"
+        (( CRF_CEILING_BYTES > 0 )) &&
+            printf '%-10s%s GiB\n' "Ceiling:" "$(bytes_to_gib "$CRF_CEILING_BYTES")"
+        printf '%-10s%s\n' "Selected:" "$(ui_bold "CRF $c")"
+    else
+        printf '%-10s%s GiB\n' "Ceiling:" "$(bytes_to_gib "$CRF_CEILING_BYTES")"
+        if (( 10#$c < 10#$CRF_MAX )); then
+            printf '%-10s%s -> trying CRF %s\n' "Result:" "$(ui_warn "too large")" "$((10#$c + 1))"
+        else
+            printf '%-10s%s (CRF %s is the %s limit)\n' "Result:" "$(ui_warn "too large")" "$CRF_MAX" "$TIER"
+        fi
+    fi
+}
+
 echo
-printf "Estimating video size from sample encodes (%d of %d episodes, %sx%s output%s):\n" \
-    "${#CRF_SERIES_SAMPLED[@]}" "$FILE_COUNT" "$OUT_WIDTH" "$OUT_HEIGHT" \
-    "$( (( DOWNSCALED == 1 )) && echo ", downscaled like the final encode")"
+if ui_verbose; then
+    printf "Estimating video size from sample encodes (%d of %d episodes, %sx%s output%s):\n" \
+        "${#CRF_SERIES_SAMPLED[@]}" "$FILE_COUNT" "$OUT_WIDTH" "$OUT_HEIGHT" \
+        "$( (( DOWNSCALED == 1 )) && echo ", downscaled like the final encode")"
+else
+    printf 'Estimating %s at %sx%s...\n' \
+        "$( [[ "$TIER" == "Custom" ]] && echo "CRF $CUSTOM_CRF" || echo "$TIER")" "$OUT_WIDTH" "$OUT_HEIGHT"
+fi
 
 if [[ "$TIER" == "Custom" ]]; then
-    crf_select_exact "$CUSTOM_CRF" crf_series_estimate || CRF_SELECTED=""
+    crf_select_exact "$CUSTOM_CRF" crf_series_estimate_shown || CRF_SELECTED=""
 else
-    crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate || CRF_SELECTED=""
+    crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate_shown || CRF_SELECTED=""
 fi
 
 if [[ -z "$CRF_SELECTED" ]]; then
     echo
-    echo "CRF analysis failed (sample encode error above)."
+    echo "$(ui_err "CRF analysis failed") (sample encode error above)."
     echo "Compression cancelled."
     exit 1
 fi
@@ -406,23 +540,25 @@ ABOVE=("${SB_ABOVE[@]+"${SB_ABOVE[@]}"}")
 EST_MEDIAN="$SB_MEDIAN"
 EST_LARGEST="$SB_LARGEST"
 
-echo
-echo "CRF analysis (video only; copied audio is not part of the choice):"
-series_crf_analysis_lines
+if ui_verbose; then
+    echo
+    echo "CRF analysis (video only; copied audio is not part of the choice):"
+    series_crf_analysis_lines
 
-echo
-echo "Selected:"
-echo "  CRF $CRF for all ${FILE_COUNT} episodes"
-echo "  median episode video:  ~$(size_text "$EST_MEDIAN")"
-echo "  largest episode video: ~$(size_text "$EST_LARGEST")"
-if [[ "$TIER" != "Custom" ]]; then
-    echo "  nominal ceiling:       ${CRF_CEILING_GIB} GiB/episode"
+    echo
+    echo "Selected:"
+    echo "  CRF $CRF for all ${FILE_COUNT} episodes"
+    echo "  median episode video:  ~$(size_text "$EST_MEDIAN")"
+    echo "  largest episode video: ~$(size_text "$EST_LARGEST")"
+    if [[ "$TIER" != "Custom" ]]; then
+        echo "  nominal ceiling:       ${CRF_CEILING_GIB} GiB/episode"
+    fi
 fi
 
 if (( CRF_OVER_CEILING == 1 )); then
     echo
     echo "------------------------------------------------------------"
-    echo "WARNING: the nominal ${CRF_CEILING_GIB} GiB per-episode video ceiling cannot be met"
+    echo "$(ui_warn WARNING): the nominal ${CRF_CEILING_GIB} GiB per-episode video ceiling cannot be met"
     echo "within the allowed ${TIER} quality range: even CRF ${CRF_MAX} (the lowest quality ${TIER}"
     echo "allows) gives a median episode of ~$(bytes_to_gib "$EST_MEDIAN") GiB video, ~$(crf_oversize_gib "$EST_MEDIAN" "$CRF_CEILING_BYTES") GiB above the ceiling."
     echo "------------------------------------------------------------"
@@ -445,16 +581,23 @@ fi
 if (( ${#ABOVE[@]} )); then
     echo
     if (( ${#ABOVE[@]} == 1 )); then
-        echo "Warning: 1 episode is estimated above the nominal ${CRF_CEILING_GIB} GiB ceiling."
+        echo "$(ui_warn Warning): 1 episode is estimated above the nominal ${CRF_CEILING_GIB} GiB ceiling."
     else
-        echo "Warning: ${#ABOVE[@]} episodes are estimated above the nominal ${CRF_CEILING_GIB} GiB ceiling."
+        echo "$(ui_warn Warning): ${#ABOVE[@]} episodes are estimated above the nominal ${CRF_CEILING_GIB} GiB ceiling."
     fi
     echo "They keep CRF ${CRF} like the rest of the season (consistent quality):"
     for i in "${ABOVE[@]}"; do
-        printf "  %-40.40s ~%s GiB video, +%s GiB (%s)\n" "$(basename "${FILES[$i]}")" \
-            "$(bytes_to_gib "${EP_EST[$i]}")" \
-            "$(crf_oversize_gib "${EP_EST[$i]}" "$CRF_CEILING_BYTES")" \
-            "$( [[ "${EP_FROM[$i]}" == sample ]] && echo "sampled" || echo "median bitrate")"
+        if ui_verbose; then
+            printf "  %-40.40s ~%s GiB video, +%s GiB (%s)\n" "$(basename "${FILES[$i]}")" \
+                "$(bytes_to_gib "${EP_EST[$i]}")" \
+                "$(crf_oversize_gib "${EP_EST[$i]}" "$CRF_CEILING_BYTES")" \
+                "$( [[ "${EP_FROM[$i]}" == sample ]] && echo "sampled" || echo "median bitrate")"
+        else
+            printf "  %-*s  ~%s GiB video, +%s GiB (%s)\n" "$LABEL_W" "${EP_LABEL[$i]}" \
+                "$(bytes_to_gib "${EP_EST[$i]}")" \
+                "$(crf_oversize_gib "${EP_EST[$i]}" "$CRF_CEILING_BYTES")" \
+                "$( [[ "${EP_FROM[$i]}" == sample ]] && echo "sampled" || echo "median bitrate")"
+        fi
     done
 fi
 
@@ -488,7 +631,7 @@ if (( ${#GUARD[@]} )); then
     echo "Source-quality guard: ${#GUARD[@]} episode(s) are already below what"
     echo "${TIER} CRF ${CRF} would need (a re-encode would not be smaller, only lossier):"
     for i in "${GUARD[@]}"; do
-        printf "  %-40.40s source %s, CRF %s estimate ~%s\n" "$(basename "${FILES[$i]}")" \
+        printf "  %-40.40s source %s, CRF %s estimate ~%s\n" "$(ep_name "$i")" \
             "$(size_text "${EP_VBYTES[$i]}")" "$CRF" "$(size_text "${EP_EST[$i]}")"
     done
     echo "------------------------------------------------------------"
@@ -531,131 +674,198 @@ for i in "${!FILES[@]}"; do
 done
 series_crf_plan "${PLAN_VIDEO[@]}"
 
-echo
-echo "------------------------------------------------------------"
-echo "Tier:                 $TIER"
-if [[ "$TIER" == "Custom" ]]; then
-    echo "Video encode:         x265 CRF ${CRF}, single pass, every episode (entered CRF)"
-else
-    echo "Video encode:         x265 CRF ${CRF}, single pass, every episode"
-    echo "                      (${TIER}: CRF ${CRF_MIN}-${CRF_MAX}, ${CRF_CEILING_GIB} GiB/episode nominal video ceiling$( (( CRF_OVER_CEILING == 1 )) && echo "; ceiling NOT met"))"
-fi
-echo "Resolution:           ${WIDTH}x${HEIGHT} -> ${OUT_WIDTH}x${OUT_HEIGHT}"
-echo "Dynamic range:        $(hdr_description)"
-
-HDR_POLICY_LINE=$(hdr_policy_summary)
-if [[ -n "$HDR_POLICY_LINE" ]]; then
-    echo "HDR metadata:         $HDR_POLICY_LINE"
-fi
-
-if [[ "$DV_POLICY" == "preserve" ]] && (( DOWNSCALED == 1 )); then
-    echo "Dolby Vision:         L5 active-area offsets rescaled to ${OUT_WIDTH}x${OUT_HEIGHT}"
-fi
-echo "Audio:                all tracks copied unchanged (on top of the video size)"
-
-# same audio layout in every episode (verified above); details of the first
-while IFS= read -r note; do
-    [[ -n "$note" ]] && echo "  $note"
-done < <(audio_copy_notes "$REFERENCE" "${EP_AKBPS[0]}")
-
-echo
-echo "Per-episode rules:"
-echo "  - video: the same CRF for every episode (sizes vary with content);"
-echo "    an episode whose estimate is not below its source is only re-encoded"
-echo "    if you chose so above"
-echo "  - audio: every track copied unchanged (optional audio compression"
-echo "    afterwards with audio_compress_menu.sh)"
-echo "------------------------------------------------------------"
-
-# ============================================================
-# SIZE PREVIEW
-# ============================================================
-
-declare -A IS_ABOVE=() IS_GUARD=()
-for i in "${ABOVE[@]+"${ABOVE[@]}"}"; do IS_ABOVE[$i]=1; done
-for i in "${GUARD[@]+"${GUARD[@]}"}"; do IS_GUARD[$i]=1; done
-
-echo
-echo "Expected sizes:"
-echo
-printf "  %-32s %7s %5s %7s %7s %7s  %-8s %s\n" \
-    "Episode" "Runtime" "CRF" "Video" "Audio" "Total" "Estimate" "Status"
-
-for i in "${!FILES[@]}"; do
-    ccol="$CRF"
-    if (( EP_GUARD_SKIP[$i] == 1 )); then
-        ccol="-"; ecol="-"; status="SKIPPED (source-quality guard)"
-    elif [[ "${EP_VIDEO[$i]}" == "copy" ]]; then
-        ccol="copy"; ecol="source"; status="SOURCE VIDEO KEPT"
+if ui_verbose; then
+    echo
+    echo "------------------------------------------------------------"
+    echo "Tier:                 $TIER"
+    if [[ "$TIER" == "Custom" ]]; then
+        echo "Video encode:         x265 CRF ${CRF}, single pass, every episode (entered CRF)"
     else
-        [[ "${EP_FROM[$i]}" == "sample" ]] && ecol="sampled" || ecol="median"
-        if [[ -n "${IS_ABOVE[$i]:-}" ]]; then
-            status="ABOVE NOMINAL CEILING"
-        else
-            status="OK"
-        fi
-        [[ -n "${IS_GUARD[$i]:-}" ]] && status+=" (not below source; encode anyway)"
+        echo "Video encode:         x265 CRF ${CRF}, single pass, every episode"
+        echo "                      (${TIER}: CRF ${CRF_MIN}-${CRF_MAX}, ${CRF_CEILING_GIB} GiB/episode nominal video ceiling$( (( CRF_OVER_CEILING == 1 )) && echo "; ceiling NOT met"))"
+    fi
+    echo "Resolution:           ${WIDTH}x${HEIGHT} -> ${OUT_WIDTH}x${OUT_HEIGHT}"
+    echo "Dynamic range:        $(hdr_description)"
+
+    HDR_POLICY_LINE=$(hdr_policy_summary)
+    if [[ -n "$HDR_POLICY_LINE" ]]; then
+        echo "HDR metadata:         $HDR_POLICY_LINE"
     fi
 
-    printf "  %-32.32s %7s %5s %7s %7s %7s  %-8s %s\n" \
-        "$(basename "${FILES[$i]}")" \
-        "$(awk -v d="${EP_DUR[$i]}" 'BEGIN { printf "%d:%02d", int(d / 60), int(d % 60) }')" \
-        "$ccol" "${P_EP_VGIB[$i]}" "${P_EP_AGIB[$i]}" "${P_EP_GIB[$i]}" "$ecol" "$status"
-done
-echo "  (runtime m:ss; sizes in GiB; video = estimate from sample encodes;"
-echo "   audio = actual size of all copied source audio tracks;"
-echo "   total = video + audio + ~${SERIES_CONTAINER_RESERVE_PCT}% container/subtitles)"
-echo "  sampled = this episode was sample-encoded"
-echo "  median  = not sampled; median sampled video bitrate x its runtime"
-if [[ "$TIER" != "Custom" ]]; then
-    echo "  ABOVE NOMINAL CEILING = video estimate above ${CRF_CEILING_GIB} GiB; still CRF ${CRF}"
-fi
+    if [[ "$DV_POLICY" == "preserve" ]] && (( DOWNSCALED == 1 )); then
+        echo "Dolby Vision:         L5 active-area offsets rescaled to ${OUT_WIDTH}x${OUT_HEIGHT}"
+    fi
+    echo "Audio:                all tracks copied unchanged (on top of the video size)"
 
-# Stream / title / chapter handling, shown for the first episode (the
-# same rules apply to every episode; each output is verified).
-build_stream_map "$REFERENCE" "${EP_VIDX[0]}"
-REF_NOTES=("${MAP_NOTES[@]+"${MAP_NOTES[@]}"}")
+    # same audio layout in every episode (verified above); details of the first
+    while IFS= read -r note; do
+        [[ -n "$note" ]] && echo "  $note"
+    done < <(audio_copy_notes "$REFERENCE" "${EP_AKBPS[0]}")
 
-while IFS= read -r note; do
-    [[ -n "$note" ]] && REF_NOTES+=("$note")
-done < <(chapter_notes "$REFERENCE")
-
-if (( ${#REF_NOTES[@]} )); then
     echo
-    echo "Stream handling ($(basename "$REFERENCE"); same rules for every episode):"
-    for note in "${REF_NOTES[@]}"; do
-        printf "  %s\n" "$note"
-    done
-fi
+    echo "Per-episode rules:"
+    echo "  - video: the same CRF for every episode (sizes vary with content);"
+    echo "    an episode whose estimate is not below its source is only re-encoded"
+    echo "    if you chose so above"
+    echo "  - audio: every track copied unchanged (optional audio compression"
+    echo "    afterwards with audio_compress_menu.sh)"
+    echo "------------------------------------------------------------"
 
-echo
-echo "Season totals (${FILE_COUNT} files):"
-printf "  Shared CRF:                 %s (every episode)\n" "$CRF"
-printf "  Total runtime:              %s hours (%s min)\n" \
-    "$(awk -v s="$P_TOTAL_SECONDS" 'BEGIN { printf "%.2f", s / 3600 }')" \
-    "$(awk -v s="$P_TOTAL_SECONDS" 'BEGIN { printf "%.0f", s / 60 }')"
-printf "  Median episode video:       ~%s GiB\n" "$(bytes_to_gib "$EST_MEDIAN")"
-printf "  Largest episode video:      ~%s GiB\n" "$(bytes_to_gib "$EST_LARGEST")"
-if [[ "$TIER" == "Custom" ]]; then
-    printf "  Above nominal ceiling:      n/a (Custom has no ceiling)\n"
+    # ============================================================
+    # SIZE PREVIEW
+    # ============================================================
+
+    declare -A IS_ABOVE=() IS_GUARD=()
+    for i in "${ABOVE[@]+"${ABOVE[@]}"}"; do IS_ABOVE[$i]=1; done
+    for i in "${GUARD[@]+"${GUARD[@]}"}"; do IS_GUARD[$i]=1; done
+
+    echo
+    echo "Expected sizes:"
+    echo
+    printf "  %-32s %7s %5s %7s %7s %7s  %-8s %s\n" \
+        "Episode" "Runtime" "CRF" "Video" "Audio" "Total" "Estimate" "Status"
+
+    for i in "${!FILES[@]}"; do
+        ccol="$CRF"
+        if (( EP_GUARD_SKIP[$i] == 1 )); then
+            ccol="-"; ecol="-"; status="SKIPPED (source-quality guard)"
+        elif [[ "${EP_VIDEO[$i]}" == "copy" ]]; then
+            ccol="copy"; ecol="source"; status="SOURCE VIDEO KEPT"
+        else
+            [[ "${EP_FROM[$i]}" == "sample" ]] && ecol="sampled" || ecol="median"
+            if [[ -n "${IS_ABOVE[$i]:-}" ]]; then
+                status="ABOVE NOMINAL CEILING"
+            else
+                status="OK"
+            fi
+            [[ -n "${IS_GUARD[$i]:-}" ]] && status+=" (not below source; encode anyway)"
+        fi
+
+        printf "  %-32.32s %7s %5s %7s %7s %7s  %-8s %s\n" \
+            "$(basename "${FILES[$i]}")" \
+            "$(awk -v d="${EP_DUR[$i]}" 'BEGIN { printf "%d:%02d", int(d / 60), int(d % 60) }')" \
+            "$ccol" "${P_EP_VGIB[$i]}" "${P_EP_AGIB[$i]}" "${P_EP_GIB[$i]}" "$ecol" "$status"
+    done
+    echo "  (runtime m:ss; sizes in GiB; video = estimate from sample encodes;"
+    echo "   audio = actual size of all copied source audio tracks;"
+    echo "   total = video + audio + ~${SERIES_CONTAINER_RESERVE_PCT}% container/subtitles)"
+    echo "  sampled = this episode was sample-encoded"
+    echo "  median  = not sampled; median sampled video bitrate x its runtime"
+    if [[ "$TIER" != "Custom" ]]; then
+        echo "  ABOVE NOMINAL CEILING = video estimate above ${CRF_CEILING_GIB} GiB; still CRF ${CRF}"
+    fi
+
+    # Stream / title / chapter handling, shown for the first episode (the
+    # same rules apply to every episode; each output is verified).
+    build_stream_map "$REFERENCE" "${EP_VIDX[0]}"
+    REF_NOTES=("${MAP_NOTES[@]+"${MAP_NOTES[@]}"}")
+
+    while IFS= read -r note; do
+        [[ -n "$note" ]] && REF_NOTES+=("$note")
+    done < <(chapter_notes "$REFERENCE")
+
+    if (( ${#REF_NOTES[@]} )); then
+        echo
+        echo "Stream handling ($(basename "$REFERENCE"); same rules for every episode):"
+        for note in "${REF_NOTES[@]}"; do
+            printf "  %s\n" "$note"
+        done
+    fi
+
+    echo
+    echo "Season totals (${FILE_COUNT} files):"
+    printf "  Shared CRF:                 %s (every episode)\n" "$CRF"
+    printf "  Total runtime:              %s hours (%s min)\n" \
+        "$(awk -v s="$P_TOTAL_SECONDS" 'BEGIN { printf "%.2f", s / 3600 }')" \
+        "$(awk -v s="$P_TOTAL_SECONDS" 'BEGIN { printf "%.0f", s / 60 }')"
+    printf "  Median episode video:       ~%s GiB\n" "$(bytes_to_gib "$EST_MEDIAN")"
+    printf "  Largest episode video:      ~%s GiB\n" "$(bytes_to_gib "$EST_LARGEST")"
+    if [[ "$TIER" == "Custom" ]]; then
+        printf "  Above nominal ceiling:      n/a (Custom has no ceiling)\n"
+    else
+        printf "  Above nominal ceiling:      %d of %d episode(s) (%s GiB/episode)\n" \
+            "${#ABOVE[@]}" "$FILE_COUNT" "$CRF_CEILING_GIB"
+    fi
+    printf "  Expected total video size:  ~%s GiB\n" "$P_VIDEO_GIB"
+    printf "  Copied source audio size:   ~%s GiB\n" "$P_AUDIO_GIB"
+    printf "  Expected total output size: ~%s GiB  (incl. ~%s%% container/subtitles)\n" \
+        "$P_TOTAL_GIB" "$SERIES_CONTAINER_RESERVE_PCT"
+    echo
+    printf "  Average per file:           ~%s GiB (video ~%s, audio ~%s)\n" \
+        "$(per_file "$P_TOTAL_GIB")" "$(per_file "$P_VIDEO_GIB")" "$(per_file "$P_AUDIO_GIB")"
+    GUARD_SKIPPED=0
+    for i in "${!FILES[@]}"; do
+        (( EP_GUARD_SKIP[$i] == 1 )) && ((GUARD_SKIPPED += 1))
+    done
+    (( GUARD_SKIPPED > 0 )) &&
+        echo "  (totals include the $GUARD_SKIPPED episode(s) skipped by the source-quality guard)"
+    echo
 else
-    printf "  Above nominal ceiling:      %d of %d episode(s) (%s GiB/episode)\n" \
-        "${#ABOVE[@]}" "$FILE_COUNT" "$CRF_CEILING_GIB"
+    # ---------------- compact preview
+    declare -A IS_ABOVE=() IS_GUARD=()
+    for i in "${ABOVE[@]+"${ABOVE[@]}"}"; do IS_ABOVE[$i]=1; done
+    for i in "${GUARD[@]+"${GUARD[@]}"}"; do IS_GUARD[$i]=1; done
+
+    # Status column only when an episode is not a plain OK
+    STATUS=()
+    SHOW_STATUS=0
+    for i in "${!FILES[@]}"; do
+        if (( EP_GUARD_SKIP[$i] == 1 )); then
+            STATUS[$i]=$(ui_warn "SKIPPED (source-quality guard)")
+        elif [[ "${EP_VIDEO[$i]}" == "copy" ]]; then
+            STATUS[$i]="SOURCE VIDEO KEPT"
+        elif [[ -n "${IS_ABOVE[$i]:-}" ]]; then
+            STATUS[$i]=$(ui_warn "ABOVE CEILING")
+        else
+            STATUS[$i]=$(ui_ok OK)
+        fi
+        [[ -n "${IS_GUARD[$i]:-}" && "${EP_VIDEO[$i]}" != "copy" ]] && (( EP_GUARD_SKIP[$i] == 0 )) &&
+            STATUS[$i]+=" (not below source)"
+        [[ "${STATUS[$i]}" == "$(ui_ok OK)" ]] || SHOW_STATUS=1
+    done
+
+    # sizes in GiB; Total padded only when a Status column follows
+    ROW_FMT="%-*s   %-7s   %-6s  %-6s  %s%s\n"
+    (( SHOW_STATUS == 1 )) && ROW_FMT="%-*s   %-7s   %-6s  %-6s  %-6s%s\n"
+
+    echo
+    echo "Expected sizes:"
+    printf "$ROW_FMT" "$LABEL_W" "Episode" "Runtime" "Video" "Audio" "Total" \
+        "$( (( SHOW_STATUS == 1 )) && echo "  Status")"
+    for i in "${!FILES[@]}"; do
+        printf "$ROW_FMT" "$LABEL_W" "${EP_LABEL[$i]}" \
+            "$(awk -v d="${EP_DUR[$i]}" 'BEGIN { printf "%d:%02d", int(d / 60), int(d % 60) }')" \
+            "${P_EP_VGIB[$i]}" "${P_EP_AGIB[$i]}" "${P_EP_GIB[$i]}" \
+            "$( (( SHOW_STATUS == 1 )) && printf '  %s' "${STATUS[$i]}")"
+    done
+
+    # stream handling: only what is lost or dropped (COMPRESS_VERBOSE=1
+    # lists every note)
+    build_stream_map "$REFERENCE" "${EP_VIDX[0]}"
+    REF_NOTES=()
+    while IFS= read -r note; do
+        [[ "$note" =~ LOST|DROPPED|WARNING|cannot|skipped|missing ]] && REF_NOTES+=("$note")
+    done < <(printf '%s\n' "${MAP_NOTES[@]+"${MAP_NOTES[@]}"}"; chapter_notes "$REFERENCE")
+
+    if (( ${#REF_NOTES[@]} )); then
+        echo
+        echo "$(ui_warn "Stream handling") ($(basename "$REFERENCE"); same rules for every episode):"
+        printf '  %s\n' "${REF_NOTES[@]}"
+    fi
+
+    GUARD_SKIPPED=0
+    for i in "${!FILES[@]}"; do
+        (( EP_GUARD_SKIP[$i] == 1 )) && ((GUARD_SKIPPED += 1))
+    done
+
+    echo
+    echo "Season:"
+    printf '  %-9s~%s GiB\n' "Video:" "$P_VIDEO_GIB" "Audio:" "$P_AUDIO_GIB" "Total:" "$P_TOTAL_GIB"
+    printf '  %-9s~%s GiB/episode\n' "Average:" "$(per_file "$P_TOTAL_GIB")"
+    (( GUARD_SKIPPED > 0 )) &&
+        echo "  (totals include the $GUARD_SKIPPED episode(s) skipped by the source-quality guard)"
+    echo
 fi
-printf "  Expected total video size:  ~%s GiB\n" "$P_VIDEO_GIB"
-printf "  Copied source audio size:   ~%s GiB\n" "$P_AUDIO_GIB"
-printf "  Expected total output size: ~%s GiB  (incl. ~%s%% container/subtitles)\n" \
-    "$P_TOTAL_GIB" "$SERIES_CONTAINER_RESERVE_PCT"
-echo
-printf "  Average per file:           ~%s GiB (video ~%s, audio ~%s)\n" \
-    "$(per_file "$P_TOTAL_GIB")" "$(per_file "$P_VIDEO_GIB")" "$(per_file "$P_AUDIO_GIB")"
-GUARD_SKIPPED=0
-for i in "${!FILES[@]}"; do
-    (( EP_GUARD_SKIP[$i] == 1 )) && ((GUARD_SKIPPED += 1))
-done
-(( GUARD_SKIPPED > 0 )) &&
-    echo "  (totals include the $GUARD_SKIPPED episode(s) skipped by the source-quality guard)"
-echo
 
 # ============================================================
 # OUTPUT
@@ -747,7 +957,15 @@ if (( QUEUED == 0 )); then
     exit 0
 fi
 
-read -rp "Start compression of $QUEUED episode(s)? [y/N]: " confirm
+if ui_verbose; then
+    read -rp "Start compression of $QUEUED episode(s)? [y/N]: " confirm
+else
+    # one-line confirmation of the encode settings
+    printf '%s | %s | %sx%s | %s | audio copied%s\n' "$TIER" "$(ui_bold "CRF $CRF")" \
+        "$OUT_WIDTH" "$OUT_HEIGHT" "$(hdr_policy_short)" \
+        "$( (( CRF_OVER_CEILING == 1 )) && echo " | $(ui_warn "ceiling not met")")"
+    read -rp "Start compression of $(ui_plural "$QUEUED" episode)? [y/N]: " confirm
+fi
 [[ "$confirm" =~ ^[Yy]$ ]] || exit 0
 
 mkdir -p "$OUT_SERIES"

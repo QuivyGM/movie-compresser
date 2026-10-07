@@ -7,6 +7,7 @@ WORK_DIR="$HOME/compress/work"
 
 mkdir -p "$IN_DIR" "$OUT_DIR" "$WORK_DIR"
 
+source "$WORK_DIR/lib/ui.sh"
 source "$WORK_DIR/lib/media_probe.sh"
 source "$WORK_DIR/lib/media_stats.sh"
 source "$WORK_DIR/lib/bitrate.sh"
@@ -34,16 +35,20 @@ fi
 # runtime files of earlier jobs confirmed finished (encode_common.sh)
 cleanup_finished_jobs "$WORK_DIR"
 
-echo "Policy: $(policy_conf_path)"
-for t in Quality High Base Custom; do
-    printf "  %-8s %s\n" "$t" "$(movie_policy_line "$t")"
-done
-for t in Quality High Base; do
+# Output is compact; COMPRESS_VERBOSE=1 shows the detailed policy, HDR
+# tool and sampling diagnostics (lib/ui.sh).
+if ui_verbose; then
+    echo "Policy: $(policy_conf_path)"
+    for t in Quality High Base Custom; do
+        printf "  %-8s %s\n" "$t" "$(movie_policy_line "$t")"
+    done
+    for t in Quality High Base; do
+        echo
+        movie_video_policy_lines "$t"
+    done
     echo
-    movie_video_policy_lines "$t"
-done
-echo
-audio_copy_policy_lines
+    audio_copy_policy_lines
+fi
 
 # skip_movie  ->  0 when the user wants to add another movie
 skip_movie() {
@@ -87,12 +92,17 @@ while true; do
     NAME="${BASENAME%.*}"
 
     echo
-    echo "Analyzing source..."
+    if ui_verbose; then
+        echo "Analyzing source..."
+    else
+        printf 'Analyzing source... '
+    fi
 
     # Main video stream (cover art / attached pictures are skipped).
     VIDX=$(main_video_index "$IN")
 
     if [[ -z "$VIDX" ]]; then
+        ui_verbose || echo
         echo "No video stream found in $BASENAME"
         exit 1
     fi
@@ -106,7 +116,7 @@ while true; do
     # Stored MKV statistics when they pass the checks, otherwise one
     # packet scan, after which the MKV statistics are refreshed for the
     # next run (media_stats.sh: stats_load).
-    STATS_PROGRESS=1 stats_load "$IN" "$DURATION" exact refresh
+    STATS_PROGRESS=$(ui_verbose && echo 1 || echo 0) stats_load "$IN" "$DURATION" exact refresh
     read -r SOURCE_VIDEO_BYTES SOURCE_AUDIO_BYTES _ _ <<< "$(stats_totals "$VIDX")"
     SOURCE_AUDIO_KBPS=$(stats_audio_kbps)
 
@@ -137,20 +147,40 @@ while true; do
             'BEGIN {printf "%.1f",d/60}'
     )
 
-    echo
-    echo "Source:       $BASENAME"
-    echo "Resolution:   ${WIDTH}x${HEIGHT}"
-    echo "Runtime:      ${DURATION_MIN} min"
-    echo "Video:        ${SOURCE_VIDEO_MBPS} Mb/s / ${SOURCE_VIDEO_GIB} GiB"
-    echo "Audio:        ${SOURCE_AUDIO_GIB} GiB / ${AUDIO_TRACKS} track(s)"
-    echo "File size:    ${SOURCE_TOTAL_GIB} GiB"
-    echo "Values from:  ${STATS_SOURCE}"
-    [[ -n "$STATS_REJECTED" ]] &&
-        echo "              (stored statistics rejected: ${STATS_REJECTED})"
-    [[ -n "$STATS_REFRESH" ]] &&
-        echo "              ($(stats_refresh_note))"
-
     probe_hdr "$IN" "$VIDX"
+
+    if ui_verbose; then
+        echo
+        echo "Source:       $BASENAME"
+        echo "Resolution:   ${WIDTH}x${HEIGHT}"
+        echo "Runtime:      ${DURATION_MIN} min"
+        echo "Video:        ${SOURCE_VIDEO_MBPS} Mb/s / ${SOURCE_VIDEO_GIB} GiB"
+        echo "Audio:        ${SOURCE_AUDIO_GIB} GiB / ${AUDIO_TRACKS} track(s)"
+        echo "File size:    ${SOURCE_TOTAL_GIB} GiB"
+        echo "Values from:  ${STATS_SOURCE}"
+        [[ -n "$STATS_REJECTED" ]] &&
+            echo "              (stored statistics rejected: ${STATS_REJECTED})"
+        [[ -n "$STATS_REFRESH" ]] &&
+            echo "              ($(stats_refresh_note))"
+    else
+        # "Analyzing source... OK    Source stats: cached"
+        printf '%s    Source stats: %s\n' "$(ui_ok OK)" \
+            "$(ui_stats_summary "$STATS_KIND$( [[ "$STATS_REFRESH" == refreshed ]] && echo :refreshed)")"
+        [[ -n "$STATS_REFRESH" && "$STATS_REFRESH" != refreshed ]] &&
+            echo "  $(ui_warn "Stats not refreshed"): $(stats_refresh_note)"
+
+        read -r VCODEC VPIX < <(stream_info "$IN" |
+            awk -F'\t' -v v="$VIDX" '$1 == v { print $3, $10; exit }')
+
+        echo
+        printf '%-16s%s\n' "Source:" "$BASENAME"
+        printf '%-16s%s\n' "Runtime:" "$(format_hms "$DURATION")"
+        printf '%-16s%-24s %s Mb/s   %s GiB\n' "Video:" \
+            "${WIDTH}x${HEIGHT} ${VCODEC^^} $(ui_bit_depth "$VPIX")" "$SOURCE_VIDEO_MBPS" "$SOURCE_VIDEO_GIB"
+        printf '%-16s%s\n' "Dynamic range:" "$(hdr_compact_label)"
+        printf '%-16s%s, %s GiB, copied unchanged\n' "Audio:" "$(ui_plural "$AUDIO_TRACKS" track)" "$SOURCE_AUDIO_GIB"
+        printf '%-16s%s GiB\n' "File size:" "$SOURCE_TOTAL_GIB"
+    fi
 
     if ! confirm_dynamic_range "$BASENAME"; then
         skip_movie && continue
@@ -169,9 +199,15 @@ while true; do
     if (( WIDTH > 1920 || HEIGHT > 1080 )); then
 
         echo
-        echo "Source is higher than 1080p."
-        echo "1) Keep original resolution (${WIDTH}x${HEIGHT})"
-        echo "2) Downscale to 1080p"
+        if ui_verbose; then
+            echo "Source is higher than 1080p."
+            echo "1) Keep original resolution (${WIDTH}x${HEIGHT})"
+            echo "2) Downscale to 1080p"
+        else
+            echo "Output resolution:"
+            printf '1) %-9s %s\n' "Original" "${WIDTH}x${HEIGHT}"
+            printf '2) %-9s %s\n' "1080p" "$(downscale_1080p_dims "$WIDTH" "$HEIGHT" | tr ' ' x)"
+        fi
 
         while true; do
             read -rp "Select [1-2]: " r
@@ -199,12 +235,22 @@ while true; do
 
     echo
     echo "Compression tier:"
-    echo "1) Quality     two-pass, ~$(movie_video_plan Quality "$DURATION" "$SOURCE_VIDEO_BYTES"; echo "$PLAN_TARGET_GIB") GiB video"
-    crf_tier_load movie High
-    echo "2) High        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_CEILING_GIB} GiB"
-    crf_tier_load movie Base
-    echo "3) Base        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_CEILING_GIB} GiB"
-    echo "4) Custom CRF  exactly the CRF you enter"
+    if ui_verbose; then
+        echo "1) Quality     two-pass, ~$(movie_video_plan Quality "$DURATION" "$SOURCE_VIDEO_BYTES"; echo "$PLAN_TARGET_GIB") GiB video"
+        crf_tier_load movie High
+        echo "2) High        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_CEILING_GIB} GiB"
+        crf_tier_load movie Base
+        echo "3) Base        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_CEILING_GIB} GiB"
+        echo "4) Custom CRF  exactly the CRF you enter"
+    else
+        printf '1) %-8s %-11s ~%s GiB\n' Quality two-pass \
+            "$(movie_video_plan Quality "$DURATION" "$SOURCE_VIDEO_BYTES"; awk -v g="$PLAN_TARGET_GIB" 'BEGIN { printf "%.2f", g }')"
+        crf_tier_load movie High
+        printf '2) %-8s %-11s <=%s GiB\n' High "CRF ${CRF_MIN}-${CRF_MAX}" "$CRF_CEILING_GIB"
+        crf_tier_load movie Base
+        printf '3) %-8s %-11s <=%s GiB\n' Base "CRF ${CRF_MIN}-${CRF_MAX}" "$CRF_CEILING_GIB"
+        printf '4) %-8s exact CRF (0-%s)\n' Custom "$CRF_LIMIT"
+    fi
 
     CUSTOM_CRF=""
 
@@ -323,8 +369,10 @@ while true; do
 
         crf_tier_load movie "$TIER" "$CUSTOM_CRF"
 
-        echo
-        crf_policy_lines movie "$TIER" "$CUSTOM_CRF"
+        if ui_verbose; then
+            echo
+            crf_policy_lines movie "$TIER" "$CUSTOM_CRF"
+        fi
 
         CRF_TITLE_FILE="$IN"
         CRF_TITLE_VIDX="$VIDX"
@@ -333,8 +381,13 @@ while true; do
         CRF_TITLE_POINTS="$MOVIE_CRF_SAMPLE_POINTS"
 
         echo
-        printf "Estimating video size from sample encodes (%sx%s output%s):\n" \
-            "$OUT_WIDTH" "$OUT_HEIGHT" "$( (( DOWNSCALED == 1 )) && echo ", downscaled like the final encode")"
+        if ui_verbose; then
+            printf "Estimating video size from sample encodes (%sx%s output%s):\n" \
+                "$OUT_WIDTH" "$OUT_HEIGHT" "$( (( DOWNSCALED == 1 )) && echo ", downscaled like the final encode")"
+        else
+            printf 'Estimating %s at %sx%s...\n' \
+                "$( [[ "$TIER" == "Custom" ]] && echo "CRF $CUSTOM_CRF" || echo "$TIER")" "$OUT_WIDTH" "$OUT_HEIGHT"
+        fi
 
         if [[ "$TIER" == "Custom" ]]; then
             crf_select_exact "$CUSTOM_CRF" crf_title_estimate || CRF_SELECTED=""
@@ -354,21 +407,36 @@ while true; do
         EXPECTED_VIDEO_GIB=$(bytes_to_gib "$EST_VIDEO_BYTES")
         VIDEO_SPEC="crf:$CRF"
 
-        echo
-        echo "CRF analysis:"
-        crf_analysis_lines
+        if ui_verbose; then
+            echo
+            echo "CRF analysis:"
+            crf_analysis_lines
 
-        echo
-        echo "Selected:"
-        echo "  CRF $CRF"
-        echo "  estimated video:      ~$(size_text "$EST_VIDEO_BYTES")"
-        echo "  copied source audio:  ~$(size_text "$SOURCE_AUDIO_BYTES")"
-        echo "  estimated total:      ~$(size_text "$(crf_total_bytes "$EST_VIDEO_BYTES" "$SOURCE_AUDIO_BYTES" "$OTHER_BYTES")")"
+            echo
+            echo "Selected:"
+            echo "  CRF $CRF"
+            echo "  estimated video:      ~$(size_text "$EST_VIDEO_BYTES")"
+            echo "  copied source audio:  ~$(size_text "$SOURCE_AUDIO_BYTES")"
+            echo "  estimated total:      ~$(size_text "$(crf_total_bytes "$EST_VIDEO_BYTES" "$SOURCE_AUDIO_BYTES" "$OTHER_BYTES")")"
+        else
+            echo
+            printf '%-10s~%s GiB\n' "Video:" "$EXPECTED_VIDEO_GIB"
+            [[ "$TIER" != "Custom" ]] &&
+                printf '%-10s%s GiB\n' "Ceiling:" "$(bytes_to_gib "$CRF_CEILING_BYTES")"
+            if (( CRF_OVER_CEILING == 1 )); then
+                printf '%-10s%s (CRF %s is the %s limit)\n' "Result:" "$(ui_warn "too large")" "$CRF_MAX" "$TIER"
+            else
+                printf '%-10s%s\n' "Selected:" "$(ui_bold "CRF $CRF")"
+            fi
+            printf '%-10s~%s GiB copied\n' "Audio:" "$SOURCE_AUDIO_GIB"
+            printf '%-10s~%s GiB\n' "Total:" \
+                "$(bytes_to_gib "$(crf_total_bytes "$EST_VIDEO_BYTES" "$SOURCE_AUDIO_BYTES" "$OTHER_BYTES")")"
+        fi
 
         if (( CRF_OVER_CEILING == 1 )); then
             echo
             echo "------------------------------------------------------------"
-            echo "WARNING: the ${CRF_CEILING_GIB} GiB video ceiling cannot be met within the"
+            echo "$(ui_warn WARNING): the ${CRF_CEILING_GIB} GiB video ceiling cannot be met within the"
             echo "${TIER} CRF range: even CRF ${CRF_MAX} (the lowest quality ${TIER} allows) is"
             echo "estimated at ~${EXPECTED_VIDEO_GIB} GiB video, ~$(crf_oversize_gib "$EST_VIDEO_BYTES" "$CRF_CEILING_BYTES") GiB above the ceiling."
             echo "------------------------------------------------------------"
@@ -490,102 +558,128 @@ while true; do
     # SUMMARY
     # ========================================================
 
-    echo
-    echo "------------------------------------------------------------"
-    echo "Added:"
-    printf "  File:              %s\n" "$BASENAME"
-    printf "  Compression tier:  %s\n" "$TIER"
-    echo
+    if ui_verbose; then
+        echo
+        echo "------------------------------------------------------------"
+        echo "Added:"
+        printf "  File:              %s\n" "$BASENAME"
+        printf "  Compression tier:  %s\n" "$TIER"
+        echo
 
-    printf "  Resolution:        %sx%s -> %sx%s\n" \
-        "$WIDTH" "$HEIGHT" \
-        "$OUT_WIDTH" "$OUT_HEIGHT"
+        printf "  Resolution:        %sx%s -> %sx%s\n" \
+            "$WIDTH" "$HEIGHT" \
+            "$OUT_WIDTH" "$OUT_HEIGHT"
 
-    case "$VIDEO_SPEC" in
-        crf:*)
-            printf "  Video encode:      x265 CRF %s, single pass\n" "$CRF"
-            if [[ "$TIER" == "Custom" ]]; then
-                printf "                     (entered CRF, used exactly)\n"
-            else
-                printf "                     (%s: CRF %s-%s, %s GiB video ceiling%s)\n" \
-                    "$TIER" "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_GIB" \
-                    "$( (( CRF_OVER_CEILING == 1 )) && echo "; ceiling NOT met" )"
-            fi
-            printf "  Video size:        ~%s -> ~%s GiB (estimated from %s sampled CRF%s)\n" \
-                "$SOURCE_VIDEO_GIB" "$EXPECTED_VIDEO_GIB" \
-                "${#CRF_TRIED[@]}" "$( (( ${#CRF_TRIED[@]} == 1 )) || echo s)"
-            printf "  Video bitrate:     %s -> ~%s Mb/s\n" \
-                "$SOURCE_VIDEO_MBPS" "$(bytes_to_mbps "$EST_VIDEO_BYTES" "$DURATION")"
-            crf_above_source "$EST_VIDEO_BYTES" "$SOURCE_VIDEO_BYTES" &&
-                printf "                     (encode anyway chosen: estimate is not below the source)\n"
-            ;;
-        copy)
-            printf "  Video:             source video kept unchanged (stream copy), %s GiB\n" "$SOURCE_VIDEO_GIB"
-            printf "                     (%s CRF %s estimate ~%s GiB was not below the source)\n" \
-                "$TIER" "$CRF" "$(bytes_to_gib "${CRF_EST[$CRF]}")"
-            ;;
-        *)
-            printf "  Video bitrate:     %s -> %.2f Mb/s\n" \
-                "$SOURCE_VIDEO_MBPS" \
-                "$TARGET_MBPS"
+        case "$VIDEO_SPEC" in
+            crf:*)
+                printf "  Video encode:      x265 CRF %s, single pass\n" "$CRF"
+                if [[ "$TIER" == "Custom" ]]; then
+                    printf "                     (entered CRF, used exactly)\n"
+                else
+                    printf "                     (%s: CRF %s-%s, %s GiB video ceiling%s)\n" \
+                        "$TIER" "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_GIB" \
+                        "$( (( CRF_OVER_CEILING == 1 )) && echo "; ceiling NOT met" )"
+                fi
+                printf "  Video size:        ~%s -> ~%s GiB (estimated from %s sampled CRF%s)\n" \
+                    "$SOURCE_VIDEO_GIB" "$EXPECTED_VIDEO_GIB" \
+                    "${#CRF_TRIED[@]}" "$( (( ${#CRF_TRIED[@]} == 1 )) || echo s)"
+                printf "  Video bitrate:     %s -> ~%s Mb/s\n" \
+                    "$SOURCE_VIDEO_MBPS" "$(bytes_to_mbps "$EST_VIDEO_BYTES" "$DURATION")"
+                crf_above_source "$EST_VIDEO_BYTES" "$SOURCE_VIDEO_BYTES" &&
+                    printf "                     (encode anyway chosen: estimate is not below the source)\n"
+                ;;
+            copy)
+                printf "  Video:             source video kept unchanged (stream copy), %s GiB\n" "$SOURCE_VIDEO_GIB"
+                printf "                     (%s CRF %s estimate ~%s GiB was not below the source)\n" \
+                    "$TIER" "$CRF" "$(bytes_to_gib "${CRF_EST[$CRF]}")"
+                ;;
+            *)
+                printf "  Video bitrate:     %s -> %.2f Mb/s\n" \
+                    "$SOURCE_VIDEO_MBPS" \
+                    "$TARGET_MBPS"
 
-            printf "  Video size:        ~%s -> ~%s GiB\n" \
-                "$SOURCE_VIDEO_GIB" \
-                "$EXPECTED_VIDEO_GIB"
+                printf "  Video size:        ~%s -> ~%s GiB\n" \
+                    "$SOURCE_VIDEO_GIB" \
+                    "$EXPECTED_VIDEO_GIB"
 
-            printf "  Video target:      rate-based   %s GiB  (%s GiB/hour x %s h)\n" \
-                "$PLAN_RATE_GIB" "$PLAN_GIB_PER_HOUR" \
-                "$(awk -v d="$DURATION" 'BEGIN { printf "%.2f", d / 3600 }')"
-            [[ -n "$PLAN_MIN_GIB" ]] &&
-                printf "                     minimum      %s GiB\n" "$PLAN_MIN_GIB"
-            printf "                     source video %s GiB\n" "${PLAN_SOURCE_GIB:-N/A}"
-            printf "                     selected     %s GiB%s\n" "$PLAN_TARGET_GIB" \
-                "$( (( PLAN_SOURCE_LIMITED == 1 )) && echo "  (limited by the source video size)")"
-            printf "                     bitrate      %s Mb/s%s\n" "$PLAN_TARGET_MBPS" \
-                "$( (( PLAN_MAX_LIMITED == 1 )) && echo "  (limited by the ${PLAN_MAX_MBPS} Mb/s max)")"
-            ;;
-    esac
+                printf "  Video target:      rate-based   %s GiB  (%s GiB/hour x %s h)\n" \
+                    "$PLAN_RATE_GIB" "$PLAN_GIB_PER_HOUR" \
+                    "$(awk -v d="$DURATION" 'BEGIN { printf "%.2f", d / 3600 }')"
+                [[ -n "$PLAN_MIN_GIB" ]] &&
+                    printf "                     minimum      %s GiB\n" "$PLAN_MIN_GIB"
+                printf "                     source video %s GiB\n" "${PLAN_SOURCE_GIB:-N/A}"
+                printf "                     selected     %s GiB%s\n" "$PLAN_TARGET_GIB" \
+                    "$( (( PLAN_SOURCE_LIMITED == 1 )) && echo "  (limited by the source video size)")"
+                printf "                     bitrate      %s Mb/s%s\n" "$PLAN_TARGET_MBPS" \
+                    "$( (( PLAN_MAX_LIMITED == 1 )) && echo "  (limited by the ${PLAN_MAX_MBPS} Mb/s max)")"
+                ;;
+        esac
 
-    printf "  Policy:            %s\n" "$(movie_policy_line "$TIER")"
-    printf "                     (%s)\n" "$(policy_conf_path)"
+        printf "  Policy:            %s\n" "$(movie_policy_line "$TIER")"
+        printf "                     (%s)\n" "$(policy_conf_path)"
 
-    printf "  Audio size:        ~%s GiB copied unchanged (%s track(s), actual source audio)\n" \
-        "$SOURCE_AUDIO_GIB" "$AUDIO_TRACKS"
+        printf "  Audio size:        ~%s GiB copied unchanged (%s track(s), actual source audio)\n" \
+            "$SOURCE_AUDIO_GIB" "$AUDIO_TRACKS"
 
-    while IFS= read -r note; do
-        [[ -n "$note" ]] && printf "                     %s\n" "$note"
-    done < <(audio_copy_notes "$IN" "$SOURCE_AUDIO_KBPS")
+        while IFS= read -r note; do
+            [[ -n "$note" ]] && printf "                     %s\n" "$note"
+        done < <(audio_copy_notes "$IN" "$SOURCE_AUDIO_KBPS")
 
-    printf "  Other streams:     ~%s GiB copied\n" \
-        "$OTHER_GIB"
+        printf "  Other streams:     ~%s GiB copied\n" \
+            "$OTHER_GIB"
 
-    printf "  File size:         %s -> ~%s GiB\n" \
-        "$SOURCE_TOTAL_GIB" \
-        "$EXPECTED_TOTAL_GIB"
+        printf "  File size:         %s -> ~%s GiB\n" \
+            "$SOURCE_TOTAL_GIB" \
+            "$EXPECTED_TOTAL_GIB"
 
-    printf "  Dynamic range:     %s\n" "$(hdr_description)"
+        printf "  Dynamic range:     %s\n" "$(hdr_description)"
 
-    HDR_POLICY_LINE=$(hdr_policy_summary)
-    [[ -n "$HDR_POLICY_LINE" ]] &&
-        printf "  HDR metadata:      %s\n" "$HDR_POLICY_LINE"
+        HDR_POLICY_LINE=$(hdr_policy_summary)
+        [[ -n "$HDR_POLICY_LINE" ]] &&
+            printf "  HDR metadata:      %s\n" "$HDR_POLICY_LINE"
 
-    if [[ "$DV_POLICY" == "preserve" ]] && (( DOWNSCALED == 1 )); then
-        echo "  Dolby Vision:      L5 active-area offsets rescaled to ${OUT_WIDTH}x${OUT_HEIGHT}"
+        if [[ "$DV_POLICY" == "preserve" ]] && (( DOWNSCALED == 1 )); then
+            echo "  Dolby Vision:      L5 active-area offsets rescaled to ${OUT_WIDTH}x${OUT_HEIGHT}"
+        fi
+
+        while IFS= read -r note; do
+            [[ -n "$note" ]] && printf "  Chapters:          %s\n" "${note#chapters: }"
+        done < <(chapter_notes "$IN")
+
+        for note in "${MAP_NOTES[@]+"${MAP_NOTES[@]}"}"; do
+            printf "  Streams:           %s\n" "$note"
+        done
+
+        printf "  Output:            %s%s\n" \
+            "$(basename "$OUT")" \
+            "$( (( RESOLVED_OVERWRITE == 1 )) && echo "  [overwrites existing]")"
+
+        echo "------------------------------------------------------------"
+    else
+        case "$VIDEO_SPEC" in
+            crf:*) VIDEO_TEXT=$(ui_bold "CRF $CRF") ;;
+            copy)  VIDEO_TEXT="source video kept" ;;
+            *)     VIDEO_TEXT=$(printf 'two-pass %.2f Mb/s' "$TARGET_MBPS") ;;
+        esac
+
+        echo
+        echo "Added: $BASENAME"
+        printf '  %s | %s | %sx%s | %s | audio copied%s\n' "$TIER" "$VIDEO_TEXT" \
+            "$OUT_WIDTH" "$OUT_HEIGHT" "$(hdr_policy_short)" \
+            "$( [[ "$VIDEO_SPEC" == crf:* ]] && (( ${CRF_OVER_CEILING:-0} == 1 )) && echo " | $(ui_warn "ceiling not met")")"
+        printf '  %-8s%s -> ~%s GiB  (video ~%s, audio %s)\n' "Size:" "$SOURCE_TOTAL_GIB" \
+            "$(awk -v t="$EXPECTED_TOTAL_GIB" 'BEGIN { printf "%.2f", t }')" "$EXPECTED_VIDEO_GIB" "$SOURCE_AUDIO_GIB"
+
+        # only what is lost or dropped (COMPRESS_VERBOSE=1 lists every note)
+        while IFS= read -r note; do
+            [[ "$note" =~ LOST|DROPPED|WARNING|cannot|skipped|missing ]] &&
+                printf '  %s %s\n' "$(ui_warn "Note:")" "$note"
+        done < <(printf '%s\n' "${MAP_NOTES[@]+"${MAP_NOTES[@]}"}"; chapter_notes "$IN")
+
+        printf '  %-8s%s%s\n' "Output:" "$(basename "$OUT")" \
+            "$( (( RESOLVED_OVERWRITE == 1 )) && echo "  [overwrites existing]")"
+        echo
     fi
-
-    while IFS= read -r note; do
-        [[ -n "$note" ]] && printf "  Chapters:          %s\n" "${note#chapters: }"
-    done < <(chapter_notes "$IN")
-
-    for note in "${MAP_NOTES[@]+"${MAP_NOTES[@]}"}"; do
-        printf "  Streams:           %s\n" "$note"
-    done
-
-    printf "  Output:            %s%s\n" \
-        "$(basename "$OUT")" \
-        "$( (( RESOLVED_OVERWRITE == 1 )) && echo "  [overwrites existing]")"
-
-    echo "------------------------------------------------------------"
 
     read -rp "Add another movie? [y/N]: " again
     [[ "$again" =~ ^[Yy]$ ]] || break

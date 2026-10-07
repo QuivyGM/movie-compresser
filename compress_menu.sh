@@ -6,7 +6,7 @@ BASE="$HOME/compress"
 echo
 echo "Compression:"
 echo "1) Movie"
-echo "2) Series / Folder"
+echo "2) Series"
 
 while true; do
     read -rp "Select [1-2]: " choice
