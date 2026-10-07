@@ -432,11 +432,19 @@ crf_policy_lines() {
 
     echo "$tier video policy:"
     if [[ "$tier" == "Custom" ]]; then
-        echo "  CRF: ${CRF_MIN:-entered in the menu} (used exactly; no size ceiling)"
+        if [[ "$scope" == series ]]; then
+            echo "  CRF: exact user CRF${CRF_MIN:+ ($CRF_MIN)}; no High/Base CRF range or size ceiling"
+            echo "  one CRF for every episode of the batch"
+        else
+            echo "  CRF: ${CRF_MIN:-entered in the menu} (used exactly; no size ceiling)"
+        fi
+    elif [[ "$scope" == series ]]; then
+        echo "  CRF range: ${CRF_MIN}-${CRF_MAX} (${CRF_MIN} preferred; raised only while the median episode is above the ceiling)"
+        echo "  nominal video ceiling: ${CRF_CEILING_GIB} GiB/episode (episodes above it are listed, same CRF)"
+        echo "  one CRF for every episode of the batch"
     else
         echo "  CRF range: ${CRF_MIN}-${CRF_MAX} (${CRF_MIN} preferred, raised only to fit the ceiling)"
-        echo "  video size ceiling: ${CRF_CEILING_GIB} GiB$( [[ "$scope" == series ]] && echo " per episode")"
-        [[ "$scope" == series ]] && echo "  one CRF for every episode of the batch"
+        echo "  video size ceiling: ${CRF_CEILING_GIB} GiB"
     fi
     echo "  encode: x265 CRF, single pass, preset slow, 10-bit"
     echo "  audio: copied unchanged"
@@ -635,6 +643,60 @@ series_crf_spread() {
     done
 
     SC_MEDIAN_BYTES=$(_median "${SC_EP_BYTES[@]}")
+}
+
+# series_batch_stats CEILING_BYTES VIDEO_BYTES...
+#
+# Season figures for one CRF. VIDEO_BYTES: estimated video bytes per
+# episode (EP_DUR order). CEILING_BYTES 0 = no ceiling (Custom).
+#
+# Sets:
+#   SB_MEDIAN    median episode video bytes (what the ceiling is checked on)
+#   SB_LARGEST   largest episode video bytes
+#   SB_TOTAL     sum of the episode video bytes
+#   SB_ABOVE     indexes of the episodes above the nominal ceiling
+#   SB_FITS      1 when the median episode fits the ceiling (always 1
+#                without a ceiling)
+series_batch_stats() {
+    local ceil="$1" i
+    shift
+    local vb=("$@")
+
+    SB_ABOVE=()
+    SB_MEDIAN=$(_median "${vb[@]}") || return 1
+    read -r SB_LARGEST SB_TOTAL < <(printf '%s\n' "${vb[@]}" |
+        awk '{ t += $1; if (NR == 1 || $1 > m) m = $1 } END { printf "%.0f %.0f\n", m, t }')
+
+    if (( ceil > 0 )); then
+        for i in "${!vb[@]}"; do
+            (( vb[i] > ceil )) && SB_ABOVE+=("$i")
+        done
+    fi
+
+    SB_FITS=0
+    (( ceil <= 0 || SB_MEDIAN <= ceil )) && SB_FITS=1
+    return 0
+}
+
+# series_crf_analysis_lines  ->  per tried CRF: median / largest episode,
+# episodes above the nominal ceiling, fits or not. Reads CRF_TRIED,
+# CRF_SERIES_EP_BYTES, CRF_CEILING_BYTES, CRF_CEILING_GIB.
+series_crf_analysis_lines() {
+    local c eb
+
+    for c in "${CRF_TRIED[@]}"; do
+        read -ra eb <<< "${CRF_SERIES_EP_BYTES[$c]}"
+        series_batch_stats "${CRF_CEILING_BYTES:-0}" "${eb[@]}" || continue
+        echo "  CRF $c:"
+        echo "    median episode:  $(size_text "$SB_MEDIAN") video"
+        echo "    largest episode: $(size_text "$SB_LARGEST") video"
+        if (( ${CRF_CEILING_BYTES:-0} > 0 )); then
+            echo "    ceiling:         ${CRF_CEILING_GIB} GiB/episode (nominal)"
+            printf '    -> %s; %d of %d episode(s) above the ceiling\n' \
+                "$( (( SB_FITS == 1 )) && echo "median fits" || echo "median above the ceiling")" \
+                "${#SB_ABOVE[@]}" "${#eb[@]}"
+        fi
+    done
 }
 
 # series_size_factor  ->  1 - reserve, for size estimates

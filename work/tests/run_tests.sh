@@ -26,7 +26,9 @@
 #     only audio_compress_menu.sh converts audio
 # 11. CRF tiers: High / Base start at CRF_MIN and step up only while the
 #     sampled video estimate is above the ceiling (stand-in estimator and
-#     real sample encodes); Custom CRF; series use one CRF per batch;
+#     real sample encodes); Custom CRF; series use one CRF per batch
+#     chosen on the median episode (S1-S23: High 18-21 / 5 GiB, Base
+#     24-27 / 1.5 GiB, outliers listed not re-CRF'd, Custom any CRF);
 #     samples follow the output resolution / HDR signalling; ceiling
 #     warning; source-quality guard (keep source video / encode / skip);
 #     estimate vs actual reported; progress-check shows one encode step
@@ -184,12 +186,25 @@ check "default compress.conf loads"           "load_policy 2>'$T/pol.err'"
     # the CRF tier values come from compress.conf
     eq "config: movie High 19-23 / 7 GiB"   "$MOVIE_HIGH_CRF_MIN $MOVIE_HIGH_CRF_MAX $MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB" "19 23 7"
     eq "config: movie Base 25-29 / 2 GiB"   "$MOVIE_BASE_CRF_MIN $MOVIE_BASE_CRF_MAX $MOVIE_BASE_VIDEO_SIZE_CEILING_GIB" "25 29 2"
-    eq "config: series High 19-23 / 7 GiB"  "$SERIES_HIGH_CRF_MIN $SERIES_HIGH_CRF_MAX $SERIES_HIGH_VIDEO_SIZE_CEILING_GIB" "19 23 7"
-    eq "config: series Base 25-29 / 2 GiB"  "$SERIES_BASE_CRF_MIN $SERIES_BASE_CRF_MAX $SERIES_BASE_VIDEO_SIZE_CEILING_GIB" "25 29 2"
+    eq "config: series High 18-21 / 5 GiB"  "$SERIES_HIGH_CRF_MIN $SERIES_HIGH_CRF_MAX $SERIES_HIGH_VIDEO_SIZE_CEILING_GIB" "18 21 5"
+    eq "config: series Base 24-27 / 1.5 GiB" "$SERIES_BASE_CRF_MIN $SERIES_BASE_CRF_MAX $SERIES_BASE_VIDEO_SIZE_CEILING_GIB" "24 27 1.5"
     crf_tier_load movie High
     eq "crf_tier_load movie High"         "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB $CRF_CEILING_BYTES" "19 23 7 $(gib_bytes 7)"
+    crf_tier_load movie Base
+    eq "crf_tier_load movie Base"         "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB $CRF_CEILING_BYTES" "25 29 2 $(gib_bytes 2)"
+    crf_tier_load series High
+    eq "crf_tier_load series High"        "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB $CRF_CEILING_BYTES" "18 21 5 $(gib_bytes 5)"
     crf_tier_load series Base
-    eq "crf_tier_load series Base"        "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB $CRF_CEILING_BYTES" "25 29 2 $(gib_bytes 2)"
+    eq "crf_tier_load series Base"        "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB $CRF_CEILING_BYTES" "24 27 1.5 $(gib_bytes 1.5)"
+    check "series values only in compress.conf, not the series menu" \
+        "! grep -nE 'SERIES_(HIGH|BASE)_[A-Z_]+=|CRF (18|24)-|1\\.5 GiB|\\b(18|21|24|27)\\)' '$SRC_WORK/series_compress.sh'"
+    spl=$(crf_policy_lines series High; crf_policy_lines series Base; crf_policy_lines series Custom)
+    check "series policy lines: High 18-21, nominal 5 GiB/episode" \
+        "grep -q 'CRF range: 18-21' <<< \"\$spl\" && grep -q 'nominal video ceiling: 5 GiB/episode' <<< \"\$spl\""
+    check "series policy lines: Base 24-27, nominal 1.5 GiB/episode" \
+        "grep -q 'CRF range: 24-27' <<< \"\$spl\" && grep -q 'nominal video ceiling: 1.5 GiB/episode' <<< \"\$spl\""
+    check "series policy lines: Custom exact user CRF" "grep -q 'CRF: exact user CRF' <<< \"\$spl\""
+    eq    "series policy lines: audio copied for all 3" "$(grep -c '^  audio: copied unchanged' <<< "$spl")" 3
     crf_tier_load movie Custom 21.5
     eq "crf_tier_load Custom: exact, no ceiling" "$CRF_MIN $CRF_MAX $CRF_CEILING_BYTES" "21.5 21.5 0"
     pl=$(crf_policy_lines movie High)
@@ -428,34 +443,121 @@ echo "== series CRF: one CRF per batch, median episode"
     eq "spread: sources"                         "${SC_EP_FROM[*]}" "sample median sample median sample"
     eq "spread: median episode"                  "$SC_MEDIAN_BYTES" 1620000000
 
-    # 17 crf_series_estimate with stand-in sample encodes: one complex
-    # episode (E3) does not pull the batch to a worse CRF
-    FILES=(/s/E1.mkv /s/E2.mkv /s/E3.mkv /s/E4.mkv /s/E5.mkv); EP_VIDX=(0 0 0 0 0)
-    EP_DUR=(2700 2700 2700 2700 2700)
-    CRF_SERIES_SAMPLED=(0 1 2 3 4); CRF_SERIES_FILTER=""
-    declare -A CRF_SERIES_EP_BYTES=() CRF_SERIES_EP_FROM=()
+    # Series selection through crf_series_estimate with stand-in sample
+    # encodes. SEP[n]: video GiB of episode En (45 min) at the tier's
+    # CRF_MIN; -12 % per CRF step. Records every sampled "CRF episode".
     eval "$(declare -f crf_sample_title | sed '1s/crf_sample_title/_real_crf_sample_title/')"
-    crf_sample_title() {   # E3: 3x the bitrate of the others; -15 % per CRF step
-        local f="$1" crf="$4" base=1.5
-        [[ "$f" == */E3.mkv ]] && base=4.5
+    declare -A SEP=() CRF_SERIES_EP_BYTES=() CRF_SERIES_EP_FROM=()
+    crf_sample_title() {   # FILE VIDX FILTER CRF DURATION POINTS
+        local n="${1##*/E}"
+        n="${n%.mkv}"
+        printf '%s %s %s\n' "$4" "$n" "${3:-none}" >> "$T/series_calls"
         CRF_SAMPLE_SECS=100
-        CRF_SAMPLE_BYTES=$(awk -v b="$base" -v c="$crf" 'BEGIN { printf "%.0f", b * 1073741824 * 0.85 ^ (c - 25) / 27 }')
+        CRF_SAMPLE_BYTES=$(awk -v g="${SEP[$n]}" -v c="$4" -v m="$SEP_CRF0" 'BEGIN { printf "%.0f", g * 1073741824 * 0.88 ^ (c - m) / 27 }')
     }
-    crf_tier_load series Base
-    crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate > "$T/series_sel.out"
-    read -ra eb <<< "${CRF_SERIES_EP_BYTES[$CRF_SELECTED]}"
-    eq "17 series: one CRF for the batch (median fits at 25)" "$CRF_SELECTED/${CRF_TRIED[*]}" "25/25"
-    check "17 series: complex episode above the ceiling, same CRF" "(( ${eb[2]} > CRF_CEILING_BYTES && ${eb[0]} <= CRF_CEILING_BYTES ))"
-    check "17 series: progress per sampled episode" "grep -q 'sampling CRF 25, episode 3/5 (E3.mkv)' '$T/series_sel.out'"
+    # series_sel TIER|Custom:CRF GIB...  ->  one batch, every episode sampled;
+    # sets SEL (CRF/tried/over), EB (episode bytes at the chosen CRF), SB_*
+    series_sel() {
+        local tier="$1" n
+        shift
+        FILES=(); EP_VIDX=(); EP_DUR=(); SEP=(); CRF_SERIES_SAMPLED=()
+        CRF_SERIES_EP_BYTES=(); CRF_SERIES_EP_FROM=(); CRF_SERIES_FILTER="${SERIES_FILTER:-}"
+        for ((n = 1; n <= $#; n++)); do
+            FILES+=("/s/E$n.mkv"); EP_VIDX+=(0); EP_DUR+=(2700); SEP[$n]="${!n}"
+            CRF_SERIES_SAMPLED+=("$((n - 1))")
+        done
+        : > "$T/series_calls"
+        if [[ "$tier" == Custom:* ]]; then
+            crf_tier_load series Custom "${tier#Custom:}"
+            SEP_CRF0="$CRF_MIN"
+            crf_select_exact "$CRF_MIN" crf_series_estimate > "$T/series_sel.out"
+        else
+            crf_tier_load series "$tier"
+            SEP_CRF0="$CRF_MIN"
+            crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate > "$T/series_sel.out"
+        fi
+        SEL="$CRF_SELECTED/${CRF_TRIED[*]}/$CRF_OVER_CEILING"
+        read -ra EB <<< "${CRF_SERIES_EP_BYTES[$CRF_SELECTED]}"
+        series_batch_stats "$CRF_CEILING_BYTES" "${EB[@]}"
+    }
 
-    # median above the ceiling -> the whole batch moves up together
-    crf_sample_title() {
-        CRF_SAMPLE_SECS=100
-        CRF_SAMPLE_BYTES=$(awk -v c="$4" 'BEGIN { printf "%.0f", 3 * 1073741824 * 0.85 ^ (c - 25) / 27 }')
-    }
-    crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate > /dev/null
-    eq "series: median too large -> next CRF for all" "$CRF_SELECTED/${CRF_TRIED[*]}" "28/25 26 27 28"
+    # S1 / S2 High starts at 18; the median fits 5 GiB at 18 -> 18 only
+    series_sel High 3.0 3.5 4.2 4.4 3.8 4.0
+    eq    "S1 series High starts at CRF 18"            "$(head -1 "$T/series_calls" | cut -d' ' -f1)" 18
+    eq    "S2 series High 18 median fits -> 18"        "$SEL" "18/18/0"
+    eq    "S2 nothing above 18 sampled"                "$(cut -d' ' -f1 "$T/series_calls" | sort -u)" 18
+    eq    "S2 every episode sampled at 18"             "$(grep -c '^18 ' "$T/series_calls")" 6
+    check "S2 progress per sampled episode"            "grep -q 'sampling CRF 18, episode 3/6 (E3.mkv)' '$T/series_sel.out'"
+    # S3 18 too large, 19 fits (5.5 -> 4.84 GiB)
+    series_sel High 5.5 5.5 5.5 5.5
+    eq    "S3 series High 18 too large, 19 fits -> 19" "$SEL" "19/18 19/0"
+    # S4 High steps up to 21 (7.0 -> 6.16 -> 5.42 -> 4.77 GiB)
+    series_sel High 7 7 7 7
+    eq    "S4 series High progresses up to 21"         "$SEL" "21/18 19 20 21/0"
+    # S5 21 still too large -> 21, CRF_OVER_CEILING (the menu warns + asks)
+    series_sel High 9 9 9
+    eq    "S5 series High 21 too large -> 21 + warn"   "$SEL" "21/18 19 20 21/1"
+    check "S5 never above CRF_MAX 21"                  "! grep -q '^22 ' '$T/series_calls'"
+    # S6 one outlier (5.8 GiB) does not move the season off 18
+    series_sel High 3.7 4.2 5.8 3.9 4.0 4.1
+    eq    "S6 one outlier: season stays at 18"         "$SEL" "18/18/0"
+    eq    "S6 outlier listed (episode 3)"              "${SB_ABOVE[*]}" 2
+    eq    "S6 largest episode 5.80 GiB"                "$(bytes_to_gib "$SB_LARGEST")" 5.80
+    eq    "S6 median episode 4.05 GiB"                 "$(bytes_to_gib "$SB_MEDIAN")" 4.05
+    # S7 several outliers, median (4.7) still fits
+    series_sel High 5.4 3.0 5.9 3.2 4.0 6.2
+    eq    "S7 multiple outliers: still 18"             "$SEL" "18/18/0"
+    eq    "S7 multiple outliers listed"                "${SB_ABOVE[*]}" "0 2 5"
+    eq    "S7 analysis lines"                          "$(series_crf_analysis_lines | tr -s ' ' | tr '\n' ';')" \
+        " CRF 18:; median episode: 4.70 GiB video; largest episode: 6.20 GiB video; ceiling: 5 GiB/episode (nominal); -> median fits; 3 of 6 episode(s) above the ceiling;"
+    # S8 / S9 Base starts at 24 and keeps it when the median fits 1.5 GiB
+    series_sel Base 0.8 0.9 1.0 1.1 0.7 0.9
+    eq    "S8 series Base starts at CRF 24"            "$(head -1 "$T/series_calls" | cut -d' ' -f1)" 24
+    eq    "S9 series Base 24 median fits -> 24"        "$SEL" "24/24/0"
+    # S10 Base steps up to 27 (2.2 -> 1.94 -> 1.70 -> 1.497 GiB)
+    series_sel Base 2.2 2.2 2.2
+    eq    "S10 series Base progresses up to 27"        "$SEL" "27/24 25 26 27/0"
+    # S11 Base 27 still too large
+    series_sel Base 3 3 3
+    eq    "S11 series Base 27 too large -> 27 + warn"  "$SEL" "27/24 25 26 27/1"
+    check "S11 never above CRF_MAX 27"                 "! grep -q '^28 ' '$T/series_calls'"
+    # S12 / S13 the final CRF is sampled for every episode; one value per batch
+    series_sel High 5.5 2 9 3 5.5
+    eq    "S12 one CRF value for the batch"            "$CRF_SELECTED/$(wc -w <<< "${CRF_SERIES_EP_BYTES[$CRF_SELECTED]}")" "19/5"
+    eq    "S13 each tried CRF covers all episodes"     "$(cut -d' ' -f1 "$T/series_calls" | uniq -c | awk '{ print $2 "x" $1 }' | tr '\n' ' ')" "18x5 19x5 "
+    # S14-S17 Custom: exact CRF for the batch, any range, no ceiling
+    series_sel Custom:16 9 9 9 9 9 9
+    eq    "S14 Custom CRF 16 for the full batch"       "$SEL" "16/16/0"
+    eq    "S14 Custom 16: all 6 episodes sampled at 16" "$(cut -d' ' -f1 "$T/series_calls" | sort | uniq -c | awk '{ print $2 "x" $1 }')" "16x6"
+    series_sel Custom:17 2 3
+    eq    "S15 Custom CRF 17"                          "$SEL" "17/17/0"
+    check "S16 Custom accepts CRFs outside High/Base"  "crf_valid 16 && crf_valid 17 && crf_valid 12 && crf_valid 30 && crf_valid 16.5"
+    series_sel Custom:16 9 9 9 9 9 9
+    eq    "S17 Custom: no ceiling, no outliers"        "$CRF_CEILING_BYTES/${#SB_ABOVE[@]}/$SB_FITS" "0/0/1"
+    check "S17 Custom: estimates still shown"          "grep -q 'sampling CRF 16, episode 6/6 (E6.mkv)' '$T/series_sel.out' && (( SB_MEDIAN > 0 ))"
+    # S20 copied audio is never an input of the selection
+    EP_ABYTES=($(gib_bytes 50) $(gib_bytes 50) $(gib_bytes 50) $(gib_bytes 50))
+    series_sel High 5.5 5.5 5.5 5.5
+    eq    "S20 huge copied audio: same CRF"            "$SEL" "19/18 19/0"
+    unset EP_ABYTES
+    # S22 / S23 samples use the output resolution chosen in the menu
+    SERIES_FILTER="$DOWNSCALE_1080P_FILTER" series_sel High 3 3
+    eq    "S22 downscaled: series samples scaled"      "$(cut -d' ' -f3- "$T/series_calls" | sort -u)" "$DOWNSCALE_1080P_FILTER"
+    SERIES_FILTER="" series_sel High 3 3
+    eq    "S23 original resolution: no scale filter"   "$(cut -d' ' -f3- "$T/series_calls" | sort -u)" "none"
+    # one-episode batch and even-count median
+    series_sel High 6.2 3.6
+    eq    "median of 2 = mean (4.90 fits 5 GiB)"       "$SEL" "18/18/0"
     eval "$(declare -f _real_crf_sample_title | sed '1s/_real_crf_sample_title/crf_sample_title/')"
+    unset -f series_sel
+    unset SEP SEL EB SERIES_FILTER
+
+    # median of the whole batch when only some episodes are sampled
+    EP_DUR=(2700 2700 2700 2700 2700)
+    series_crf_spread 500000 - 600000 - 4000000
+    series_batch_stats "$(gib_bytes 5)" "${SC_EP_BYTES[@]}"
+    eq "batch stats: median / largest / total"   "$SB_MEDIAN/$SB_LARGEST/$SB_TOTAL" "1620000000/10800000000/17010000000"
+    eq "batch stats: outlier from a sampled episode" "${SB_ABOVE[*]}/$SB_FITS" "4/1"
 
     # expected series sizes: copied audio on top, reserve added
     EP_DUR=(3600 1800); EP_VKBPS=(8000 8000); EP_AKBPS=("768 192" "768 192")
@@ -463,7 +565,9 @@ echo "== series CRF: one CRF per batch, median episode"
     series_crf_plan "$(gib_bytes 2)" "$(gib_bytes 1)"
     eq "series plan: video per episode"          "${P_EP_VGIB[*]}" "2.00 1.00"
     eq "series plan: copied audio kb/s"          "${P_EP_AKBPS[0]}" 960
-    eq "series plan: total = (video + audio) / reserve" "${P_EP_GIB[0]}" \
+    eq "S21 series plan: copied audio = actual source bytes" "${P_EP_AGIB[0]}" \
+        "$(awk -v a="${EP_ABYTES[0]}" 'BEGIN { printf "%.2f", a / 1073741824 }')"
+    eq "S21 series plan: total = (video + copied audio) / reserve" "${P_EP_GIB[0]}" \
         "$(awk -v a="${EP_ABYTES[0]}" -v f="$(series_size_factor)" 'BEGIN { printf "%.2f", (2 * 1073741824 + a) / 1073741824 / f }')"
     eq "series plan: totals"                     "$P_VIDEO_GIB/$P_TOTAL_SECONDS" "3.00/5400.000"
     series_crf_plan copy "$(gib_bytes 1)"
@@ -1370,22 +1474,32 @@ if [[ -s "$MH/compress/in/Multi.mkv" ]]; then
     cp "$MH/compress/in/Multi.mkv" "$MH/compress/in/Show/E01.mkv"
     cp "$MH/compress/in/Multi.mkv" "$MH/compress/in/Show/E02.mkv"
     mv "$MH/compress/in/Multi.mkv" "$AC/Multi.mkv"
-    for sel in "1:Base:25" "2:High:19" "3:Custom:24"; do
+    for sel in "1:Base:24" "2:High:18" "3:Custom:16" "3:Custom:17"; do
         k="${sel%%:*}"; t="${sel#*:}"; c="${t#*:}"; t="${t%%:*}"
+        log="$AC/series_$t.log"; [[ $c == 17 ]] && log="$AC/series_Custom17.log"
         rm -f "$MH/compress/work"/series[0-9]*.sh; rm -rf "$MH/compress/out/Show"*
         in="1\n$k\ny\n"; [[ $t == Custom ]] && in="1\n3\n$c\ny\n"
-        menu "$MH/compress/work/series_compress.sh" "$in" "$AC/series_$t.log"
+        menu "$MH/compress/work/series_compress.sh" "$in" "$log"
         job=$(ls "$MH/compress/work"/series[0-9]*.sh 2>/dev/null | head -1)
-        check "acopy $((k + 4)): series $t job written"       "[[ -n '$job' ]]"
-        check "acopy $((k + 4)): series $t copies all audio"  "no_audio_encoding '$job'"
-        check "acopy: series $t table shows copied audio"     "grep -qE 'E0[12].mkv .* copy [0-9]+k' '$AC/series_$t.log'"
-        check "17 series $t: one CRF ($c) for every episode"  "[[ \$(grep -o -- '-crf:v:0 [0-9.]*' '$job' | sort -u) == '-crf:v:0 $c' && \$(grep -c -- '-crf:v:0 $c ' '$job') == 2 ]]"
-        check "19 series $t: no -b:v / passes"                "! grep -qE -- '-b:v|pass=[12]|stats=' '$job' && ! ls -d '$MH/compress/work'/series[0-9]*_passes >/dev/null 2>&1"
+        check "acopy $((k + 4)): series $t $c job written"    "[[ -n '$job' ]]"
+        check "18 series $t $c: copies all audio (-c:a copy)" "no_audio_encoding '$job'"
+        check "21 series $t $c: table shows copied audio + total" "grep -qE '^  E0[12]\\.mkv +[0-9]+:[0-9]{2} +$c +[0-9.]+ +[0-9.]+ +[0-9.]+  (sampled|median) ' '$log'"
+        check "12 series $t: one CRF ($c) for every episode"  "[[ \$(grep -o -- '-crf:v:0 [0-9.]*' '$job' | sort -u) == '-crf:v:0 $c' && \$(grep -c -- '-crf:v:0 $c ' '$job') == 2 ]]"
+        check "19 series $t $c: no -b:v / passes"             "! grep -qE -- '-b:v|pass=[12]|stats=' '$job' && ! ls -d '$MH/compress/work'/series[0-9]*_passes >/dev/null 2>&1"
+        check "series $t $c: selected for all episodes"       "grep -q '^  CRF $c for all 2 episodes' '$log' && grep -q '^  Shared CRF: *$c (every episode)' '$log'"
     done
-    check "acopy: series header: audio copied"         "grep -q '^  audio: copied unchanged' '$AC/series_Base.log' && grep -q '^  all tracks copied unchanged' '$AC/series_Base.log'"
+    check "acopy: series header: audio copied"         "[[ \$(grep -c '^  audio: copied unchanged' '$AC/series_Base.log') -ge 3 ]] && grep -q '^  all tracks copied unchanged' '$AC/series_Base.log'"
+    check "series header: High 18-21 / 5 GiB nominal"  "grep -q 'CRF range: 18-21' '$AC/series_Base.log' && grep -q 'nominal video ceiling: 5 GiB/episode' '$AC/series_Base.log'"
+    check "series header: Base 24-27 / 1.5 GiB nominal" "grep -q 'CRF range: 24-27' '$AC/series_Base.log' && grep -q 'nominal video ceiling: 1.5 GiB/episode' '$AC/series_Base.log'"
+    check "series header: Custom exact user CRF"       "grep -q 'CRF: exact user CRF' '$AC/series_Base.log'"
     check "acopy: series Custom label"                 "grep -q '3) Custom CRF  exactly the CRF you enter' '$AC/series_Custom.log'"
-    check "series Base: batch sampled at 25 only"      "grep -q 'sampling CRF 25, episode 1/2 (E01.mkv)' '$AC/series_Base.log' && grep -q 'sampling CRF 25, episode 2/2 (E02.mkv)' '$AC/series_Base.log' && ! grep -q 'sampling CRF 26' '$AC/series_Base.log'"
-    check "series: one CRF for every episode shown"    "grep -q 'CRF 25 for every episode' '$AC/series_Base.log' && grep -q 'one CRF for every episode of the batch' '$AC/series_Base.log'"
+    check "series Base: batch sampled at 24 only"      "grep -q 'sampling CRF 24, episode 1/2 (E01.mkv)' '$AC/series_Base.log' && grep -q 'sampling CRF 24, episode 2/2 (E02.mkv)' '$AC/series_Base.log' && ! grep -q 'sampling CRF 25' '$AC/series_Base.log'"
+    check "series High: starts at 18, nothing else"    "grep -q 'sampling CRF 18, episode 1/2' '$AC/series_High.log' && ! grep -qE 'sampling CRF (19|2[0-9])' '$AC/series_High.log'"
+    check "series Custom 16: sampled at 16 only"       "grep -q 'sampling CRF 16, episode 2/2' '$AC/series_Custom.log' && [[ \$(grep -oE 'sampling CRF [0-9.]+' '$AC/series_Custom.log' | sort -u) == 'sampling CRF 16' ]]"
+    check "series: one CRF for every episode shown"    "grep -q 'one CRF for every episode of the batch' '$AC/series_Base.log'"
+    check "series summary: median / largest / above"   "grep -q '^  Median episode video: *~' '$AC/series_High.log' && grep -q '^  Largest episode video: *~' '$AC/series_High.log' && grep -q '^  Above nominal ceiling: *0 of 2 episode(s) (5 GiB/episode)' '$AC/series_High.log'"
+    check "series table: header + OK status"           "grep -qE '^  Episode +Runtime +CRF +Video +Audio +Total +Estimate +Status' '$AC/series_High.log' && grep -qE '^  E01\\.mkv .* OK\$' '$AC/series_High.log'"
+    check "series Custom: no ceiling in the summary"   "grep -q 'Above nominal ceiling: *n/a (Custom has no ceiling)' '$AC/series_Custom.log' && ! grep -q 'ABOVE NOMINAL CEILING' '$AC/series_Custom.log'"
     check "acopy: series lists tracks, Atmos PRESERVED" "grep -q 'Audio 1: E-AC-3 5.1(side) + Dolby Atmos' '$AC/series_Custom.log' && grep -q 'Object audio: Dolby Atmos PRESERVED by stream copy' '$AC/series_Custom.log'"
     check "acopy: series no AAC rates / LOST warning"  "! grep -qiE 'kb/s AAC|LOST|Fixed audio total|GiB/hour' '$AC/series_Custom.log'"
     check "acopy: series season totals"                "grep -q 'Copied source audio size: *~' '$AC/series_Custom.log'"
@@ -1674,9 +1788,10 @@ new_home() {
     printf '%s' "$h"
 }
 # av_source VIDEO_ARGS... OUT  ->  2 s 640x360 video + E-AC-3 5.1 + AAC stereo
+# (AV_VIDEO: another lavfi video graph, e.g. a harder-to-encode one)
 av_source() {
     local out="${*: -1}"
-    ffmpeg -v error -y -f lavfi -i "testsrc2=s=640x360:r=24:d=2" -f lavfi -i "sine=f=440:r=48000:d=2" \
+    ffmpeg -v error -y -f lavfi -i "${AV_VIDEO:-testsrc2=s=640x360:r=24:d=2}" -f lavfi -i "sine=f=440:r=48000:d=2" \
         -map 0:v -map 1:a -map 1:a "${@:1:$#-1}" \
         -c:a:0 eac3 -ac:a:0 6 -b:a:0 640k -c:a:1 aac -ac:a:1 2 -b:a:1 128k \
         -metadata:s:a:0 language=eng -metadata:s:a:1 language=eng "$out"
@@ -1791,6 +1906,87 @@ check "5 High: summary says ceiling not met"    "grep -q 'ceiling NOT met' '$T/o
 rm -f "$DH/compress/work"/c[0-9]*.sh
 run_menu "$DH" "$DH/compress/work/movie_compress.sh" "1\n3\n2\nn\n" "$T/over_base.log" "$TINY_CONF"
 check "9 Base: CRF 29 warned, skip -> nothing" "grep -q 'Base CRF range: even CRF 29' '$T/over_base.log' && grep -q 'Nothing queued' '$T/over_base.log' && [[ -z '$(first_job "$DH" c)' ]]"
+
+echo
+echo "== smoke: series High / Base / Custom (real samples, 3 episodes)"
+# E01 / E02 simple, E03 noisy (much larger at the same CRF): the median
+# episode is E01/E02, E03 is the outlier.
+SH=$(new_home series)
+mkdir -p "$SH/compress/in/Show"
+av_source -c:v libx264 -preset ultrafast -qp 0 "$SH/compress/in/Show/E01.mkv"
+cp "$SH/compress/in/Show/E01.mkv" "$SH/compress/in/Show/E02.mkv"
+AV_VIDEO="testsrc2=s=640x360:r=24:d=2,noise=alls=60:allf=t+u" \
+    av_source -c:v libx264 -preset ultrafast -qp 0 "$SH/compress/in/Show/E03.mkv"
+s18=$(WORK_DIR="$SH/compress/work" whole_title_estimate "$SH/compress/in/Show/E01.mkv" 18)
+s19=$(WORK_DIR="$SH/compress/work" whole_title_estimate "$SH/compress/in/Show/E01.mkv" 19)
+n18=$(WORK_DIR="$SH/compress/work" whole_title_estimate "$SH/compress/in/Show/E03.mkv" 18)
+check "series smoke: CRF 19 below CRF 18, noisy E03 largest" "(( s19 < s18 && n18 > s18 ))"
+sjobs() { ls "$SH/compress/work"/series[0-9]*.sh 2>/dev/null | head -1; }
+sclean() { rm -f "$SH/compress/work"/series[0-9]*.sh; rm -rf "$SH/compress/out"/Show*; }
+crfs_in() { grep -o -- '-crf:v:0 [0-9.]*' "$1" | sort | uniq -c | awk '{ print $3 "x" $1 }' | tr '\n' ' '; }
+
+# High, default 5 GiB ceiling: CRF 18 selected immediately; job run end to end
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n2\ny\n" "$T/ss_high18.log"
+sj=$(sjobs)
+sed -n '/^CRF analysis/,/^Season totals/p' "$T/ss_high18.log" | sed 's/^/  | /'
+check "smoke series High: CRF 18 immediately"  "grep -q '^  CRF 18 for all 3 episodes' '$T/ss_high18.log' && ! grep -qE 'sampling CRF (19|2[0-9])' '$T/ss_high18.log'"
+eq    "smoke series High: one CRF 18 job x3"   "$(crfs_in "$sj")" "18x3 "
+bash "$sj" < /dev/null > "$T/ss_high18_run.log" 2>&1
+check "smoke series High: single pass, CRF 18" "[[ \$(grep -c 'ENCODING (single pass, CRF 18)' '$T/ss_high18_run.log') == 3 ]] && ! grep -qE 'PASS [12]/2' '$T/ss_high18_run.log'"
+check "smoke series High: audio stream copy verified" "[[ \$(grep -cE 'Audio track 1: *COPIED \\(E-AC-3 .*payload MD5 MATCH' '$T/ss_high18_run.log') == 3 && \$(grep -cE 'Audio track 2: *COPIED \\(AAC .*payload MD5 MATCH' '$T/ss_high18_run.log') == 3 ]]"
+check "smoke series High: estimate vs actual logged" "[[ \$(grep -c 'Estimated video size: ' '$T/ss_high18_run.log') == 3 ]]"
+check "smoke series High: all 3 ok"            "grep -q 'All encodes finished: 3 ok, 0 failed' '$T/ss_high18_run.log'"
+eq    "smoke series High: outputs HEVC 10-bit" "$(for f in "$SH/compress/out"/Show*/*.mkv; do ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,pix_fmt -of csv=p=0 "$f"; done | sort -u)" "hevc,yuv420p10le"
+
+# High, ceiling between the CRF 18 and 19 median estimates: 18 fails, 19 fits
+sclean
+ceil=$(awk -v a="$s18" -v b="$s19" 'BEGIN { printf "%.12f", (a + b) / 2 / 1073741824 }')
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n2\nn\n" "$T/ss_high19.log" "$(conf_with ssh19 "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")"
+check "smoke series High: 18 too large, 19 fits" "grep -q 'sampling CRF 19, episode 3/3' '$T/ss_high19.log' && ! grep -q 'sampling CRF 20' '$T/ss_high19.log' && grep -q '^  CRF 19 for all 3 episodes' '$T/ss_high19.log'"
+check "smoke series High: analysis shows 18 median above" "grep -A4 '^  CRF 18:' '$T/ss_high19.log' | grep -q 'median above the ceiling'"
+
+# High, ceiling between the median (E01/E02) and the noisy E03 at 18:
+# one outlier above the ceiling, season stays at 18
+sclean
+ceil=$(awk -v a="$s18" -v b="$n18" 'BEGIN { printf "%.12f", (a + b) / 2 / 1073741824 }')
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n2\ny\n" "$T/ss_outlier.log" "$(conf_with ssout "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")"
+sed -n '/^Expected sizes:/,/^  ABOVE NOMINAL/p' "$T/ss_outlier.log" | sed 's/^/  | /'
+check "smoke series outlier: season stays at 18" "grep -q '^  CRF 18 for all 3 episodes' '$T/ss_outlier.log' && ! grep -q 'sampling CRF 19' '$T/ss_outlier.log'"
+check "smoke series outlier: warning, 1 episode" "grep -q 'Warning: 1 episode is estimated above the nominal' '$T/ss_outlier.log' && grep -qE '^  E03\\.mkv +~[0-9.]+ GiB video, \\+' '$T/ss_outlier.log'"
+check "smoke series outlier: table marks only E03" "grep -qE '^  E03\\.mkv .* ABOVE NOMINAL CEILING\$' '$T/ss_outlier.log' && [[ \$(grep -c ' ABOVE NOMINAL CEILING\$' '$T/ss_outlier.log') == 1 ]]"
+check "smoke series outlier: summary counts it"  "grep -q 'Above nominal ceiling: *1 of 3 episode(s)' '$T/ss_outlier.log' && ! grep -q 'cannot be met' '$T/ss_outlier.log'"
+eq    "smoke series outlier: E03 also CRF 18"    "$(crfs_in "$(sjobs)")" "18x3 "
+
+# Base, default 1.5 GiB ceiling: CRF 24 immediately
+sclean
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n1\ny\n" "$T/ss_base.log"
+check "smoke series Base: CRF 24 immediately"  "grep -q '^  CRF 24 for all 3 episodes' '$T/ss_base.log' && ! grep -qE 'sampling CRF 2[5-9]' '$T/ss_base.log'"
+eq    "smoke series Base: one CRF 24 job x3"   "$(crfs_in "$(sjobs)")" "24x3 "
+
+# Custom CRF 16 (below the High range)
+sclean
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n3\n16\ny\n" "$T/ss_c16.log"
+check "smoke series Custom 16: selected"       "grep -q '^  CRF 16 for all 3 episodes' '$T/ss_c16.log' && [[ \$(grep -oE 'sampling CRF [0-9.]+' '$T/ss_c16.log' | sort -u) == 'sampling CRF 16' ]]"
+eq    "smoke series Custom 16: job x3"         "$(crfs_in "$(sjobs)")" "16x3 "
+check "smoke series Custom 16: copies audio"   "no_audio_encoding '$(sjobs)'"
+
+# nominal ceiling unreachable within the range: CRF_MAX + warning + confirmation
+sclean
+SS_TINY=$(conf_with sstiny SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=0.000000001 SERIES_BASE_VIDEO_SIZE_CEILING_GIB=0.000000001)
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n2\n1\nn\n" "$T/ss_over_high.log" "$SS_TINY"
+eq    "series High over: 18..21 sampled, not 22" "$(grep -oE 'sampling CRF [0-9]+, episode 3/3' "$T/ss_over_high.log" | cut -d' ' -f3 | tr -d , | tr '\n' ' ')" "18 19 20 21 "
+check "series High over: warns, asks, CRF 21"   "grep -q 'cannot be met' '$T/ss_over_high.log' && grep -q 'allowed High quality range: even CRF 21' '$T/ss_over_high.log' && grep -q '1) Encode every episode at CRF 21 anyway' '$T/ss_over_high.log' && grep -q '^  CRF 21 for all 3 episodes' '$T/ss_over_high.log'"
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n1\n2\n" "$T/ss_over_base.log" "$SS_TINY"
+check "series Base over: CRF 27 warned, cancel" "grep -q 'allowed Base quality range: even CRF 27' '$T/ss_over_base.log' && grep -q 'Compression cancelled' '$T/ss_over_base.log' && [[ -z \"\$(sjobs)\" ]]"
+
+# output resolution: 1080-class downscale vs original 4K (series samples)
+mkdir -p "$SH/compress/in/UHDShow"
+cp "$T/uhd.mkv" "$SH/compress/in/UHDShow/E01.mkv"
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "2\n2\n3\n20\nn\nn\n" "$T/ss_uhd_down.log"
+check "22 series downscale: estimate at 1920x960" "grep -q 'Estimating video size from sample encodes (1 of 1 episodes, 1920x960 output, downscaled like the final encode)' '$T/ss_uhd_down.log'"
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "2\n1\n3\n20\nn\nn\n" "$T/ss_uhd_keep.log"
+check "23 series 4K kept: estimate at 3840x1920"  "grep -q 'Estimating video size from sample encodes (1 of 1 episodes, 3840x1920 output)' '$T/ss_uhd_keep.log'"
+unset -f sjobs sclean crfs_in
 
 echo
 echo "== source-quality guard (source already below the CRF demand)"

@@ -21,12 +21,14 @@ source "$WORK_DIR/lib/policy.sh"
 # Base / High: x265 CRF, ONE CRF for every episode of the batch: the
 #              lowest CRF of SERIES_*_CRF_MIN..MAX whose median episode
 #              video estimate fits SERIES_*_VIDEO_SIZE_CEILING_GIB
-# Custom:      user-entered CRF, used exactly
+#              (a nominal per-episode ceiling, not a target)
+# Custom:      user-entered CRF, used exactly for every episode (no
+#              High/Base range or ceiling)
 #
-# Episodes estimated above the ceiling keep the batch CRF (consistent
-# quality) and are listed. An episode whose estimate is not below its
-# source video is only re-encoded when the user chooses so (or its
-# source video is kept / it is skipped).
+# Episodes estimated above the nominal ceiling keep the batch CRF
+# (consistent quality) and are listed as outliers. An episode whose
+# estimate is not below its source video is only re-encoded when the
+# user chooses so (or its source video is kept / it is skipped).
 #
 # Every audio track is copied unchanged (codec, bitrate, channels,
 # Atmos / DTS:X, titles, flags) and comes on top of the video size;
@@ -39,7 +41,7 @@ if ! load_policy; then
 fi
 
 echo "Policy: $(policy_conf_path)"
-for t in High Base; do
+for t in High Base Custom; do
     echo
     crf_policy_lines series "$t"
 done
@@ -327,10 +329,10 @@ per_file() {
 echo
 echo "Compression tier:"
 crf_tier_load series Base
-echo "1) Base        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_CEILING_GIB} GiB per episode (audio copied)"
+echo "1) Base        CRF ${CRF_MIN}-${CRF_MAX}, nominal video ceiling ${CRF_CEILING_GIB} GiB/episode (audio copied unchanged)"
 crf_tier_load series High
-echo "2) High        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_CEILING_GIB} GiB per episode (audio copied)"
-echo "3) Custom CRF  exactly the CRF you enter (no ceiling; audio copied)"
+echo "2) High        CRF ${CRF_MIN}-${CRF_MAX}, nominal video ceiling ${CRF_CEILING_GIB} GiB/episode (audio copied unchanged)"
+echo "3) Custom CRF  exactly the CRF you enter, any 0-${CRF_LIMIT} (no range or ceiling; audio copied unchanged)"
 
 CUSTOM_CRF=""
 
@@ -394,21 +396,31 @@ CRF="$CRF_SELECTED"
 read -ra EP_EST <<< "${CRF_SERIES_EP_BYTES[$CRF]}"
 read -ra EP_FROM <<< "${CRF_SERIES_EP_FROM[$CRF]}"
 
+# season figures at the batch CRF (audio is never part of them)
+series_batch_stats "$CRF_CEILING_BYTES" "${EP_EST[@]}"
+ABOVE=("${SB_ABOVE[@]+"${SB_ABOVE[@]}"}")
+EST_MEDIAN="$SB_MEDIAN"
+EST_LARGEST="$SB_LARGEST"
+
 echo
-echo "CRF analysis (median episode video):"
-crf_analysis_lines
+echo "CRF analysis (video only; copied audio is not part of the choice):"
+series_crf_analysis_lines
 
 echo
 echo "Selected:"
-echo "  CRF $CRF for every episode"
-echo "  median episode video: ~$(size_text "${CRF_EST[$CRF]}")"
+echo "  CRF $CRF for all ${FILE_COUNT} episodes"
+echo "  median episode video:  ~$(size_text "$EST_MEDIAN")"
+echo "  largest episode video: ~$(size_text "$EST_LARGEST")"
+if [[ "$TIER" != "Custom" ]]; then
+    echo "  nominal ceiling:       ${CRF_CEILING_GIB} GiB/episode"
+fi
 
 if (( CRF_OVER_CEILING == 1 )); then
     echo
     echo "------------------------------------------------------------"
-    echo "WARNING: the ${CRF_CEILING_GIB} GiB per-episode video ceiling cannot be met within"
-    echo "the ${TIER} CRF range: even CRF ${CRF_MAX} (the lowest quality ${TIER} allows) gives"
-    echo "a median episode of ~$(bytes_to_gib "${CRF_EST[$CRF]}") GiB video, ~$(crf_oversize_gib "${CRF_EST[$CRF]}" "$CRF_CEILING_BYTES") GiB above the ceiling."
+    echo "WARNING: the nominal ${CRF_CEILING_GIB} GiB per-episode video ceiling cannot be met"
+    echo "within the allowed ${TIER} quality range: even CRF ${CRF_MAX} (the lowest quality ${TIER}"
+    echo "allows) gives a median episode of ~$(bytes_to_gib "$EST_MEDIAN") GiB video, ~$(crf_oversize_gib "$EST_MEDIAN" "$CRF_CEILING_BYTES") GiB above the ceiling."
     echo "------------------------------------------------------------"
     echo "1) Encode every episode at CRF ${CRF_MAX} anyway"
     echo "2) Cancel"
@@ -423,24 +435,23 @@ if (( CRF_OVER_CEILING == 1 )); then
     done
 fi
 
-# Episodes above the per-episode ceiling at the batch CRF: reported, not
-# given a different CRF (consistent quality across the season).
-if [[ "$TIER" != "Custom" ]]; then
-    ABOVE=()
-    for i in "${!FILES[@]}"; do
-        (( EP_EST[$i] > CRF_CEILING_BYTES )) && ABOVE+=("$i")
-    done
-
-    if (( ${#ABOVE[@]} )) && (( CRF_OVER_CEILING == 0 )); then
-        echo
-        echo "Note: ${#ABOVE[@]} episode(s) estimated above the ${CRF_CEILING_GIB} GiB ceiling at CRF ${CRF};"
-        echo "they keep CRF ${CRF} like the rest of the season (consistent quality):"
-        for i in "${ABOVE[@]}"; do
-            printf "  %-40.40s ~%s GiB video (%s)\n" "$(basename "${FILES[$i]}")" \
-                "$(bytes_to_gib "${EP_EST[$i]}")" \
-                "$( [[ "${EP_FROM[$i]}" == sample ]] && echo "sampled" || echo "median bitrate")"
-        done
+# Episodes above the nominal per-episode ceiling at the batch CRF:
+# listed as outliers, not given a different CRF (consistent quality
+# across the season). Custom has no ceiling.
+if (( ${#ABOVE[@]} )); then
+    echo
+    if (( ${#ABOVE[@]} == 1 )); then
+        echo "Warning: 1 episode is estimated above the nominal ${CRF_CEILING_GIB} GiB ceiling."
+    else
+        echo "Warning: ${#ABOVE[@]} episodes are estimated above the nominal ${CRF_CEILING_GIB} GiB ceiling."
     fi
+    echo "They keep CRF ${CRF} like the rest of the season (consistent quality):"
+    for i in "${ABOVE[@]}"; do
+        printf "  %-40.40s ~%s GiB video, +%s GiB (%s)\n" "$(basename "${FILES[$i]}")" \
+            "$(bytes_to_gib "${EP_EST[$i]}")" \
+            "$(crf_oversize_gib "${EP_EST[$i]}" "$CRF_CEILING_BYTES")" \
+            "$( [[ "${EP_FROM[$i]}" == sample ]] && echo "sampled" || echo "median bitrate")"
+    done
 fi
 
 # ============================================================
@@ -523,7 +534,7 @@ if [[ "$TIER" == "Custom" ]]; then
     echo "Video encode:         x265 CRF ${CRF}, single pass, every episode (entered CRF)"
 else
     echo "Video encode:         x265 CRF ${CRF}, single pass, every episode"
-    echo "                      (${TIER}: CRF ${CRF_MIN}-${CRF_MAX}, ${CRF_CEILING_GIB} GiB video ceiling per episode$( (( CRF_OVER_CEILING == 1 )) && echo "; ceiling NOT met"))"
+    echo "                      (${TIER}: CRF ${CRF_MIN}-${CRF_MAX}, ${CRF_CEILING_GIB} GiB/episode nominal video ceiling$( (( CRF_OVER_CEILING == 1 )) && echo "; ceiling NOT met"))"
 fi
 echo "Resolution:           ${WIDTH}x${HEIGHT} -> ${OUT_WIDTH}x${OUT_HEIGHT}"
 echo "Dynamic range:        $(hdr_description)"
@@ -556,33 +567,45 @@ echo "------------------------------------------------------------"
 # SIZE PREVIEW
 # ============================================================
 
+declare -A IS_ABOVE=() IS_GUARD=()
+for i in "${ABOVE[@]+"${ABOVE[@]}"}"; do IS_ABOVE[$i]=1; done
+for i in "${GUARD[@]+"${GUARD[@]}"}"; do IS_GUARD[$i]=1; done
+
 echo
 echo "Expected sizes:"
 echo
-printf "  %-36s %7s  %-16s %-14s %9s %9s %9s\n" \
-    "Episode" "Minutes" "Video" "Audio" "Video" "Audio" "Total"
+printf "  %-32s %7s %5s %7s %7s %7s  %-8s %s\n" \
+    "Episode" "Runtime" "CRF" "Video" "Audio" "Total" "Estimate" "Status"
 
 for i in "${!FILES[@]}"; do
+    ccol="$CRF"
     if (( EP_GUARD_SKIP[$i] == 1 )); then
-        vcol="skipped"
+        ccol="-"; ecol="-"; status="SKIPPED (source-quality guard)"
     elif [[ "${EP_VIDEO[$i]}" == "copy" ]]; then
-        vcol="source (copy)"
-    elif [[ "${EP_FROM[$i]}" == "sample" ]]; then
-        vcol="CRF $CRF sampled"
+        ccol="copy"; ecol="source"; status="SOURCE VIDEO KEPT"
     else
-        vcol="CRF $CRF (median)"
+        [[ "${EP_FROM[$i]}" == "sample" ]] && ecol="sampled" || ecol="median"
+        if [[ -n "${IS_ABOVE[$i]:-}" ]]; then
+            status="ABOVE NOMINAL CEILING"
+        else
+            status="OK"
+        fi
+        [[ -n "${IS_GUARD[$i]:-}" ]] && status+=" (not below source; encode anyway)"
     fi
 
-    printf "  %-36.36s %7s  %-16s %-14.14s %9s %9s %9s\n" \
+    printf "  %-32.32s %7s %5s %7s %7s %7s  %-8s %s\n" \
         "$(basename "${FILES[$i]}")" \
-        "$(awk -v d="${EP_DUR[$i]}" 'BEGIN { printf "%.1f", d / 60 }')" \
-        "$vcol" \
-        "copy ${P_EP_AKBPS[$i]}k" \
-        "~${P_EP_VGIB[$i]}" "~${P_EP_AGIB[$i]}" "~${P_EP_GIB[$i]}"
+        "$(awk -v d="${EP_DUR[$i]}" 'BEGIN { printf "%d:%02d", int(d / 60), int(d % 60) }')" \
+        "$ccol" "${P_EP_VGIB[$i]}" "${P_EP_AGIB[$i]}" "${P_EP_GIB[$i]}" "$ecol" "$status"
 done
-echo "  (sizes in GiB; video sizes are estimates from sample encodes)"
-echo "  sampled  = this episode was sample-encoded"
-echo "  (median) = not sampled; median sampled video bitrate x its runtime"
+echo "  (runtime m:ss; sizes in GiB; video = estimate from sample encodes;"
+echo "   audio = actual size of all copied source audio tracks;"
+echo "   total = video + audio + ~${SERIES_CONTAINER_RESERVE_PCT}% container/subtitles)"
+echo "  sampled = this episode was sample-encoded"
+echo "  median  = not sampled; median sampled video bitrate x its runtime"
+if [[ "$TIER" != "Custom" ]]; then
+    echo "  ABOVE NOMINAL CEILING = video estimate above ${CRF_CEILING_GIB} GiB; still CRF ${CRF}"
+fi
 
 # Stream / title / chapter handling, shown for the first episode (the
 # same rules apply to every episode; each output is verified).
@@ -603,9 +626,18 @@ fi
 
 echo
 echo "Season totals (${FILE_COUNT} files):"
+printf "  Shared CRF:                 %s (every episode)\n" "$CRF"
 printf "  Total runtime:              %s hours (%s min)\n" \
     "$(awk -v s="$P_TOTAL_SECONDS" 'BEGIN { printf "%.2f", s / 3600 }')" \
     "$(awk -v s="$P_TOTAL_SECONDS" 'BEGIN { printf "%.0f", s / 60 }')"
+printf "  Median episode video:       ~%s GiB\n" "$(bytes_to_gib "$EST_MEDIAN")"
+printf "  Largest episode video:      ~%s GiB\n" "$(bytes_to_gib "$EST_LARGEST")"
+if [[ "$TIER" == "Custom" ]]; then
+    printf "  Above nominal ceiling:      n/a (Custom has no ceiling)\n"
+else
+    printf "  Above nominal ceiling:      %d of %d episode(s) (%s GiB/episode)\n" \
+        "${#ABOVE[@]}" "$FILE_COUNT" "$CRF_CEILING_GIB"
+fi
 printf "  Expected total video size:  ~%s GiB\n" "$P_VIDEO_GIB"
 printf "  Copied source audio size:   ~%s GiB\n" "$P_AUDIO_GIB"
 printf "  Expected total output size: ~%s GiB  (incl. ~%s%% container/subtitles)\n" \
