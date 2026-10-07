@@ -157,6 +157,18 @@ inspect_file() {
     row "Duration" "$(format_hms "$dur")"
     row "Resolution" "${res:-N/A}"
     row "Video codec" "${codec:-N/A}"
+    if [[ "$codec" == hevc* ]]; then
+        # rate control from the x265 settings in the stream (CRF tiers:
+        # single-pass CRF; Quality: two-pass bitrate)
+        local rc
+        rc=$(x265_rate_control "$file" "$vidx")
+        case "$rc" in
+            "")        ;;
+            "crf "*)   row "Video encode" "x265 CRF ${rc#crf } (single pass)" ;;
+            "2pass "*) row "Video encode" "x265 two-pass, ${rc#2pass } kb/s" ;;
+            *)         row "Video encode" "x265 ${rc}" ;;
+        esac
+    fi
     probe_hdr "$file" "$vidx"
     row "Dynamic range" "$(hdr_description)"
     row "Video" "$(rate_size "$vbytes" "$dur" "$approx")"

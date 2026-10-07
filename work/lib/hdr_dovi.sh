@@ -7,8 +7,9 @@
 #   1. RPU extracted from the source with dovi_tool (profile 7 -> 8.1
 #      with mode 2); L5 active-area offsets rescaled when the video is
 #      downscaled
-#   2. x265 encodes the base layer exactly like a non-DV encode (two
-#      pass), pass 2 writes raw HEVC; ffmpeg's own RPU writing is off
+#   2. x265 encodes the base layer exactly like a non-DV encode (single
+#      pass CRF, or two-pass for Quality); the final encode writes raw
+#      HEVC; ffmpeg's own RPU writing is off
 #   3. dovi_tool inject-rpu puts the RPU back (frame counts must match)
 #   4. mkvmerge wraps the HEVC with the source frame timestamps and
 #      writes the DV configuration record; ffmpeg then muxes it with all
@@ -868,6 +869,58 @@ item_verify_output() {
                 fi
                 unset -n sv ov
             done
+        fi
+
+        # ---- video stream properties (as planned by the job)
+        local sv_codec sv_w sv_h sv_pix ov_codec ov_w ov_h ov_pix
+        IFS=, read -r sv_codec sv_w sv_h sv_pix < <(ffprobe -v error -select_streams "$vidx" \
+            -show_entries stream=codec_name,width,height,pix_fmt -of csv=p=0 "$src" 2>/dev/null | head -n 1)
+        IFS=, read -r ov_codec ov_w ov_h ov_pix < <(ffprobe -v error -select_streams "${ovidx:-0}" \
+            -show_entries stream=codec_name,width,height,pix_fmt -of csv=p=0 "$out" 2>/dev/null | head -n 1)
+        line="${ov_codec:-?} ${ov_w:-?}x${ov_h:-?} ${ov_pix:-?}"
+
+        # rate control as written by x265 into the stream ("" = unknown)
+        local rc="" rc_bad=""
+        [[ "$video" != "copy" ]] && rc=$(x265_rate_control "$out" "${ovidx:-0}")
+        case "${ITEM_EXP[mode]:-}:$rc" in
+            *:) ;;
+            crf:"crf "*)
+                awk -v a="${rc#crf }" -v b="${ITEM_EXP[crf]:-}" 'BEGIN { exit !(a + 0 == b + 0) }' ||
+                    rc_bad="x265 CRF ${rc#crf }, planned ${ITEM_EXP[crf]:-?}"
+                ;;
+            crf:*)   rc_bad="x265 rate control '$rc', planned CRF ${ITEM_EXP[crf]:-?}" ;;
+            abr:"2pass "*) ;;
+            abr:*)   rc_bad="x265 rate control '$rc', planned two-pass" ;;
+        esac
+
+        if [[ "$video" == "copy" ]]; then
+            if [[ "$ov_codec $ov_w $ov_h $ov_pix" == "$sv_codec $sv_w $sv_h $sv_pix" ]]; then
+                _rep "Video stream" "COPIED ($line, as the source)" >&3
+            else
+                _rep "Video stream" "CHANGED although it was to be copied: ${sv_codec}/${sv_w}x${sv_h}/${sv_pix} -> ${line// //}" >&3
+                fails+=("video stream not copied unchanged")
+            fi
+        elif [[ "$ov_codec" != "hevc" || "$ov_pix" != "yuv420p10le" ]]; then
+            _rep "Video stream" "NOT AS PLANNED ($line; planned hevc yuv420p10le)" >&3
+            fails+=("video stream is $ov_codec/$ov_pix, not HEVC 10-bit")
+        elif (( scaled == 0 )) && [[ "$ov_w" != "$sv_w" || "$ov_h" != "$sv_h" ]]; then
+            _rep "Video stream" "NOT AS PLANNED (${ov_w}x${ov_h}; planned source resolution ${sv_w}x${sv_h})" >&3
+            fails+=("resolution changed without scaling")
+        elif (( scaled == 1 )) &&
+             { [[ ! "$ov_w" =~ ^[0-9]+$ || ! "$ov_h" =~ ^[0-9]+$ ]] || (( ov_w > 1920 || ov_h > 1080 )); }; then
+            _rep "Video stream" "NOT AS PLANNED (${ov_w}x${ov_h}; planned within 1920x1080)" >&3
+            fails+=("scaled output is not within 1080p")
+        elif [[ -n "$rc_bad" ]]; then
+            _rep "Video stream" "NOT AS PLANNED ($rc_bad)" >&3
+            fails+=("video encode mode not as planned: $rc_bad")
+        else
+            line+="$( (( scaled == 1 )) && echo ", scaled from ${sv_w}x${sv_h}")"
+            case "$rc" in
+                "crf "*)   line+=", CRF ${rc#crf } (single pass)" ;;
+                "2pass "*) line+=", two-pass ${rc#2pass } kb/s" ;;
+                *)         [[ -n "${ITEM_EXP[crf]:-}" ]] && line+=", CRF ${ITEM_EXP[crf]}" ;;
+            esac
+            _rep "Video stream" "AS PLANNED ($line)" >&3
         fi
     fi
 

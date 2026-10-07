@@ -6,7 +6,8 @@
 #  1. bash -n on every script
 #  2. unit: audio title rewriting / false-claim detection (Atmos, DTS:X,
 #     codec names, bitrates, commentary text kept)
-#  3. SDR source, audio copied: plain two-pass job (no DV steps); tracks,
+#  3. SDR source, audio copied: two-pass job (Quality path, no DV
+#     steps) and single-pass CRF job (High / Base / Custom path); tracks,
 #     flags, languages, titles (unchanged), chapters, attachments kept
 #  4. HDR10 source: HDR10 metadata kept; all audio copied unchanged and
 #     verified (codec / layout / payload hash)
@@ -23,6 +24,13 @@
 #     or sources a running compression job is reading)
 # 10. movie / series menus copy every audio track (all tiers, Custom);
 #     only audio_compress_menu.sh converts audio
+# 11. CRF tiers: High / Base start at CRF_MIN and step up only while the
+#     sampled video estimate is above the ceiling (stand-in estimator and
+#     real sample encodes); Custom CRF; series use one CRF per batch;
+#     samples follow the output resolution / HDR signalling; ceiling
+#     warning; source-quality guard (keep source video / encode / skip);
+#     estimate vs actual reported; progress-check shows one encode step
+# 12. HDR10 / HDR10+ (needs hdr10plus_tool) / Dolby Vision on the CRF path
 #
 # Runs in a temporary copy of work/ so real logs/jobs are untouched.
 # Everything here is synthetic: it proves the mechanics, not behaviour
@@ -133,16 +141,6 @@ command -v mkvmerge >/dev/null && command -v mkvextract >/dev/null &&
 echo
 echo "== policy: compress.conf loading and validation"
 
-# expected values are computed from the config, not hardcoded
-exp_rate() {   # gib_per_hour max dur [source_gib]  ->  High/Base target Mb/s
-    awk -v r="$1" -v m="$2" -v d="$3" -v s="${4:-0}" 'BEGIN {
-        g = sprintf("%.3f", r * d / 3600) + 0   # the plan sizes in 0.001 GiB steps
-        if (s > 0 && s < g) g = s
-        t = g * 1073741824 * 8 / d / 1000000
-        if (m > 0 && t > m) t = m
-        printf "%.3f", t }'
-}
-
 # Quality: max(hours * GiB/hour, min GiB), min(source), cap at max Mb/s
 exp_quality() {   # dur [source_gib]  ->  target Mb/s from the loaded config
     awk -v r="$MOVIE_QUALITY_VIDEO_GIB_PER_HOUR" -v n="$MOVIE_QUALITY_VIDEO_MIN_GIB" \
@@ -158,33 +156,47 @@ gib_bytes() { awk -v g="$1" 'BEGIN { printf "%.0f", g * 1073741824 }'; }
 check "default compress.conf loads"           "load_policy 2>'$T/pol.err'"
 {
     load_policy 2>/dev/null
-    for tier in High Base; do
-        u=${tier^^}; g="MOVIE_${u}_VIDEO_GIB_PER_HOUR"; m="MOVIE_${u}_VIDEO_MAX_MBPS"
-        for dur in 1800 5400 9000 20000; do
-            movie_video_plan "$tier" "$dur"
-            eq "movie $tier ${dur}s target from config" "$PLAN_TARGET_MBPS" "$(exp_rate "${!g}" "${!m}" "$dur")"
-        done
-    done
-
     for dur in 3600 6000 10800 20000; do
         movie_video_plan Quality "$dur"
         eq "movie Quality ${dur}s target from config" "$PLAN_TARGET_MBPS" "$(exp_quality "$dur")"
     done
     movie_video_plan Quality 5400
     eq "movie Quality 90 min not below floor" "$PLAN_BELOW_FLOOR" 0
+    check "movie_video_plan is Quality-only"  "! movie_video_plan High 7200 2>/dev/null"
 
-    for tier in Quality High Base; do
+    for tier in Quality High Base Custom; do
         check "movie $tier policy: audio copied" "[[ \"\$(movie_policy_line $tier)\" == *'; audio copied' ]]"
     done
     check "no movie/series audio policy functions left" \
         "! declare -F movie_aac_kbps movie_audio_cap_gib build_audio_args series_aac_kbps >/dev/null"
+    check "no High/Base size-target functions left" \
+        "! declare -F series_video_plan series_plan series_episode_video_kbps series_gib_per_hour >/dev/null"
     check "no movie/series AAC settings in the config" \
         "! grep -qE '^(MOVIE|SERIES)_[A-Z_]*(AAC|AUDIO)' '$SRC_WORK/lib/compress.conf'"
+    check "no High/Base GiB/hour settings in the config" \
+        "! grep -qE '^(MOVIE|SERIES)_(HIGH|BASE)_VIDEO_(GIB_PER_HOUR|FLOOR_MBPS|MAX_MBPS)=' '$SRC_WORK/lib/compress.conf'"
     check "audio menu settings still in the config" \
         "grep -q '^AUDIO_HIGH_KBPS_5TO6=' '$SRC_WORK/lib/compress.conf' && grep -q '^AUDIO_COMPACT_LIMIT_GIB=' '$SRC_WORK/lib/compress.conf'"
     eq "series reserve from config"       "$(series_size_factor)" \
         "$(awk -v r="$SERIES_CONTAINER_RESERVE_PCT" 'BEGIN { printf "%.6f", (100 - r) / 100 }')"
     eq "audio menu High 5.1 from config"  "$(audio_menu_high_kbps 6)" "$AUDIO_HIGH_KBPS_5TO6"
+
+    # the CRF tier values come from compress.conf
+    eq "config: movie High 19-23 / 7 GiB"   "$MOVIE_HIGH_CRF_MIN $MOVIE_HIGH_CRF_MAX $MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB" "19 23 7"
+    eq "config: movie Base 25-29 / 2 GiB"   "$MOVIE_BASE_CRF_MIN $MOVIE_BASE_CRF_MAX $MOVIE_BASE_VIDEO_SIZE_CEILING_GIB" "25 29 2"
+    eq "config: series High 19-23 / 7 GiB"  "$SERIES_HIGH_CRF_MIN $SERIES_HIGH_CRF_MAX $SERIES_HIGH_VIDEO_SIZE_CEILING_GIB" "19 23 7"
+    eq "config: series Base 25-29 / 2 GiB"  "$SERIES_BASE_CRF_MIN $SERIES_BASE_CRF_MAX $SERIES_BASE_VIDEO_SIZE_CEILING_GIB" "25 29 2"
+    crf_tier_load movie High
+    eq "crf_tier_load movie High"         "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB $CRF_CEILING_BYTES" "19 23 7 $(gib_bytes 7)"
+    crf_tier_load series Base
+    eq "crf_tier_load series Base"        "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB $CRF_CEILING_BYTES" "25 29 2 $(gib_bytes 2)"
+    crf_tier_load movie Custom 21.5
+    eq "crf_tier_load Custom: exact, no ceiling" "$CRF_MIN $CRF_MAX $CRF_CEILING_BYTES" "21.5 21.5 0"
+    pl=$(crf_policy_lines movie High)
+    check "policy lines: CRF range + ceiling" \
+        "grep -q 'CRF range: 19-23 (19 preferred' <<< \"\$pl\" && grep -q 'video size ceiling: 7 GiB' <<< \"\$pl\" && grep -q 'audio: copied unchanged' <<< \"\$pl\""
+    check "policy lines: no 'minimum quality' wording" \
+        "! { crf_policy_lines movie High; crf_policy_lines series Base; movie_policy_line High; } | grep -qi 'minimum quality'"
 }
 
 # changing compress.conf changes the calculated targets
@@ -200,121 +212,8 @@ conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the default config
 }
 
 {
-    load_policy 2>/dev/null
-    # High / Base: GiB/hour, no minimum size (fixed values, not the defaults)
-    for tier in High Base; do
-        u=${tier^^}
-        if [[ $tier == High ]]; then r=3.0 f=6 m=10 r2=4 big=10; else r=1.25 f=2.5 m=5 r2=2 big=4; fi
-        COMPRESS_CONF=$(conf_with "hb$tier" MOVIE_${u}_VIDEO_GIB_PER_HOUR=$r \
-            MOVIE_${u}_VIDEO_FLOOR_MBPS=$f MOVIE_${u}_VIDEO_MAX_MBPS=0)
-        load_policy 2>/dev/null
-
-        # 1 / 7 / 8: normal GiB/hour calculation (no max, large source)
-        for h in 1.5 2 2.5 3; do
-            dur=$(awk -v h="$h" 'BEGIN { printf "%.0f", h * 3600 }')
-            want=$(awk -v r="$r" -v h="$h" 'BEGIN { printf "%.3f", r * h }')
-            movie_video_plan "$tier" "$dur" "$(gib_bytes 60)"
-            eq "$tier ${h} h: $want GiB video"     "$PLAN_TARGET_GIB" "$want"
-            eq "$tier ${h} h: bitrate from size"   "$PLAN_TARGET_MBPS" "$(bitrate_for_gib "$want" "$dur")"
-        done
-        movie_video_plan "$tier" 7200
-        eq "$tier 2 h: no minimum size"         "$PLAN_MIN_GIB" ""
-        eq "$tier 2 h: not limited"             "$PLAN_SOURCE_LIMITED/$PLAN_MAX_LIMITED/$PLAN_BELOW_FLOOR" "0/0/0"
-
-        # 2 source video smaller than the rate-based target (bitrate above the floor)
-        if [[ $tier == High ]]; then small=5.500; else small=2.300; fi
-        movie_video_plan "$tier" 7200 "$(gib_bytes "$small")"
-        eq "$tier source: source size wins"     "$PLAN_TARGET_GIB" "$small"
-        eq "$tier source: flagged as limited"   "$PLAN_SOURCE_LIMITED/$PLAN_SOURCE_BELOW_FLOOR" "1/0"
-        eq "$tier source: bitrate from source"  "$PLAN_TARGET_MBPS" "$(bitrate_for_gib "$small" 7200)"
-
-        # source bitrate vs floor (2 h; bytes for an exact Mb/s over 7200 s)
-        mbps_bytes() { awk -v x="$1" 'BEGIN { printf "%.0f", x * 1000000 / 8 * 7200 }'; }
-        half=$(awk -v f="$f" 'BEGIN { printf "%.3f", f / 2 }')
-        fl=$(awk -v f="$f" 'BEGIN { printf "%.3f", f }')
-
-        # S1 source below floor, GiB/hour target below the source -> source wins
-        COMPRESS_CONF=$(conf_with "hbsrc$tier" MOVIE_${u}_VIDEO_GIB_PER_HOUR=0.1 \
-            MOVIE_${u}_VIDEO_FLOOR_MBPS=$f MOVIE_${u}_VIDEO_MAX_MBPS=$m)
-        load_policy 2>/dev/null
-        movie_video_plan "$tier" 7200 "$(mbps_bytes "$half")"
-        eq "$tier S1 src<floor, rate<src: source bitrate" "$PLAN_TARGET_MBPS" "$half"
-        eq "$tier S1 src<floor, rate<src: flagged" "$PLAN_SOURCE_BELOW_FLOOR" 1
-        # S5 no floor conflict when the source itself is below the floor
-        eq "$tier S5 src<floor: no conflict"    "$PLAN_BELOW_FLOOR" 0
-
-        # S2 source below floor, GiB/hour target above the source -> source wins
-        COMPRESS_CONF=$(conf_with "hbsrc2$tier" MOVIE_${u}_VIDEO_GIB_PER_HOUR=$big \
-            MOVIE_${u}_VIDEO_FLOOR_MBPS=$f MOVIE_${u}_VIDEO_MAX_MBPS=0)
-        load_policy 2>/dev/null
-        movie_video_plan "$tier" 7200 "$(mbps_bytes "$half")"
-        eq "$tier S2 src<floor, rate>src: source bitrate" "$PLAN_TARGET_MBPS" "$half"
-        eq "$tier S2 src<floor, rate>src: no conflict" "$PLAN_SOURCE_BELOW_FLOOR/$PLAN_BELOW_FLOOR" "1/0"
-
-        # S3 source equal to the floor -> normal path (low rate -> conflict)
-        COMPRESS_CONF=$(conf_with "hbsrc3$tier" MOVIE_${u}_VIDEO_GIB_PER_HOUR=0.1 \
-            MOVIE_${u}_VIDEO_FLOOR_MBPS=$f MOVIE_${u}_VIDEO_MAX_MBPS=$m)
-        load_policy 2>/dev/null
-        movie_video_plan "$tier" 7200 "$(mbps_bytes "$fl")"
-        eq "$tier S3 src=floor: not below floor" "$PLAN_SOURCE_BELOW_FLOOR" 0
-        eq "$tier S3 src=floor: GiB/hour target" "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 0.2 7200)"
-        eq "$tier S3 src=floor: floor conflict"  "$PLAN_BELOW_FLOOR" 1
-
-        # S4 source above the floor -> GiB/hour logic unchanged
-        COMPRESS_CONF=$(conf_with "hbsrc4$tier" MOVIE_${u}_VIDEO_GIB_PER_HOUR=$r \
-            MOVIE_${u}_VIDEO_FLOOR_MBPS=$f MOVIE_${u}_VIDEO_MAX_MBPS=$m)
-        load_policy 2>/dev/null
-        movie_video_plan "$tier" 7200 "$(mbps_bytes "$(awk -v f="$f" 'BEGIN { print f * 2 }')")"
-        want=$(awk -v r="$r" 'BEGIN { printf "%.3f", r * 2 }')
-        eq "$tier S4 src>floor: GiB/hour size"   "$PLAN_TARGET_GIB" "$want"
-        eq "$tier S4 src>floor: bitrate"         "$PLAN_TARGET_MBPS" "$(bitrate_for_gib "$want" 7200)"
-        eq "$tier S4 src>floor: no flags"        "$PLAN_SOURCE_BELOW_FLOOR/$PLAN_SOURCE_LIMITED/$PLAN_BELOW_FLOOR" "0/0/0"
-
-        # Quality is unchanged: a source below its floor still gets the size target
-        COMPRESS_CONF=$(conf_with "qsrc$tier" MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=0.1 MOVIE_QUALITY_VIDEO_MIN_GIB=0.1 \
-            MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=0)
-        load_policy 2>/dev/null
-        movie_video_plan Quality 7200 "$(mbps_bytes 6)"
-        eq "Quality src<floor: size target kept" "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 0.2 7200)"
-        eq "Quality src<floor: conflict as before" "$PLAN_BELOW_FLOOR" 1
-
-        # 3 nonzero bitrate max limits the result
-        COMPRESS_CONF=$(conf_with "hbmax$tier" MOVIE_${u}_VIDEO_GIB_PER_HOUR=$big \
-            MOVIE_${u}_VIDEO_FLOOR_MBPS=$f MOVIE_${u}_VIDEO_MAX_MBPS=$m)
-        load_policy 2>/dev/null
-        movie_video_plan "$tier" 7200 "$(gib_bytes 60)"
-        eq "$tier max: capped at $m Mb/s"        "$PLAN_TARGET_MBPS" "$(awk -v m="$m" 'BEGIN { printf "%.3f", m }')"
-        eq "$tier max: flagged as limited"      "$PLAN_MAX_LIMITED" 1
-
-        # 4 calculated bitrate below the floor -> conflict, floor not forced
-        COMPRESS_CONF=$(conf_with "hbfloor$tier" MOVIE_${u}_VIDEO_GIB_PER_HOUR=0.5 \
-            MOVIE_${u}_VIDEO_FLOOR_MBPS=$f MOVIE_${u}_VIDEO_MAX_MBPS=$m)
-        load_policy 2>/dev/null
-        movie_video_plan "$tier" 7200 "$(gib_bytes 60)"
-        eq "$tier floor: below floor -> asks"   "$PLAN_BELOW_FLOOR" 1
-        eq "$tier floor: target not raised"     "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 1 7200)"
-        eq "$tier floor: floor offered"         "$PLAN_FLOOR_MBPS" "$f"
-
-        # 6 changing GiB/hour changes the target
-        COMPRESS_CONF=$(conf_with "hbrate$tier" MOVIE_${u}_VIDEO_GIB_PER_HOUR=$r2 \
-            MOVIE_${u}_VIDEO_FLOOR_MBPS=$f MOVIE_${u}_VIDEO_MAX_MBPS=0)
-        load_policy 2>/dev/null
-        movie_video_plan "$tier" 7200 "$(gib_bytes 60)"
-        eq "$tier edited GiB/hour: $r2 * 2 h"   "$PLAN_TARGET_GIB" "$(awk -v r="$r2" 'BEGIN { printf "%.3f", r * 2 }')"
-    done
-
-    # default config: High 2 h -> 6 GiB, Base 2 h -> 2.5 GiB before caps
-    COMPRESS_CONF="$T/compress.conf"
-    load_policy 2>/dev/null
-    movie_video_plan High 7200;  eq "default High 2 h rate-based 6 GiB"   "$PLAN_RATE_GIB" 6.000
-    movie_video_plan Base 7200;  eq "default Base 2 h rate-based 2.5 GiB" "$PLAN_RATE_GIB" 2.500
-
-    COMPRESS_CONF=$(conf_with nomax MOVIE_HIGH_VIDEO_MAX_MBPS=0 MOVIE_HIGH_VIDEO_GIB_PER_HOUR=40)
-    load_policy 2>/dev/null
-    movie_video_plan High 5400
-    eq "MAX_MBPS=0: size decides"         "$PLAN_TARGET_MBPS" "$(exp_rate 40 0 5400)"
-
-    # Quality: GiB/hour with a minimum size (fixed values, not the defaults)
+    # Quality: two-pass GiB/hour with a minimum size (unchanged policy;
+    # fixed values, not the defaults)
     COMPRESS_CONF=$(conf_with q MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=8.4 MOVIE_QUALITY_VIDEO_MIN_GIB=20 \
         MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=0)
     load_policy 2>/dev/null
@@ -350,6 +249,15 @@ conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the default config
     check "Q7 GBH: ~28.6 Mb/s"            "awk -v x='$PLAN_TARGET_MBPS' 'BEGIN { exit !(x > 28.5 && x < 28.7) }'"
     eq "Q7 GBH: expected size ~20 GiB"    "$(video_size_gib "$PLAN_TARGET_MBPS" 6000)" 20.000
 
+    # Quality: a source below its floor still gets the size target
+    mbps_bytes() { awk -v x="$1" 'BEGIN { printf "%.0f", x * 1000000 / 8 * 7200 }'; }
+    COMPRESS_CONF=$(conf_with qsrc MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=0.1 MOVIE_QUALITY_VIDEO_MIN_GIB=0.1 \
+        MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=0)
+    load_policy 2>/dev/null
+    movie_video_plan Quality 7200 "$(mbps_bytes 6)"
+    eq "Quality src<floor: size target kept" "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 0.2 7200)"
+    eq "Quality src<floor: conflict as before" "$PLAN_BELOW_FLOOR" 1
+
     # 4 nonzero bitrate max limits the calculated bitrate
     COMPRESS_CONF=$(conf_with qmax MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=8.4 MOVIE_QUALITY_VIDEO_MIN_GIB=20 \
         MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=25)
@@ -382,151 +290,185 @@ conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the default config
     eq "Q6 edited GiB/hour: 12 * 3 h"     "$PLAN_TARGET_GIB" 36.000
     eq "Q6 edited GiB/hour: bitrate"      "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 36 10800)"
 
-    COMPRESS_CONF=$(conf_with series SERIES_BASE_VIDEO_GIB_PER_HOUR=2.5)
+    # edited CRF settings are used
+    COMPRESS_CONF=$(conf_with crfedit MOVIE_HIGH_CRF_MIN=18 MOVIE_HIGH_CRF_MAX=22 MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=9.5)
     load_policy 2>/dev/null
-    eq "edited series GiB/hour"           "$(series_gib_per_hour Base)" 2.5
+    crf_tier_load movie High
+    eq "edited High CRF settings"         "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB" "18 22 9.5"
 
     # a config still setting the former audio policy loads, with a note
     COMPRESS_CONF=$(conf_with retired MOVIE_HIGH_AUDIO_MAX_GIB=2 SERIES_HIGH_AAC_KBPS_6=640)
     check "retired audio settings: still loads"   "load_policy 2>'$T/retired.err'"
     check "retired audio settings: named as ignored" \
         "grep -q 'ignored' '$T/retired.err' && grep -q MOVIE_HIGH_AUDIO_MAX_GIB '$T/retired.err' && grep -q SERIES_HIGH_AAC_KBPS_6 '$T/retired.err'"
+
+    # ... and the former High/Base GiB/hour settings, with a note
+    COMPRESS_CONF=$(conf_with retiredv MOVIE_HIGH_VIDEO_GIB_PER_HOUR=3.0 SERIES_BASE_VIDEO_FLOOR_MBPS=2.5)
+    check "retired GiB/hour settings: still loads" "load_policy 2>'$T/retiredv.err'"
+    check "retired GiB/hour settings: named as ignored" \
+        "grep -q 'High/Base size-target' '$T/retiredv.err' && grep -q MOVIE_HIGH_VIDEO_GIB_PER_HOUR '$T/retiredv.err' && grep -q SERIES_BASE_VIDEO_FLOOR_MBPS '$T/retiredv.err'"
+}
+COMPRESS_CONF="$T/compress.conf"
+load_policy 2>/dev/null
+
+# ------------------------------------------------------------
+echo
+echo "== CRF selection (estimates from a stand-in estimator)"
+{
+    # fake_est CRF: estimated video GiB per CRF from FAKE[crf]; records calls
+    declare -A FAKE=()
+    CALLS=()
+    fake_est() { CALLS+=("$1"); CRF_EST_RESULT=$(gib_bytes "${FAKE[$1]:-999}"); }
+    run_sel() {   # SCOPE TIER "crf=GiB ..."  ->  crf_select with that table
+        local kv
+        FAKE=(); CALLS=()
+        for kv in $3; do FAKE[${kv%%=*}]="${kv#*=}"; done
+        crf_tier_load "$1" "$2"
+        crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" fake_est
+    }
+
+    # 1 / 2 High starts at CRF 19; 19 fits under 7 GiB -> 19, nothing else tried
+    run_sel movie High "19=4.5 20=4.0"
+    eq "1 High starts at CRF 19"                 "${CALLS[0]}" 19
+    eq "2 High 19 fits (4.5 GiB) -> CRF 19"      "$CRF_SELECTED/${CRF_TRIED[*]}/$CRF_OVER_CEILING" "19/19/0"
+    eq "10 High never tries below 19 (no 18)"    "$(printf '%s\n' "${CALLS[@]}" | sort -n | head -1)" 19
+    run_sel movie High "19=7 20=6"
+    eq "High: exactly at the ceiling fits"       "$CRF_SELECTED" 19
+
+    # 3 19 too large, 20 fits -> 20
+    run_sel movie High "19=8.6 20=6.9 21=6.0"
+    eq "3 High 19 too large, 20 fits -> 20"      "$CRF_SELECTED/${CRF_TRIED[*]}" "20/19 20"
+    # spec example: 8.6 / 7.4 / 6.5 -> 21
+    run_sel movie High "19=8.6 20=7.4 21=6.5 22=5.9"
+    eq "High 8.6/7.4/6.5 -> lowest fitting 21"   "$CRF_SELECTED/${CRF_TRIED[*]}" "21/19 20 21"
+    eq "High: estimates kept per CRF"            "$(crf_analysis_lines | tr -s ' ' | tr '\n' ';')" \
+        " CRF 19 -> estimated 8.60 GiB video; CRF 20 -> estimated 7.40 GiB video; CRF 21 -> estimated 6.50 GiB video;"
+
+    # 4 continues through 23
+    run_sel movie High "19=12 20=11 21=10 22=9 23=6.9"
+    eq "4 High continues through 23"             "$CRF_SELECTED/${CRF_TRIED[*]}/$CRF_OVER_CEILING" "23/19 20 21 22 23/0"
+
+    # 5 / 12 23 still too large -> 23, warned, never 24
+    run_sel movie High "19=12 20=11 21=10 22=9 23=8.1 24=1"
+    eq "5 High 23 too large -> 23 + over ceiling" "$CRF_SELECTED/$CRF_OVER_CEILING" "23/1"
+    eq "12 High never exceeds 23"                "$(printf '%s\n' "${CALLS[@]}" | sort -n | tail -1)" 23
+    eq "5 oversize reported"                     "$(crf_oversize_gib "${CRF_EST[23]}" "$CRF_CEILING_BYTES")" "1.10"
+
+    # 6 / 7 Base starts at 25; 25 fits under 2 GiB -> 25
+    run_sel movie Base "25=1.5 26=1.2"
+    eq "6 Base starts at CRF 25"                 "${CALLS[0]}" 25
+    eq "7 Base 25 fits -> 25, no 26+"            "$CRF_SELECTED/${CRF_TRIED[*]}" "25/25"
+    eq "11 Base never tries below 25"            "$(printf '%s\n' "${CALLS[@]}" | sort -n | head -1)" 25
+
+    # 8 Base increases up through 29 as needed
+    for want in 26 27 28 29; do
+        tbl=""
+        for c in 25 26 27 28 29; do
+            if (( c < want )); then tbl+="$c=3 "; else tbl+="$c=1.9 "; fi
+        done
+        run_sel movie Base "$tbl"
+        eq "8 Base first fit at $want -> $want"  "$CRF_SELECTED/$CRF_OVER_CEILING" "$want/0"
+    done
+
+    # 9 / 12 29 still too large -> 29, warned, never 30
+    run_sel movie Base "25=5 26=4.5 27=4 28=3.5 29=3 30=1"
+    eq "9 Base 29 too large -> 29 + over ceiling" "$CRF_SELECTED/$CRF_OVER_CEILING" "29/1"
+    eq "12 Base never exceeds 29"                "$(printf '%s\n' "${CALLS[@]}" | sort -n | tail -1)" 29
+
+    # 13 audio is not part of the selection: 6.5 GiB video fits 7 GiB even
+    # when copied audio makes the file far larger
+    run_sel movie High "19=6.5"
+    eq "13 audio ignored: CRF 19 kept"           "$CRF_SELECTED" 19
+    total=$(crf_total_bytes "${CRF_EST[19]}" "$(gib_bytes 4)" "$(gib_bytes 0.1)")
+    check "13 total above the ceiling, CRF unchanged" "(( $total > CRF_CEILING_BYTES )) && [[ $CRF_SELECTED == 19 ]]"
+    # 14 copied audio + other streams added to the total preview
+    eq "14 total = video + audio + other"        "$total" "$(( $(gib_bytes 6.5) + $(gib_bytes 4) + $(gib_bytes 0.1) ))"
+    eq "14 unknown audio counts as 0"            "$(crf_total_bytes 100 N/A 5)" 105
+
+    # 18 Custom: exactly the entered CRF, one estimate
+    FAKE=([24]=50); CALLS=()
+    crf_select_exact 24 fake_est
+    eq "18 Custom exact CRF 24, one estimate"    "$CRF_SELECTED/${CALLS[*]}/$CRF_OVER_CEILING" "24/24/0"
+    check "Custom CRF validation"                "crf_valid 0 && crf_valid 21 && crf_valid 20.5 && crf_valid 51 && ! crf_valid 52 && ! crf_valid -1 && ! crf_valid abc && ! crf_valid ''"
+
+    # an estimator failure stops the selection
+    bad_est() { return 1; }
+    check "estimate failure -> no CRF"           "! crf_select 19 23 1 bad_est && [[ -z \$CRF_SELECTED ]]"
+
+    # source-quality guard
+    check "guard: estimate >= source"            "crf_above_source 100 100 && crf_above_source 101 100"
+    check "guard: estimate < source"             "! crf_above_source 99 100"
+    check "guard: unknown source -> no guard"    "! crf_above_source 99 N/A && ! crf_above_source 99 0"
+
+    # sample sections: spread 10..90 %, never past the end; short titles whole
+    eq "sample points: 2 h, 5 x 20 s"            "$(crf_sample_points 7200 5 20 | tr '\n' ';')" \
+        "710.000 20.000;2150.000 20.000;3590.000 20.000;5030.000 20.000;6470.000 20.000;"
+    eq "sample points: one point at 50 %"        "$(crf_sample_points 1000 1 20)" "490.000 20.000"
+    eq "sample points: short title sampled whole" "$(crf_sample_points 150 5 20)" "0.000 150.000"
+    eq "extrapolation: bitrate x runtime"        "$(crf_extrapolate 1000000 100 7200)" 72000000
+    eq "estimate error +6.3%"                    "$(estimate_error_pct 6871947674 7301444403)" "+6.2%"
+    eq "estimate error -10.0%"                   "$(estimate_error_pct 1000 900)" "-10.0%"
+    eq "size_text MiB below 0.1 GiB"             "$(size_text 2097152)" "0.00 GiB (2.0 MiB)"
+    unset -f fake_est bad_est run_sel
 }
 
 # ------------------------------------------------------------
 echo
-echo "== series policy: video GiB/hour, copied audio on top"
+echo "== series CRF: one CRF per batch, median episode"
 {
-    # series_plan inputs (normally filled by series_compress.sh)
-    set_eps() {   # SOURCE_VIDEO_KBPS DURATION...
-        local src="$1" i=0 d
-        shift
-        EP_DUR=(); EP_VKBPS=(); EP_AKBPS=(); EP_ABYTES=()
-        for d in "$@"; do
-            # copied source audio: 768 + 192 kb/s (E-AC-3 5.1 + stereo)
-            EP_DUR[$i]="$d"; EP_VKBPS[$i]="$src"; EP_AKBPS[$i]="768 192"
-            EP_ABYTES[$i]=$(awk -v d="$d" 'BEGIN { printf "%.0f", 960 * 1000 / 8 * d }')
-            ((i += 1))
-        done
+    eq "sample episodes: 10 -> 4 spread"         "$(series_sample_episodes 10 4 | tr '\n' ' ')" "0 3 6 9 "
+    eq "sample episodes: 3 of 4 -> all"          "$(series_sample_episodes 3 4 | tr '\n' ' ')" "0 1 2 "
+    eq "sample episodes: 1 wanted -> middle"     "$(series_sample_episodes 9 1)" 4
+
+    # spread: unsampled episodes get the median sampled bitrate
+    EP_DUR=(2700 2700 2700 2700 2700)
+    series_crf_spread 500000 - 600000 - 4000000
+    eq "spread: median sampled rate"             "$SC_MEDIAN_RATE" 600000.000
+    eq "spread: per-episode bytes"               "${SC_EP_BYTES[*]}" "1350000000 1620000000 1620000000 1620000000 10800000000"
+    eq "spread: sources"                         "${SC_EP_FROM[*]}" "sample median sample median sample"
+    eq "spread: median episode"                  "$SC_MEDIAN_BYTES" 1620000000
+
+    # 17 crf_series_estimate with stand-in sample encodes: one complex
+    # episode (E3) does not pull the batch to a worse CRF
+    FILES=(/s/E1.mkv /s/E2.mkv /s/E3.mkv /s/E4.mkv /s/E5.mkv); EP_VIDX=(0 0 0 0 0)
+    EP_DUR=(2700 2700 2700 2700 2700)
+    CRF_SERIES_SAMPLED=(0 1 2 3 4); CRF_SERIES_FILTER=""
+    declare -A CRF_SERIES_EP_BYTES=() CRF_SERIES_EP_FROM=()
+    eval "$(declare -f crf_sample_title | sed '1s/crf_sample_title/_real_crf_sample_title/')"
+    crf_sample_title() {   # E3: 3x the bitrate of the others; -15 % per CRF step
+        local f="$1" crf="$4" base=1.5
+        [[ "$f" == */E3.mkv ]] && base=4.5
+        CRF_SAMPLE_SECS=100
+        CRF_SAMPLE_BYTES=$(awk -v b="$base" -v c="$crf" 'BEGIN { printf "%.0f", b * 1073741824 * 0.85 ^ (c - 25) / 27 }')
     }
+    crf_tier_load series Base
+    crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate > "$T/series_sel.out"
+    read -ra eb <<< "${CRF_SERIES_EP_BYTES[$CRF_SELECTED]}"
+    eq "17 series: one CRF for the batch (median fits at 25)" "$CRF_SELECTED/${CRF_TRIED[*]}" "25/25"
+    check "17 series: complex episode above the ceiling, same CRF" "(( ${eb[2]} > CRF_CEILING_BYTES && ${eb[0]} <= CRF_CEILING_BYTES ))"
+    check "17 series: progress per sampled episode" "grep -q 'sampling CRF 25, episode 3/5 (E3.mkv)' '$T/series_sel.out'"
 
-    for tier in High Base; do
-        u=${tier^^}
-        if [[ $tier == High ]]; then r=3.0 f=6 m=10 kb=7158 big=10 r2=4 fk=6000
-        else                         r=1.25 f=2.5 m=5 kb=2983 big=4 r2=2 fk=2500; fi
-        COMPRESS_CONF=$(conf_with "s$tier" SERIES_${u}_VIDEO_GIB_PER_HOUR=$r \
-            SERIES_${u}_VIDEO_FLOOR_MBPS=$f SERIES_${u}_VIDEO_MAX_MBPS=$m)
-        load_policy 2>/dev/null
+    # median above the ceiling -> the whole batch moves up together
+    crf_sample_title() {
+        CRF_SAMPLE_SECS=100
+        CRF_SAMPLE_BYTES=$(awk -v c="$4" 'BEGIN { printf "%.0f", 3 * 1073741824 * 0.85 ^ (c - 25) / 27 }')
+    }
+    crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate > /dev/null
+    eq "series: median too large -> next CRF for all" "$CRF_SELECTED/${CRF_TRIED[*]}" "28/25 26 27 28"
+    eval "$(declare -f _real_crf_sample_title | sed '1s/_real_crf_sample_title/crf_sample_title/')"
 
-        # 1 GiB/hour -> fixed bitrate
-        set_eps 50000 3600
-        series_video_plan "$tier"
-        eq "series $tier: $r GiB/hour = $kb kb/s"   "$SPLAN_TARGET_KBPS" "$kb"
-        eq "series $tier: = gib_per_hour_to_kbps"   "$SPLAN_TARGET_KBPS" "$(gib_per_hour_to_kbps "$r")"
-        eq "series $tier: floor / max in kb/s"      "$SPLAN_FLOOR_KBPS/$SPLAN_MAX_KBPS" "$fk/$(_mbps_to_kbps "$m")"
-        eq "series $tier: no conflict, no max"      "$SPLAN_BELOW_FLOOR/$SPLAN_MAX_LIMITED" "0/0"
-
-        # 2 expected video sizes per runtime; bitrate does not depend on runtime
-        if [[ $tier == High ]]; then
-            mins=(30 45 60 90);             want=(1.50 2.25 3.00 4.50)
-        else
-            mins=(30 40 45 50 60 75 90);    want=(0.63 0.83 0.94 1.04 1.25 1.56 1.88)
-        fi
-        set_eps 50000 $(for x in "${mins[@]}"; do echo $((x * 60)); done)
-        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
-        for i in "${!mins[@]}"; do
-            eq "series $tier ${mins[$i]} min: ~${want[$i]} GiB video" "${P_EP_VGIB[$i]}" "${want[$i]}"
-        done
-        eq "series $tier: same bitrate every runtime" \
-            "$(printf '%s\n' "${P_EP_VKBPS[@]}" | sort -u)" "$kb"
-
-        # 3 copied audio does not reduce the video bitrate (13)
-        EP_ABYTES[0]=$(( 40 * 1073741824 )); EP_AKBPS[0]="18000 18000 18000"
-        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
-        many="${P_EP_VKBPS[0]}/$P_VIDEO_KBPS/${P_EP_VGIB[0]}"
-        EP_ABYTES[0]=1000; EP_AKBPS[0]="64"
-        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
-        eq "series $tier: huge vs tiny audio, same video" "$many" "${P_EP_VKBPS[0]}/$P_VIDEO_KBPS/${P_EP_VGIB[0]}"
-        eq "series $tier: video kb/s ignores audio"   "${many%%/*}" "$kb"
-
-        # 4 / 12 copied audio: actual source bytes on top of the video size
-        set_eps 50000 3600
-        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
-        ab=$(awk 'BEGIN { printf "%.0f", 960 * 1000 / 8 * 3600 }')
-        eq "series $tier: audio size = source bytes"  "${P_EP_AGIB[0]}" "$(awk -v a="$ab" 'BEGIN { printf "%.2f", a / 1073741824 }')"
-        eq "series $tier: copied audio kb/s shown"    "${P_EP_AKBPS[0]}" 960
-        eq "series $tier: video size unchanged"       "${P_EP_VGIB[0]}" "${want[$(( ${#want[@]} > 4 ? 4 : 2 ))]}"
-        eq "series $tier: total = video + audio (+reserve)" "${P_EP_GIB[0]}" \
-            "$(awk -v v="$kb" -v a="$ab" -v f="$(series_size_factor)" 'BEGIN { printf "%.2f", (v * 1000 / 8 * 3600 + a) / 1073741824 / f }')"
-        eq "series $tier: season totals"              "$P_VIDEO_GIB/$P_AUDIO_GIB/$P_TOTAL_SECONDS" \
-            "${P_EP_VGIB[0]}/${P_EP_AGIB[0]}/3600.000"
-        EP_ABYTES[0]=N/A
-        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
-        eq "series $tier: no bytes -> from source kb/s" "${P_EP_AGIB[0]}" "$(awk 'BEGIN { printf "%.2f", 960 * 1000 / 8 * 3600 / 1073741824 }')"
-
-        # 5 source below the floor -> source bitrate, no conflict
-        half=$(( fk / 2 ))
-        set_eps "$half" 3600 3600
-        series_video_plan "$tier"
-        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
-        eq "series $tier src<floor: source bitrate"   "${P_EP_VKBPS[0]}/${P_EP_VNOTE[0]}" "$half/floor"
-        eq "series $tier src<floor: counted"          "$P_SRC_BELOW_FLOOR" 2
-        COMPRESS_CONF=$(conf_with "slow$tier" SERIES_${u}_VIDEO_GIB_PER_HOUR=0.1 \
-            SERIES_${u}_VIDEO_FLOOR_MBPS=$f SERIES_${u}_VIDEO_MAX_MBPS=$m)
-        load_policy 2>/dev/null
-        series_video_plan "$tier"
-        eq "series $tier src<floor, target<src: no conflict" "$SPLAN_BELOW_FLOOR" 0
-        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
-        eq "series $tier src<floor, target<src: source wins" "${P_EP_VKBPS[1]}" "$half"
-
-        # 6 source at/above the floor, GiB/hour bitrate below it -> conflict
-        set_eps "$fk" 3600
-        series_video_plan "$tier"
-        eq "series $tier src=floor, target<floor: conflict" "$SPLAN_BELOW_FLOOR" 1
-        set_eps 50000 3600
-        series_video_plan "$tier"
-        eq "series $tier src>floor, target<floor: conflict" "$SPLAN_BELOW_FLOOR" 1
-        eq "series $tier conflict: target not raised" "$SPLAN_TARGET_KBPS" "$(gib_per_hour_to_kbps 0.1)"
-        set_eps 50000 3600 3600; EP_VKBPS[1]="$half"
-        series_video_plan "$tier"
-        series_plan "$SPLAN_FLOOR_KBPS" "$SPLAN_FLOOR_KBPS"
-        eq "series $tier mixed: floor chosen / low source kept" \
-            "$SPLAN_BELOW_FLOOR ${P_EP_VKBPS[0]} ${P_EP_VKBPS[1]}" "1 $fk $half"
-
-        # 7 max limits the fixed bitrate
-        COMPRESS_CONF=$(conf_with "smax$tier" SERIES_${u}_VIDEO_GIB_PER_HOUR=$big \
-            SERIES_${u}_VIDEO_FLOOR_MBPS=$f SERIES_${u}_VIDEO_MAX_MBPS=$m)
-        load_policy 2>/dev/null
-        set_eps 50000 3600
-        series_video_plan "$tier"
-        eq "series $tier max: capped"                "$SPLAN_TARGET_KBPS/$SPLAN_MAX_LIMITED" "$(_mbps_to_kbps "$m")/1"
-        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
-        eq "series $tier max: episodes at max"       "${P_EP_VKBPS[0]}" "$(_mbps_to_kbps "$m")"
-
-        # 8 changing the config changes bitrate and sizes
-        COMPRESS_CONF=$(conf_with "srate$tier" SERIES_${u}_VIDEO_GIB_PER_HOUR=$r2 \
-            SERIES_${u}_VIDEO_FLOOR_MBPS=$f SERIES_${u}_VIDEO_MAX_MBPS=0)
-        load_policy 2>/dev/null
-        series_video_plan "$tier"
-        series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
-        eq "series $tier edited: bitrate"            "$SPLAN_TARGET_KBPS" "$(gib_per_hour_to_kbps "$r2")"
-        eq "series $tier edited: 60 min = $r2 GiB"   "${P_EP_VGIB[0]}" "$(awk -v r="$r2" 'BEGIN { printf "%.2f", r }')"
-    done
-
-    # 9 / 10 defaults: 60 min episode
-    COMPRESS_CONF="$T/compress.conf"
-    load_policy 2>/dev/null
-    set_eps 50000 3600
-    series_video_plan High; series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
-    eq "series default High 60 min: ~3.00 GiB video" "${P_EP_VGIB[0]}" 3.00
-    series_video_plan Base; series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
-    eq "series default Base 60 min: ~1.25 GiB video" "${P_EP_VGIB[0]}" 1.25
-
-    # Custom: entered GiB/hour, no floor / max, High audio
-    series_video_plan Custom 2
-    eq "series Custom 2 GiB/hour"                "$SPLAN_TARGET_KBPS/$SPLAN_FLOOR_KBPS/$SPLAN_MAX_KBPS" "$(gib_per_hour_to_kbps 2)/0/0"
-    unset -f set_eps
-    unset EP_DUR EP_VKBPS EP_AKBPS EP_ABYTES
+    # expected series sizes: copied audio on top, reserve added
+    EP_DUR=(3600 1800); EP_VKBPS=(8000 8000); EP_AKBPS=("768 192" "768 192")
+    EP_ABYTES=($(awk 'BEGIN { printf "%.0f %.0f", 960 * 1000 / 8 * 3600, 960 * 1000 / 8 * 1800 }'))
+    series_crf_plan "$(gib_bytes 2)" "$(gib_bytes 1)"
+    eq "series plan: video per episode"          "${P_EP_VGIB[*]}" "2.00 1.00"
+    eq "series plan: copied audio kb/s"          "${P_EP_AKBPS[0]}" 960
+    eq "series plan: total = (video + audio) / reserve" "${P_EP_GIB[0]}" \
+        "$(awk -v a="${EP_ABYTES[0]}" -v f="$(series_size_factor)" 'BEGIN { printf "%.2f", (2 * 1073741824 + a) / 1073741824 / f }')"
+    eq "series plan: totals"                     "$P_VIDEO_GIB/$P_TOTAL_SECONDS" "3.00/5400.000"
+    series_crf_plan copy "$(gib_bytes 1)"
+    eq "series plan: kept source video size"     "${P_EP_VGIB[0]}" "$(awk 'BEGIN { printf "%.2f", 8000 * 1000 / 8 * 3600 / 1073741824 }')"
+    unset FILES EP_VIDX EP_DUR EP_VKBPS EP_AKBPS EP_ABYTES CRF_SERIES_SAMPLED CRF_SERIES_EP_BYTES CRF_SERIES_EP_FROM
 }
 COMPRESS_CONF="$T/compress.conf"
 
@@ -545,16 +487,24 @@ reject_file() {   # LABEL PATTERN CONF
         bad "rejects $label (message: $(tr '\n' ' ' < "$T/rej.out"))"
     fi
 }
-reject "negative size"            "must not be negative"     MOVIE_HIGH_VIDEO_GIB_PER_HOUR=-3
-reject "negative bitrate"         "must not be negative"     MOVIE_BASE_VIDEO_FLOOR_MBPS=-1
-reject "non-numeric value"        "not a number"             MOVIE_HIGH_VIDEO_MAX_MBPS=twelve
-reject "floor above nonzero max"  "is greater than MOVIE_HIGH_VIDEO_MAX_MBPS" MOVIE_HIGH_VIDEO_FLOOR_MBPS=15
-reject "zero High GiB/hour"       'MOVIE_HIGH_VIDEO_GIB_PER_HOUR="0": must be greater than 0' MOVIE_HIGH_VIDEO_GIB_PER_HOUR=0
-reject "zero Base GiB/hour"       'MOVIE_BASE_VIDEO_GIB_PER_HOUR="0": must be greater than 0' MOVIE_BASE_VIDEO_GIB_PER_HOUR=0
-reject "negative High floor"      'MOVIE_HIGH_VIDEO_FLOOR_MBPS="-1": must not be negative' MOVIE_HIGH_VIDEO_FLOOR_MBPS=-1
-reject "negative Base max"        'MOVIE_BASE_VIDEO_MAX_MBPS="-5": must not be negative' MOVIE_BASE_VIDEO_MAX_MBPS=-5
-reject "Base floor above max"     'MOVIE_BASE_VIDEO_FLOOR_MBPS (6) is greater than MOVIE_BASE_VIDEO_MAX_MBPS (5)' MOVIE_BASE_VIDEO_FLOOR_MBPS=6
-for k in MOVIE_HIGH_VIDEO_GIB_PER_HOUR MOVIE_BASE_VIDEO_GIB_PER_HOUR MOVIE_HIGH_VIDEO_FLOOR_MBPS MOVIE_BASE_VIDEO_MAX_MBPS; do
+reject "negative CRF"             'MOVIE_HIGH_CRF_MIN="-1": must not be negative' MOVIE_HIGH_CRF_MIN=-1
+reject "CRF above 51"             'SERIES_BASE_CRF_MAX="52": outside the x265 CRF range 0-51' SERIES_BASE_CRF_MAX=52
+reject "decimal CRF in config"    'MOVIE_BASE_CRF_MIN="25.5": must be a whole number' MOVIE_BASE_CRF_MIN=25.5
+reject "non-numeric CRF"          'MOVIE_HIGH_CRF_MAX="high": must be a whole number' MOVIE_HIGH_CRF_MAX=high
+reject "High CRF_MAX < CRF_MIN"   'MOVIE_HIGH_CRF_MAX (18) is lower than MOVIE_HIGH_CRF_MIN (19)' MOVIE_HIGH_CRF_MAX=18
+reject "Base CRF_MAX < CRF_MIN"   'MOVIE_BASE_CRF_MAX (24) is lower than MOVIE_BASE_CRF_MIN (25)' MOVIE_BASE_CRF_MAX=24
+reject "series CRF_MAX < CRF_MIN" 'SERIES_HIGH_CRF_MAX (20) is lower than SERIES_HIGH_CRF_MIN (21)' SERIES_HIGH_CRF_MIN=21 SERIES_HIGH_CRF_MAX=20
+reject "zero High ceiling"        'MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB="0": must be greater than 0' MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=0
+reject "negative Base ceiling"    'SERIES_BASE_VIDEO_SIZE_CEILING_GIB="-2": must not be negative' SERIES_BASE_VIDEO_SIZE_CEILING_GIB=-2
+reject "zero sample seconds"      'CRF_SAMPLE_SECONDS="0": must be greater than 0' CRF_SAMPLE_SECONDS=0
+reject "zero sample points"       'MOVIE_CRF_SAMPLE_POINTS="0": must be at least 1' MOVIE_CRF_SAMPLE_POINTS=0
+check "CRF_MIN = CRF_MAX allowed" "( COMPRESS_CONF=\$(conf_with crfeq MOVIE_HIGH_CRF_MIN=21 MOVIE_HIGH_CRF_MAX=21) load_policy )"
+check "CRF 0 allowed"             "( COMPRESS_CONF=\$(conf_with crf0 MOVIE_HIGH_CRF_MIN=0) load_policy )"
+for k in MOVIE_HIGH_CRF_MIN MOVIE_HIGH_CRF_MAX MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB \
+         MOVIE_BASE_CRF_MIN MOVIE_BASE_CRF_MAX MOVIE_BASE_VIDEO_SIZE_CEILING_GIB \
+         SERIES_HIGH_CRF_MIN SERIES_HIGH_CRF_MAX SERIES_HIGH_VIDEO_SIZE_CEILING_GIB \
+         SERIES_BASE_CRF_MIN SERIES_BASE_CRF_MAX SERIES_BASE_VIDEO_SIZE_CEILING_GIB \
+         CRF_SAMPLE_SECONDS MOVIE_CRF_SAMPLE_POINTS SERIES_CRF_SAMPLE_EPISODES SERIES_CRF_SAMPLE_POINTS; do
     f=$(conf_with "unset$k"); sed -i "/^$k=/d" "$f"
     reject_file "missing $k" "$k is not set" "$f"
 done
@@ -563,28 +513,18 @@ reject "zero Quality GiB/hour"    'MOVIE_QUALITY_VIDEO_GIB_PER_HOUR="0": must be
 reject "zero Quality minimum"     'MOVIE_QUALITY_VIDEO_MIN_GIB="0": must be greater than 0' MOVIE_QUALITY_VIDEO_MIN_GIB=0
 reject "negative Quality floor"   'MOVIE_QUALITY_VIDEO_FLOOR_MBPS="-1": must not be negative' MOVIE_QUALITY_VIDEO_FLOOR_MBPS=-1
 reject "negative Quality max"     'MOVIE_QUALITY_VIDEO_MAX_MBPS="-5": must not be negative' MOVIE_QUALITY_VIDEO_MAX_MBPS=-5
+reject "non-numeric Quality max"  "not a number"             MOVIE_QUALITY_VIDEO_MAX_MBPS=twelve
 reject "Quality floor above max"  'MOVIE_QUALITY_VIDEO_FLOOR_MBPS (12) is greater than MOVIE_QUALITY_VIDEO_MAX_MBPS (10)' MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=10
 f=$(conf_with qunset); sed -i '/^MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=/d' "$f"
 reject_file "missing Quality GiB/hour" "MOVIE_QUALITY_VIDEO_GIB_PER_HOUR is not set" "$f"
 check "Quality floor 12 max 0 allowed" "( COMPRESS_CONF=\$(conf_with qok MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=0) load_policy )"
 f=$(conf_with unset); sed -i '/^SERIES_CONTAINER_RESERVE_PCT=/d' "$f"
 reject_file "missing setting"     "SERIES_CONTAINER_RESERVE_PCT is not set" "$f"
-reject "zero series High GiB/hour" 'SERIES_HIGH_VIDEO_GIB_PER_HOUR="0": must be greater than 0' SERIES_HIGH_VIDEO_GIB_PER_HOUR=0
-reject "zero series Base GiB/hour" 'SERIES_BASE_VIDEO_GIB_PER_HOUR="0": must be greater than 0' SERIES_BASE_VIDEO_GIB_PER_HOUR=0
-reject "negative series floor"    'SERIES_HIGH_VIDEO_FLOOR_MBPS="-1": must not be negative' SERIES_HIGH_VIDEO_FLOOR_MBPS=-1
-reject "negative series max"      'SERIES_BASE_VIDEO_MAX_MBPS="-2": must not be negative' SERIES_BASE_VIDEO_MAX_MBPS=-2
-reject "series floor above max"   'SERIES_BASE_VIDEO_FLOOR_MBPS (6) is greater than SERIES_BASE_VIDEO_MAX_MBPS (5)' SERIES_BASE_VIDEO_FLOOR_MBPS=6
-check "series floor 6 max 0 allowed" "( COMPRESS_CONF=\$(conf_with sok SERIES_BASE_VIDEO_FLOOR_MBPS=6 SERIES_BASE_VIDEO_MAX_MBPS=0) load_policy )"
-for k in SERIES_HIGH_VIDEO_GIB_PER_HOUR SERIES_BASE_VIDEO_GIB_PER_HOUR SERIES_HIGH_VIDEO_FLOOR_MBPS SERIES_BASE_VIDEO_MAX_MBPS; do
-    f=$(conf_with "unset$k"); sed -i "/^$k=/d" "$f"
-    reject_file "missing $k" "$k is not set" "$f"
-done
 reject_file "missing file"        "Compression policy file not found" "$T/nope.conf"
-check "floor = 0 max = 0 allowed" "( COMPRESS_CONF=\$(conf_with zero MOVIE_HIGH_VIDEO_FLOOR_MBPS=0 MOVIE_HIGH_VIDEO_MAX_MBPS=0) load_policy )"
 check "no policy numbers left in movie menu" \
-    "! grep -nE '(VIDEO_(FLOOR|PREFERRED|UPPER|MAX_GIB|TARGET_GIB))=[0-9]|AUDIO_CAP_GIB=[0-9]|echo (768|640|512|448|320|256|192|128|96|64)\$' '$SRC_WORK/movie_compress.sh'"
+    "! grep -nE '(VIDEO_(FLOOR|PREFERRED|UPPER|MAX_GIB|TARGET_GIB))=[0-9]|AUDIO_CAP_GIB=[0-9]|echo (768|640|512|448|320|256|192|128|96|64)\$|CRF_(MIN|MAX)=\"?[0-9]|CEILING(_GIB|_BYTES)?=\"?[0-9]|crf:[0-9]|crf_select \"?[0-9]|SAMPLE_(SECONDS|POINTS)=[0-9]' '$SRC_WORK/movie_compress.sh'"
 check "no policy numbers left in series menu" \
-    "! grep -nE 'echo (768|640|384|320|256|192|128|96|64)\$|GIB_PER_HOUR=\"?[0-9]|_KBPS=[0-9]|0\\.99|< 500|gib_per_hour_to_kbps' '$SRC_WORK/series_compress.sh'"
+    "! grep -nE 'echo (768|640|384|320|256|192|128|96|64)\$|GIB_PER_HOUR=\"?[0-9]|_KBPS=[0-9]|0\\.99|< 500|gib_per_hour_to_kbps|CRF_(MIN|MAX)=\"?[0-9]|CEILING(_GIB|_BYTES)?=\"?[0-9]|crf:[0-9]|crf_select \"?[0-9]|SAMPLE_(SECONDS|POINTS|EPISODES)=[0-9]' '$SRC_WORK/series_compress.sh'"
 check "no policy numbers left in audio menu" \
     "! grep -nE 'TRIGGER_KBPS=[0-9]|LIMIT_GIB=\"?[0-9]|echo (1280|1024|640|384|320|192|128|96)\$' '$ROOT/audio_compress_menu.sh'"
 
@@ -687,16 +627,18 @@ ffmpeg -v error -y -f lavfi -i "testsrc2=s=1280x720:r=24000/1001:d=2,format=yuv4
 mux_source "$T/hdr10.mkv" "$T/in/HDR10.mkv"
 
 # ------------------------------------------------------------
-# run_item NAME INPUT FILTER [OVERWRITE]  ->  job script + output + log
+# run_item NAME INPUT FILTER [OVERWRITE] [VIDEO] [EST_VIDEO_BYTES]
+#   ->  job script + output + log. VIDEO: two-pass kb/s (default 1500,
+#   the Quality path), crf:N (High / Base / Custom) or copy
 run_item() {
-    local name="$1" in="$2" filter="$3" overwrite="${4:-0}"
+    local name="$1" in="$2" filter="$3" overwrite="${4:-0}" video="${5:-1500}" est="${6:-}"
     local job="$WORK_DIR/$name.sh"
 
-    mkdir -p "$WORK_DIR/${name}_passes"
+    [[ "$video" =~ ^[0-9]+$ ]] && mkdir -p "$WORK_DIR/${name}_passes"
     {
         emit_job_header "$name" movie 1
-        emit_encode_item 1 "$in" "$T/out/$name.mkv" Test 1500 "$filter" \
-            "$WORK_DIR/${name}_passes/pass_0" "$overwrite"
+        emit_encode_item 1 "$in" "$T/out/$name.mkv" Test "$video" "$filter" \
+            "$WORK_DIR/${name}_passes/pass_0" "$overwrite" "$est"
         emit_job_footer
     } > "$job"
 
@@ -737,10 +679,11 @@ common_checks() {
         "[[ \$(ffprobe -v error -select_streams v:0 -show_entries stream_tags=BPS -of default=nw=1:nk=1 '$T/out/$n.mkv') != 99999999 ]]"
 }
 
-nondv_job_checks() {
+nondv_job_checks() {   # two-pass (Quality) job
     local n="$1" job="$WORK_DIR/$1.sh"
 
     check "$n: two libx265 passes"             "[[ \$(grep -c 'libx265' '$job') == 2 ]]"
+    check "$n: two-pass bitrate (-b:v)"        "grep -q -- '-b:v:0 1500k' '$job' && ! grep -q -- '-crf' '$job'"
     check "$n: pass 1 / pass 2 stats"          "grep -q 'pass=1:stats=' '$job' && grep -q 'pass=2:stats=' '$job'"
     check "$n: no Dolby Vision steps"          "! grep -qE 'item_dv_|item_step rpu|-copyts' '$job'"
     check "$n: no HDR10+ steps"                "! grep -q 'hdr10plus' '$job'"
@@ -766,6 +709,62 @@ check "sdr: no audio title rewrite in job"     "! grep -q -- '-metadata:s:a:[0-9
 eq    "sdr: copied audio 1 title unchanged"    "$(out_title sdr 0)" "$A0_TITLE"
 eq    "sdr: copied audio 2 title unchanged"    "$(out_title sdr 1)" "$A1_TITLE"
 check "sdr: track titles MATCH"                "report_has sdr 'Track titles: +MATCH'"
+check "sdr: report: two-pass mode"             "grep -q 'Video encode mode: *two-pass bitrate (1500 kb/s)' '$T/sdr.log'"
+check "sdr: stream is x265 two-pass"           "report_has sdr 'Video stream: +AS PLANNED \\(hevc 1280x720 yuv420p10le, two-pass 1500 kb/s\\)'"
+check "verify.sh: x265 rate control read"      "[[ \"\$(x265_rate_control '$T/out/sdr.mkv' 0)\" == '2pass 1500' ]]"
+check "sdr: pane shows pass 1/2 and 2/2"       "grep -q 'PASS 1/2' '$T/sdr.log' && grep -q 'PASS 2/2' '$T/sdr.log'"
+
+# crf_job_checks NAME CRF  ->  single-pass CRF job: no -b:v, no passes
+crf_job_checks() {
+    local n="$1" crf="$2" job="$WORK_DIR/$1.sh"
+
+    check "$n: one libx265 encode (single pass)" "[[ \$(grep -c 'libx265' '$job') == 1 ]]"
+    check "$n: -crf $crf, preset slow, 10-bit"   "grep -q -- '-preset slow -crf:v:0 $crf -pix_fmt:v:0 yuv420p10le' '$job'"
+    check "$n: no -b:v / pass / stats"           "! grep -qE -- '-b:v|pass=[12]|stats=|-pass ' '$job'"
+    check "$n: no pass log for the item"         "grep -q \"^if item_begin .* ''\" '$job'"
+    check "$n: one encode step, no pass 1/2"     "grep -q 'item_run encode ffmpeg' '$job' && ! grep -qE 'item_run [12]/2' '$job'"
+    check "$n: mode / CRF in the item plan"      "grep -q 'item_expect .*mode=crf crf=$crf ' '$job'"
+    check "$n: metadata + chapters mapped"       "grep -q -- '-map_metadata 0 -map_chapters 0' '$job'"
+    check "$n: chapter restore step"             "grep -q 'item_step chapters item_restore_mkv_chapters' '$job'"
+    check "$n: video stats stripped"             "grep -q -- '-metadata:s:v:0 BPS=' '$job'"
+    check "$n: audio copied (-c:a copy)"         "grep -q -- '-c:a copy' '$job'"
+    check "$n: no audio encoder arguments"       "! grep -qE -- '-c:a:[0-9]|-b:a|aac|eac3|libopus|-ac |-ar ' '$job'"
+    check "$n: final mux to .part"               "grep -q '\"\$ITEM_PART\"' '$job'"
+    check "$n: pane shows one CRF encode"        "grep -q 'ENCODING (single pass, CRF $crf)' '$T/$n.log' && ! grep -qE 'PASS [12]/2' '$T/$n.log'"
+    check "$n: no x265 pass logs left"           "[[ -z \$(find '$WORK_DIR' \\( -name '*pass_0*' -o -name '*2pass*' -o -name '*.cutree' \\) 2>/dev/null) ]]"
+    check "$n: video stream AS PLANNED (x265 CRF)" "report_has $n 'Video stream: +AS PLANNED \\(hevc .* yuv420p10le.*, CRF $crf(\\.0)? \\(single pass\\)\\)'"
+    check "$n: report: CRF, single pass"         "grep -q 'Selected CRF: *$crf' '$T/$n.log' && grep -q 'Video encode mode: *CRF (single pass)' '$T/$n.log'"
+    check "$n: report: audio copied unchanged"   "grep -q '^  Audio: *copied unchanged' '$T/$n.log'"
+}
+
+# whole_title_estimate FILE CRF [FILTER]  ->  video bytes of the sample-based
+# estimate (the menus' estimator; a 2 s title is sampled whole)
+whole_title_estimate() {
+    CRF_TITLE_FILE="$1" CRF_TITLE_VIDX=0 CRF_TITLE_FILTER="${3:-}" \
+    CRF_TITLE_DURATION=$(get_duration "$1") CRF_TITLE_POINTS="$MOVIE_CRF_SAMPLE_POINTS"
+    crf_title_estimate "$2" > /dev/null && printf '%s' "$CRF_EST_RESULT"
+}
+
+echo
+echo "== SDR, x265 CRF (High / Base / Custom path; audio copied)"
+SDR_EST=$(whole_title_estimate "$T/in/SDR.mkv" 24)
+check "sdrcrf: sample estimate available"      "[[ '$SDR_EST' =~ ^[0-9]+\$ ]]"
+run_item sdrcrf "$T/in/SDR.mkv" "" 0 crf:24 "$SDR_EST"
+crf_job_checks sdrcrf 24
+common_checks sdrcrf
+check "sdrcrf: HDR type SDR"                   "report_has sdrcrf 'HDR type: +SDR\$'"
+eq    "sdrcrf: copied audio 1 title unchanged" "$(out_title sdrcrf 0)" "$A0_TITLE"
+check "25 sdrcrf: estimated size reported"     "grep -q 'Estimated video size: ' '$T/sdrcrf.log'"
+check "25 sdrcrf: estimate error reported"     "grep -qE 'Estimate error: +[-+][0-9]+\\.[0-9]%' '$T/sdrcrf.log'"
+err=$(grep -oE 'Estimate error: +[-+][0-9.]+' "$T/sdrcrf.log" | grep -oE '[-+][0-9.]+$')
+check "25 sdrcrf: whole-title sample within 5% ($err%)" "awk -v e='$err' 'BEGIN { exit !(e > -5 && e < 5) }'"
+check "25 sdrcrf: accuracy logged"             "awk -F'\\t' -v e='$SDR_EST' '\$9 == \"sdrcrf\" && \$2 == \"Test\" && \$3 == \"24\" && \$4 == \"1280x720\" && \$6 == e && \$7 ~ /^[0-9]+\$/ && \$8 ~ /%\$/ { f = 1 } END { exit !f }' '$WORK_DIR/logs/crf_estimates.tsv'"
+check "25 sdrcrf: accuracy log header"         "head -1 '$WORK_DIR/logs/crf_estimates.tsv' | awk -F'\\t' '{ exit !(\$6 == \"estimated_video_bytes\" && \$7 == \"actual_video_bytes\" && \$8 == \"error_pct\") }'"
+
+# a miss is reported, never a failure (the ceiling is a selection goal)
+run_item sdrmiss "$T/in/SDR.mkv" "" 0 crf:24 1000
+check "sdrmiss: far-off estimate still succeeds" "grep -q 'All encodes finished: 1 ok, 0 failed' '$T/sdrmiss.log' && grep -qE 'Estimate error: +\\+[0-9]+' '$T/sdrmiss.log'"
+check "sdrmiss: no re-encode"                  "[[ \$(grep -c 'ENCODING (single pass' '$T/sdrmiss.log') == 1 ]]"
 
 echo
 echo "== encode onto an output symlink"
@@ -1273,8 +1272,10 @@ no_audio_encoding() {   # JOB  ->  0 when the job converts no audio
 
 # E-AC-3 5.1 "Atmos" (object audio named in the title: ffmpeg cannot
 # write real Atmos/JOC), TrueHD 5.1, DTS 5.1, AAC commentary
+# (lossless video: every CRF estimate is far below the source, so the
+# source-quality guard does not ask here; it is tested separately)
 ffmpeg -v error -y -f lavfi -i "testsrc2=s=640x360:r=24:d=2" -f lavfi -i "sine=f=440:r=48000:d=2" \
-    -map 0:v -map 1:a -map 1:a -map 1:a -map 1:a -c:v libx264 -preset ultrafast \
+    -map 0:v -map 1:a -map 1:a -map 1:a -map 1:a -c:v libx264 -preset ultrafast -qp 0 \
     -c:a:0 eac3 -ac:a:0 6 -b:a:0 640k -c:a:1 truehd -ac:a:1 6 -strict -2 \
     -c:a:2 dca -ac:a:2 6 -b:a:2 768k -c:a:3 aac -ac:a:3 2 -b:a:3 96k \
     -metadata:s:a:0 language=eng -metadata:s:a:0 "title=English DDP 5.1 Atmos" -disposition:a:0 default \
@@ -1288,28 +1289,56 @@ if [[ -s "$MH/compress/in/Multi.mkv" ]]; then
     check "acopy: source has E-AC-3, TrueHD, DTS, AAC" "[[ '$src_audio' == 'eac3,48000,6 truehd,48000,6 dts,48000,6 aac,48000,2 ' ]]"
 
     n=0
-    for t in Quality High Base; do
+    for t in Quality High Base Custom; do
         ((n += 1))
-        rm -f "$MH/compress/work"/c[0-9]*.sh
-        menu "$MH/compress/work/movie_compress.sh" "1\n$n\nn\n" "$AC/movie_$t.log"
+        rm -rf "$MH/compress/work"/c[0-9]*.sh "$MH/compress/work"/c[0-9]*_passes
+        in="1\n$n\nn\n"; [[ $t == Custom ]] && in="1\n4\n24\nn\n"
+        menu "$MH/compress/work/movie_compress.sh" "$in" "$AC/movie_$t.log"
         job=$(ls "$MH/compress/work"/c[0-9]*.sh 2>/dev/null | head -1)
         check "acopy $n: movie $t job written"          "[[ -n '$job' ]]"
         check "acopy $n: movie $t copies all audio"     "no_audio_encoding '$job'"
         check "acopy $n: movie $t summary says copied"  "grep -q 'Audio size: .*copied unchanged (4 track(s), actual source audio)' '$AC/movie_$t.log'"
-        [[ "$t" == Quality ]] && cp "$job" "$AC/movie_quality_job.sh"
+        cp "$job" "$AC/movie_${t}_job.sh"
+        if [[ -d "${job%.sh}_passes" ]]; then echo 1 > "$AC/movie_${t}_passdir"; else : > "$AC/movie_${t}_passdir"; fi
     done
+
+    # 19 / 20 job shape per tier: Quality two-pass, the others single-pass CRF
+    qj="$AC/movie_Quality_job.sh"
+    check "20 movie Quality: still two-pass bitrate" "[[ \$(grep -c libx265 '$qj') == 2 ]] && grep -q -- '-b:v:0 [0-9]*k' '$qj' && grep -q 'pass=1:stats=' '$qj' && grep -q 'pass=2:stats=' '$qj' && ! grep -q -- '-crf' '$qj'"
+    check "20 movie Quality: pass log dir created"   "[[ -s '$AC/movie_Quality_passdir' ]]"
+    check "20 movie Quality: GiB/hour target summary" "grep -q 'Video target:      rate-based' '$AC/movie_Quality.log' && grep -q 'quality-first \[two-pass' '$AC/movie_Quality.log'"
+    for tc in High:19 Base:25 Custom:24; do
+        tt=${tc%%:*}; c=${tc#*:}; j="$AC/movie_${tt}_job.sh"
+        check "19 movie $tt: -crf $c, no -b:v / passes" "grep -q -- '-crf:v:0 $c ' '$j' && ! grep -qE -- '-b:v|pass=[12]|stats=' '$j' && [[ \$(grep -c libx265 '$j') == 1 ]]"
+        check "movie $tt: no pass log dir"               "[[ ! -s '$AC/movie_${tt}_passdir' ]]"
+    done
+    check "1 movie High: analysis starts at CRF 19"  "grep -q 'sampling CRF 19 ' '$AC/movie_High.log' && ! grep -qE 'sampling CRF (1[0-8]|2[0-9]) ' '$AC/movie_High.log'"
+    check "movie High: policy + analysis shown"      "grep -q 'CRF range: 19-23' '$AC/movie_High.log' && grep -q '^  CRF 19 -> estimated ' '$AC/movie_High.log' && grep -A1 '^Selected:' '$AC/movie_High.log' | grep -q 'CRF 19'"
+    check "7 movie Base: CRF 25 fits, no 26+ samples" "grep -q 'sampling CRF 25 ' '$AC/movie_Base.log' && ! grep -qE 'sampling CRF (2[6-9]) ' '$AC/movie_Base.log'"
+    check "18 movie Custom: exactly CRF 24"          "grep -q 'sampling CRF 24 ' '$AC/movie_Custom.log' && [[ \$(grep -c 'sampling CRF' '$AC/movie_Custom.log') == 1 ]]"
+    check "18 movie Custom: menu entry"              "grep -q '4) Custom CRF  exactly the CRF you enter' '$AC/movie_Custom.log' && grep -q 'CRF: 24 (used exactly; no size ceiling)' '$AC/movie_Custom.log'"
+    # 14 total preview = estimated video + copied audio + other streams
+    hest=$(grep -o 'est_vbytes=[0-9]*' "$AC/movie_High_job.sh" | cut -d= -f2)
+    stats_load "$MH/compress/in/Multi.mkv" "" exact
+    read -r srcvb srcab _ _ <<< "$(stats_totals 0)"
+    other=$(awk -v t="$(file_bytes "$MH/compress/in/Multi.mkv")" -v v="$srcvb" -v a="$srcab" 'BEGIN { x = t - v - a; if (x < 0) x = 0; printf "%.0f", x }')
+    check "14 movie: copied audio in the preview"    "grep -qF 'copied source audio:  ~$(size_text "$srcab")' '$AC/movie_High.log'"
+    check "14 movie: total = video + audio + other"  "grep -qF 'estimated total:      ~$(size_text "$(crf_total_bytes "$hest" "$srcab" "$other")")' '$AC/movie_High.log'"
     check "acopy: movie header: audio copied"          "grep -q '^  all tracks copied unchanged' '$AC/movie_Quality.log' && grep -q 'use audio_compress_menu.sh for optional audio compression' '$AC/movie_Quality.log'"
     check "acopy: movie lists tracks as copied"        "grep -q 'Audio 1: E-AC-3 5.1(side) + Dolby Atmos (per track title).*copied unchanged' '$AC/movie_Quality.log' && grep -q 'Audio 4: AAC stereo.*\"Director Commentary\" - copied unchanged' '$AC/movie_Quality.log'"
     check "acopy: Atmos PRESERVED, no LOST warning"    "grep -q 'Object audio: Dolby Atmos PRESERVED by stream copy' '$AC/movie_Quality.log' && ! grep -qi 'LOST' '$AC/movie_Quality.log'"
     check "acopy: no Base audio question"              "! grep -q 'Base audio target' '$AC/movie_Base.log'"
+    check "acopy: tier menu lists CRF tiers"           "grep -q '2) High        CRF 19-23, video ceiling 7 GiB' '$AC/movie_Base.log' && grep -q '3) Base        CRF 25-29, video ceiling 2 GiB' '$AC/movie_Base.log'"
     # 12 expected size uses the actual source audio bytes
     stats_load "$MH/compress/in/Multi.mkv" "" exact
     read -r _ srcab _ _ <<< "$(stats_totals 0)"
     check "acopy 12: movie audio size = source bytes"  "grep -q \"Audio size: *~$(bytes_to_gib "$srcab") GiB copied\" '$AC/movie_Quality.log'"
 
     # run the Quality job: every track identical in the output
-    bash "$AC/movie_quality_job.sh" < /dev/null > "$AC/movie_run.log" 2>&1
-    mout=$(ls "$MH/compress/out"/Multi*.mkv 2>/dev/null | head -1)
+    # (the menu created this; the per-tier loop above removed it again)
+    mkdir -p "$MH/compress/work/c1_passes"
+    bash "$AC/movie_Quality_job.sh" < /dev/null > "$AC/movie_run.log" 2>&1
+    mout="$MH/compress/out/Multi HEVC Quality.mkv"
     check "acopy 7: movie output written"             "[[ -s '$mout' ]]"
     eq    "acopy 7: all 4 audio tracks, same codecs"  "$(ffprobe -v error -select_streams a -show_entries stream=codec_name,channels,sample_rate -of csv=p=0 "$mout" | tr '\n' ' ')" "$src_audio"
     eq    "acopy 9-11: payload identical (all tracks)" "$(_audio_payload_md5 "$mout" | tr '\n' ' ')" "$(_audio_payload_md5 "$MH/compress/in/Multi.mkv" | tr '\n' ' ')"
@@ -1319,6 +1348,16 @@ if [[ -s "$MH/compress/in/Multi.mkv" ]]; then
     check "acopy 8: commentary kept"                  "[[ \$(ffprobe -v error -select_streams a:3 -show_entries stream_disposition=comment -of default=nw=1:nk=1 '$mout') == 1 ]] && grep -q 'Audio track 4: *COPIED (AAC stereo' '$AC/movie_run.log'"
     check "acopy: titles / languages kept"            "grep -q 'Languages: *MATCH' '$AC/movie_run.log' && grep -q 'Track titles: *MATCH' '$AC/movie_run.log'"
     check "acopy: job succeeded"                      "grep -q 'All encodes finished: 1 ok, 0 failed' '$AC/movie_run.log'"
+
+    # 23 the High (CRF) job: all tracks identical, estimate reported
+    bash "$AC/movie_High_job.sh" < /dev/null > "$AC/movie_high_run.log" 2>&1
+    hout="$MH/compress/out/Multi HEVC High.mkv"
+    check "23 movie High job succeeded"              "grep -q 'All encodes finished: 1 ok, 0 failed' '$AC/movie_high_run.log'"
+    eq    "23 movie High: payload identical (all tracks)" "$(_audio_payload_md5 "$hout" | tr '\n' ' ')" "$(_audio_payload_md5 "$MH/compress/in/Multi.mkv" | tr '\n' ' ')"
+    check "23 movie High: Atmos PRESERVED"           "grep -q 'Audio 1 object: *Dolby Atmos PRESERVED (stream copy)' '$AC/movie_high_run.log'"
+    check "25 movie High: estimate vs actual"        "grep -q 'Selected CRF: *19' '$AC/movie_high_run.log' && grep -q 'Estimated video size: ' '$AC/movie_high_run.log' && grep -qE 'Estimate error: +[-+][0-9.]+%' '$AC/movie_high_run.log'"
+    check "movie High: single pass in the pane"      "grep -q 'ENCODING (single pass, CRF 19)' '$AC/movie_high_run.log' && ! grep -qE 'PASS [12]/2' '$AC/movie_high_run.log'"
+    rm -f "$hout"
 
     # verification catches a transcode that was not planned
     ffmpeg -v error -y -i "$mout" -map 0 -c copy -c:a:3 libopus -b:a:3 64k "$AC/tampered.mkv"
@@ -1331,20 +1370,24 @@ if [[ -s "$MH/compress/in/Multi.mkv" ]]; then
     cp "$MH/compress/in/Multi.mkv" "$MH/compress/in/Show/E01.mkv"
     cp "$MH/compress/in/Multi.mkv" "$MH/compress/in/Show/E02.mkv"
     mv "$MH/compress/in/Multi.mkv" "$AC/Multi.mkv"
-    for sel in "1:Base" "2:High" "3:Custom"; do
-        k="${sel%%:*}"; t="${sel#*:}"
+    for sel in "1:Base:25" "2:High:19" "3:Custom:24"; do
+        k="${sel%%:*}"; t="${sel#*:}"; c="${t#*:}"; t="${t%%:*}"
         rm -f "$MH/compress/work"/series[0-9]*.sh; rm -rf "$MH/compress/out/Show"*
-        in="1\n$k\ny\n"; [[ $t == Custom ]] && in="1\n3\n3\ny\n"
+        in="1\n$k\ny\n"; [[ $t == Custom ]] && in="1\n3\n$c\ny\n"
         menu "$MH/compress/work/series_compress.sh" "$in" "$AC/series_$t.log"
         job=$(ls "$MH/compress/work"/series[0-9]*.sh 2>/dev/null | head -1)
-        check "acopy $((k + 3)): series $t job written"       "[[ -n '$job' ]]"
-        check "acopy $((k + 3)): series $t copies all audio"  "no_audio_encoding '$job'"
+        check "acopy $((k + 4)): series $t job written"       "[[ -n '$job' ]]"
+        check "acopy $((k + 4)): series $t copies all audio"  "no_audio_encoding '$job'"
         check "acopy: series $t table shows copied audio"     "grep -qE 'E0[12].mkv .* copy [0-9]+k' '$AC/series_$t.log'"
+        check "17 series $t: one CRF ($c) for every episode"  "[[ \$(grep -o -- '-crf:v:0 [0-9.]*' '$job' | sort -u) == '-crf:v:0 $c' && \$(grep -c -- '-crf:v:0 $c ' '$job') == 2 ]]"
+        check "19 series $t: no -b:v / passes"                "! grep -qE -- '-b:v|pass=[12]|stats=' '$job' && ! ls -d '$MH/compress/work'/series[0-9]*_passes >/dev/null 2>&1"
     done
-    check "acopy: series header: audio copied"         "grep -q '^  all tracks copied unchanged' '$AC/series_Base.log'"
-    check "acopy: series Custom label"                 "grep -q '3) Custom video GiB/hour (no floor / max; audio copied)' '$AC/series_Custom.log'"
+    check "acopy: series header: audio copied"         "grep -q '^  audio: copied unchanged' '$AC/series_Base.log' && grep -q '^  all tracks copied unchanged' '$AC/series_Base.log'"
+    check "acopy: series Custom label"                 "grep -q '3) Custom CRF  exactly the CRF you enter' '$AC/series_Custom.log'"
+    check "series Base: batch sampled at 25 only"      "grep -q 'sampling CRF 25, episode 1/2 (E01.mkv)' '$AC/series_Base.log' && grep -q 'sampling CRF 25, episode 2/2 (E02.mkv)' '$AC/series_Base.log' && ! grep -q 'sampling CRF 26' '$AC/series_Base.log'"
+    check "series: one CRF for every episode shown"    "grep -q 'CRF 25 for every episode' '$AC/series_Base.log' && grep -q 'one CRF for every episode of the batch' '$AC/series_Base.log'"
     check "acopy: series lists tracks, Atmos PRESERVED" "grep -q 'Audio 1: E-AC-3 5.1(side) + Dolby Atmos' '$AC/series_Custom.log' && grep -q 'Object audio: Dolby Atmos PRESERVED by stream copy' '$AC/series_Custom.log'"
-    check "acopy: series no AAC rates / LOST warning"  "! grep -qiE 'kb/s AAC|LOST|Fixed audio total' '$AC/series_Custom.log'"
+    check "acopy: series no AAC rates / LOST warning"  "! grep -qiE 'kb/s AAC|LOST|Fixed audio total|GiB/hour' '$AC/series_Custom.log'"
     check "acopy: series season totals"                "grep -q 'Copied source audio size: *~' '$AC/series_Custom.log'"
 
     # 15 the audio menu still converts audio (High: E-AC-3 640k -> 256k)
@@ -1391,6 +1434,67 @@ eq    "hdr10: audio 2 title unchanged"         "$(out_title hdr10 1)" "$A1_TITLE
 eq    "hdr10: audio codecs unchanged"          "$(ffprobe -v error -select_streams a -show_entries stream=codec_name,channels,sample_rate -of csv=p=0 "$T/out/hdr10.mkv" | tr '\n' ' ')" \
     "$(ffprobe -v error -select_streams a -show_entries stream=codec_name,channels,sample_rate -of csv=p=0 "$T/in/HDR10.mkv" | tr '\n' ' ')"
 check "hdr10: track titles MATCH"              "report_has hdr10 'Track titles: +MATCH'"
+
+echo
+echo "== HDR10, x265 CRF (audio copied)"
+run_item hdr10crf "$T/in/HDR10.mkv" "" 0 crf:21 "$(whole_title_estimate "$T/in/HDR10.mkv" 21)"
+crf_job_checks hdr10crf 21
+common_checks hdr10crf
+check "hdr10crf: x265 HDR10 params"            "grep -q 'transfer=smpte2084' '$WORK_DIR/hdr10crf.sh' && grep -q 'master-display=' '$WORK_DIR/hdr10crf.sh' && grep -q 'max-cll=1000' '$WORK_DIR/hdr10crf.sh'"
+check "hdr10crf: HDR type HDR10"               "report_has hdr10crf 'HDR type: +HDR10\$'"
+check "hdr10crf: colour MATCH"                 "report_has hdr10crf 'Colour signalling: +MATCH \\(bt2020/smpte2084/bt2020nc/tv\\)'"
+check "hdr10crf: mastering VERIFIED"           "report_has hdr10crf 'HDR10 mastering: +VERIFIED'"
+check "hdr10crf: MaxCLL VERIFIED"              "report_has hdr10crf 'MaxCLL/MaxFALL: +VERIFIED'"
+
+echo
+echo "== source video kept (stream copy, source-quality guard)"
+run_item hdr10copy "$T/in/HDR10.mkv" "" 0 copy
+common_checks hdr10copy
+check "hdr10copy: no libx265, no passes"       "! grep -qE 'libx265|pass=|-b:v|-crf' '$WORK_DIR/hdr10copy.sh'"
+check "hdr10copy: video copy planned"          "grep -q 'item_expect .*video=copy mode=copy' '$WORK_DIR/hdr10copy.sh'"
+check "hdr10copy: video stream COPIED"         "report_has hdr10copy 'Video stream: +COPIED \\(hevc 1280x720 yuv420p10le, as the source\\)'"
+check "hdr10copy: HDR10 still VERIFIED"        "report_has hdr10copy 'HDR10 mastering: +VERIFIED' && report_has hdr10copy 'Colour signalling: +MATCH'"
+eq    "hdr10copy: video payload identical"     "$(ffmpeg -v error -i "$T/out/hdr10copy.mkv" -map 0:v:0 -c copy -f streamhash -hash md5 - 2>/dev/null | cut -d, -f3)" \
+    "$(ffmpeg -v error -i "$T/in/HDR10.mkv" -map 0:v:0 -c copy -f streamhash -hash md5 - 2>/dev/null | cut -d, -f3)"
+check "hdr10copy: report says copied"          "grep -q 'Video encode mode: *source video copied' '$T/hdr10copy.log'"
+emit_encode_item 1 "$T/in/HDR10.mkv" "$T/out/x.mkv" Test copy "$DOWNSCALE_1080P_FILTER" "" 0 > "$T/copyscale.sh"
+check "copy + scaling refused"                 "grep -q 'item_failed .*when.*is.*scaled' '$T/copyscale.sh' && ! grep -q 'item_run' '$T/copyscale.sh'"
+
+hdr_tools_detect
+if [[ -n "$HDR10PLUS_TOOL" ]]; then
+    echo
+    echo "== HDR10+ (synthetic metadata), x265 CRF"
+    awk 'BEGIN {
+        printf "{\"JSONInfo\":{\"HDR10plusProfile\":\"A\",\"Version\":\"1.0\"},\"SceneInfo\":["
+        for (i = 0; i < 48; i++)
+            printf "%s{\"LuminanceParameters\":{\"AverageRGB\":1000,\"LuminanceDistributions\":{\"DistributionIndex\":[1,5,10,25,50,75,90,95,99],\"DistributionValues\":[10,50,100,500,1000,5000,10000,20000,40000]},\"MaxScl\":[40000,40000,40000]},\"NumberOfWindows\":1,\"TargetedSystemDisplayMaximumLuminance\":0,\"SceneFrameIndex\":%d,\"SceneId\":0,\"SequenceFrameIndex\":%d}", (i ? "," : ""), i, i
+        printf "],\"SceneInfoSummary\":{\"SceneFirstFrameIndex\":[0],\"SceneFrameNumbers\":[48]}}\n"
+    }' > "$T/h10p.json"
+    ffmpeg -v error -y -f lavfi -i "testsrc2=s=1280x720:r=24000/1001:d=2,format=yuv420p10le" \
+        -c:v libx265 -preset ultrafast -x265-params "$HDR_X265:dhdr10-info=$T/h10p.json" "$T/h10p.mkv"
+    mux_source "$T/h10p.mkv" "$T/in/HDR10P.mkv"
+    probe_hdr "$T/in/HDR10P.mkv" 0
+    check "h10p: source has HDR10+"            "[[ '$HDR_HDR10PLUS' == 1 ]]"
+
+    DV_POLICY=none; DV_MODE=""; HDR10P_POLICY=preserve
+    run_item h10pcrf "$T/in/HDR10P.mkv" "" 0 crf:22 "$(whole_title_estimate "$T/in/HDR10P.mkv" 22)"
+    crf_job_checks h10pcrf 22
+    common_checks h10pcrf
+    check "h10pcrf: HDR10+ extracted + passed to x265" "grep -q 'item_step hdr10+ item_hdr10plus_extract' '$WORK_DIR/h10pcrf.sh' && grep -q 'dhdr10-info=\$ITEM_TMP/hdr10plus.json' '$WORK_DIR/h10pcrf.sh'"
+    check "h10pcrf: HDR10+ VERIFIED"           "report_has h10pcrf 'HDR10\\+: +VERIFIED'"
+    check "h10pcrf: HDR10 mastering VERIFIED"  "report_has h10pcrf 'HDR10 mastering: +VERIFIED'"
+
+    HDR10P_POLICY=drop
+    run_item h10pdrop "$T/in/HDR10P.mkv" "" 0 crf:22
+    check "h10pdrop: HDR10+ DROPPED by choice" "report_has h10pdrop 'HDR10\\+: +DROPPED' && grep -q 'All encodes finished: 1 ok, 0 failed' '$T/h10pdrop.log'"
+
+    HDR10P_POLICY=preserve
+    run_item h10pcopy "$T/in/HDR10P.mkv" "" 0 copy
+    check "h10pcopy: HDR10+ kept by stream copy" "report_has h10pcopy 'HDR10\\+: +VERIFIED' && report_has h10pcopy 'Video stream: +COPIED'"
+    DV_POLICY=none; DV_MODE=""; HDR10P_POLICY=none
+else
+    SKIPPED+=("HDR10+ (needs hdr10plus_tool)")
+fi
 
 # ------------------------------------------------------------
 echo
@@ -1532,9 +1636,219 @@ if (( DOVI_TOOL_OK == 1 )) && [[ -n "$MKVMERGE" ]]; then
     check "dv: L5 rescaled 184 -> 138"         "grep -q 'L5 offsets: top=138, bottom=138' '$T/dv_summary.txt'"
     check "dv: 1080p output"                   "[[ \$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 '$T/out/dv.mkv') == 1080 ]]"
     check "dv: temp files removed on success"  "! ls -d '$WORK_DIR'/logs/*/item-1.tmp >/dev/null 2>&1"
+
+    echo
+    echo "== Dolby Vision profile 8.1, x265 CRF, 1440p -> 1080p"
+    DV_POLICY=preserve; DV_MODE=""; HDR10P_POLICY=none
+    run_item dvcrf "$T/in/DV.mkv" "$DOWNSCALE_1080P_FILTER" 0 crf:23
+    crf_job_checks dvcrf 23
+    common_checks dvcrf
+    check "dvcrf: RPU steps in job"            "grep -q 'item_step rpu item_dv_extract' '$WORK_DIR/dvcrf.sh' && grep -q 'item_dv_inject' '$WORK_DIR/dvcrf.sh'"
+    check "dvcrf: raw HEVC, frames pinned"     "grep -q -- '-fps_mode:v:0 passthrough -an -sn -dn -f hevc' '$WORK_DIR/dvcrf.sh'"
+    check "dvcrf: RPU VERIFIED"                "report_has dvcrf 'Dolby Vision RPU: +VERIFIED'"
+    check "dvcrf: HDR10 fallback VERIFIED"     "report_has dvcrf 'HDR10 fallback: +VERIFIED'"
+    check "dvcrf: 1080p output"                "[[ \$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 '$T/out/dvcrf.mkv') == 1080 ]]"
+    run_item dvcopy "$T/in/DV.mkv" "" 0 copy
+    check "dvcopy: DV kept by stream copy"     "report_has dvcopy 'Dolby Vision: +COPIED \(video stream copy, profile 8\)' && grep -q 'All encodes finished: 1 ok, 0 failed' '$T/dvcopy.log'"
+    DV_POLICY=none
 else
     SKIPPED+=("Dolby Vision (needs dovi_tool >= 2.1 and mkvmerge)")
 fi
+
+
+# ------------------------------------------------------------
+# run_menu HOME SCRIPT INPUT LOG [CONF]  ->  menu run in its own HOME
+run_menu() {
+    printf "$3" | HOME="$1" PATH="$AC/stub:$PATH" COMPRESS_CONF="${5:-$T/compress.conf}" \
+        bash "$2" > "$4" 2>&1
+}
+# new_home NAME  ->  a HOME with compress/{in,out,work} (work = the code under test)
+new_home() {
+    local h="$T/homes/$1"
+    mkdir -p "$h/compress/in" "$h/compress/out"
+    cp -r "$SRC_WORK" "$h/compress/work"
+    # no tests, and no job scripts / state / logs of real runs on this machine
+    rm -rf "$h/compress/work/tests" "$h/compress/work/logs" "$h/compress/work/cache" \
+        "$h/compress/work"/[a-z]*[0-9]_passes
+    rm -f "$h/compress/work"/[a-z]*[0-9].sh "$h/compress/work"/*.state "$h/compress/work"/*.progress
+    printf '%s' "$h"
+}
+# av_source VIDEO_ARGS... OUT  ->  2 s 640x360 video + E-AC-3 5.1 + AAC stereo
+av_source() {
+    local out="${*: -1}"
+    ffmpeg -v error -y -f lavfi -i "testsrc2=s=640x360:r=24:d=2" -f lavfi -i "sine=f=440:r=48000:d=2" \
+        -map 0:v -map 1:a -map 1:a "${@:1:$#-1}" \
+        -c:a:0 eac3 -ac:a:0 6 -b:a:0 640k -c:a:1 aac -ac:a:1 2 -b:a:1 128k \
+        -metadata:s:a:0 language=eng -metadata:s:a:1 language=eng "$out"
+}
+first_job() { ls "$1/compress/work"/$2[0-9]*.sh 2>/dev/null | head -1; }
+
+echo
+echo "== CRF samples use the selected output resolution and HDR signalling"
+eval "$(declare -f crf_sample_encode | sed '1s/crf_sample_encode/_real_crf_sample_encode/')"
+crf_sample_encode() {   # records FILTER X265 CRF START LENGTH, keeps the last sample
+    printf '%s\t%s\t%s\t%s\t%s\n' "$3" "$4" "$5" "$6" "$7" >> "$T/sample_calls"
+    _real_crf_sample_encode "$@" && cp "$8" "$T/last_sample.hevc"
+}
+dims() { ffprobe -v error -select_streams v:0 -show_entries stream=width,height,pix_fmt -of csv=p=0 "$1" | head -1; }
+ffmpeg -v error -y -f lavfi -i "testsrc2=s=3840x1920:r=24:d=1,format=yuv420p" -c:v libx264 -preset ultrafast -crf 16 "$T/uhd.mkv"
+CRF_SAMPLE_CACHE=0
+
+: > "$T/sample_calls"
+whole_title_estimate "$T/uhd.mkv" 25 "$DOWNSCALE_1080P_FILTER" > /dev/null
+eq    "15 downscaled: sample has the output scale filter" "$(cut -f1 "$T/sample_calls")" "$DOWNSCALE_1080P_FILTER"
+eq    "15 downscaled: sample encoded at 1920x960, 10-bit" "$(dims "$T/last_sample.hevc")" "1920,960,yuv420p10le"
+: > "$T/sample_calls"
+whole_title_estimate "$T/uhd.mkv" 25 "" > /dev/null
+eq    "16 4K kept: no scale filter"              "$(cut -f1 "$T/sample_calls")" ""
+eq    "16 4K kept: sample encoded at 3840x1920"  "$(dims "$T/last_sample.hevc")" "3840,1920,yuv420p10le"
+: > "$T/sample_calls"
+whole_title_estimate "$T/in/HDR10.mkv" 21 > /dev/null
+check "HDR10 sample: x265 HDR10 parameters"      "cut -f2 '$T/sample_calls' | grep -q 'transfer=smpte2084' && cut -f2 '$T/sample_calls' | grep -q 'master-display=' && cut -f2 '$T/sample_calls' | grep -q 'max-cll=1000,400'"
+eq    "HDR10 sample: PQ / BT.2020 in the sample" "$(ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer,color_primaries -of csv=p=0 "$T/last_sample.hevc")" "smpte2084,bt2020"
+eq    "HDR10 sample: same x265 params as the job" "$(cut -f2 "$T/sample_calls" | sed 's/:log-level=error$//')" \
+    "$(probe_hdr "$T/in/HDR10.mkv" 0; x265_color_params)"
+
+# sections: 5 spread over the title, the same ones for every CRF
+ffmpeg -v error -y -f lavfi -i "testsrc2=s=320x180:r=24:d=12" -c:v libx264 -preset ultrafast "$T/long.mkv"
+: > "$T/sample_calls"
+(
+    CRF_SAMPLE_SECONDS=1
+    CRF_TITLE_FILE="$T/long.mkv" CRF_TITLE_VIDX=0 CRF_TITLE_FILTER="" CRF_TITLE_DURATION=$(get_duration "$T/long.mkv") CRF_TITLE_POINTS=5
+    crf_select 25 26 1 crf_title_estimate > /dev/null
+)
+eq    "sampling: 5 sections x 2 CRFs"            "$(grep -c . "$T/sample_calls")" 10
+eq    "sampling: same sections for every CRF"    "$(awk -F'\t' '$3 == 25 { print $4 }' "$T/sample_calls" | tr '\n' ' ')" \
+                                                  "$(awk -F'\t' '$3 == 26 { print $4 }' "$T/sample_calls" | tr '\n' ' ')"
+check "sampling: spread 10..90 %, not the opening" "awk -F'\t' '\$3 == 25 { s[++n] = \$4 } END { exit !(n == 5 && s[1] > 0.5 && s[1] < 1.5 && s[5] > 10 && s[5] < 11) }' '$T/sample_calls'"
+CRF_SAMPLE_CACHE=1
+: > "$T/sample_calls"
+( CRF_SAMPLE_SECONDS=1; whole_title_estimate "$T/long.mkv" 30 > /dev/null; whole_title_estimate "$T/long.mkv" 30 > /dev/null )
+eq    "sampling: second run from the cache"      "$(grep -c . "$T/sample_calls")" 5
+
+# movie menu: 3840x1920 -> 1080p downscale is sampled at 1920x960
+RH=$(new_home res)
+cp "$T/uhd.mkv" "$RH/compress/in/UHD.mkv"
+run_menu "$RH" "$RH/compress/work/movie_compress.sh" "1\n2\n2\nn\n" "$T/menu_uhd_down.log"
+check "15 menu downscale: estimate at 1920x960" "grep -q 'Estimating video size from sample encodes (1920x960 output, downscaled like the final encode)' '$T/menu_uhd_down.log'"
+check "15 menu downscale: job scales + CRF"     "grep -q -- \"-filter:v:0 scale\" '$(first_job "$RH" c)' && grep -q -- '-crf:v:0 19 ' '$(first_job "$RH" c)'"
+rm -f "$RH/compress/work"/c[0-9]*.sh
+run_menu "$RH" "$RH/compress/work/movie_compress.sh" "1\n1\n2\nn\n" "$T/menu_uhd_keep.log"
+check "16 menu 4K kept: estimate at 3840x1920"  "grep -q 'Estimating video size from sample encodes (3840x1920 output)' '$T/menu_uhd_keep.log'"
+check "16 menu 4K kept: job does not scale"     "! grep -q -- '-filter:v:0' '$(first_job "$RH" c)'"
+eval "$(declare -f _real_crf_sample_encode | sed '1s/_real_crf_sample_encode/crf_sample_encode/')"
+
+echo
+echo "== smoke: High CRF 19 too large, CRF 20 fits (real samples)"
+DH=$(new_home demo)
+av_source -c:v libx264 -preset ultrafast -qp 0 "$DH/compress/in/Demo.mkv"
+e19=$(WORK_DIR="$DH/compress/work" whole_title_estimate "$DH/compress/in/Demo.mkv" 19)
+e20=$(WORK_DIR="$DH/compress/work" whole_title_estimate "$DH/compress/in/Demo.mkv" 20)
+check "demo: CRF 20 estimate below CRF 19"      "(( e20 < e19 ))"
+ceil=$(awk -v a="$e19" -v b="$e20" 'BEGIN { printf "%.12f", (a + b) / 2 / 1073741824 }')
+DEMO_CONF=$(conf_with demo "MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")
+run_menu "$DH" "$DH/compress/work/movie_compress.sh" "1\n2\nn\n" "$T/demo_high.log" "$DEMO_CONF"
+djob=$(first_job "$DH" c)
+echo "  ---- menu excerpt (ceiling $ceil GiB = midway between the CRF 19 and 20 estimates)"
+sed -n '/^CRF analysis:/,/estimated total/p' "$T/demo_high.log" | sed 's/^/  | /'
+check "demo: CRF 19 estimated too large"        "grep -q '^  CRF 19 -> estimated ' '$T/demo_high.log'"
+check "demo: CRF 20 estimated, fits"            "grep -q '^  CRF 20 -> estimated ' '$T/demo_high.log'"
+check "demo: nothing above CRF 20 sampled"      "! grep -qE 'sampling CRF (2[1-9])' '$T/demo_high.log'"
+check "demo: selected CRF 20"                   "grep -A1 '^Selected:' '$T/demo_high.log' | grep -q 'CRF 20'"
+check "demo: job is single-pass CRF 20"         "grep -q -- '-crf:v:0 20 ' '$djob' && [[ \$(grep -c libx265 '$djob') == 1 ]] && ! grep -qE -- '-b:v|pass=' '$djob'"
+eq    "demo: job carries the CRF 20 estimate"   "$(grep -o 'est_vbytes=[0-9]*' "$djob" | cut -d= -f2)" "$e20"
+bash "$djob" < /dev/null > "$T/demo_run.log" 2>&1
+echo "  ---- job excerpt"
+sed -n '/^Finished:/,/Audio: *copied/p' "$T/demo_run.log" | sed 's/^/  | /'
+check "demo: encoded once, CRF 20"              "grep -q 'ENCODING (single pass, CRF 20)' '$T/demo_run.log' && ! grep -qE 'PASS [12]/2' '$T/demo_run.log'"
+check "demo: audio copied (payload MATCH)"      "grep -q 'Audio track 1: *COPIED (E-AC-3 .*payload MD5 MATCH)' '$T/demo_run.log' && grep -q 'Audio track 2: *COPIED (AAC .*payload MD5 MATCH)' '$T/demo_run.log'"
+check "demo: actual vs estimate reported"       "grep -q 'Estimated video size: ' '$T/demo_run.log' && grep -qE 'Estimate error: +[-+][0-9.]+%' '$T/demo_run.log'"
+check "demo: job succeeded"                     "grep -q 'All encodes finished: 1 ok, 0 failed' '$T/demo_run.log'"
+check "demo: accuracy recorded"                 "awk -F'\\t' '\$2 == \"High\" && \$3 == \"20\" { f = 1 } END { exit !f }' '$DH/compress/work/logs/crf_estimates.tsv'"
+cp "$ROOT/verify.sh" "$DH/compress/"
+printf '2\n1\n' | HOME="$DH" bash "$DH/compress/verify.sh" > "$T/demo_verify.log" 2>&1
+check "demo: verify.sh shows x265 CRF 20"       "grep -q 'Video encode *x265 CRF 20.0 (single pass)' '$T/demo_verify.log' && grep -q 'Tier *High' '$T/demo_verify.log'"
+
+echo
+echo "== smoke: Base CRF 25 fits, selected immediately"
+rm -f "$DH/compress/work"/c[0-9]*.sh "$DH/compress/out"/*.mkv
+run_menu "$DH" "$DH/compress/work/movie_compress.sh" "1\n3\nn\n" "$T/demo_base.log"
+sed -n '/^CRF analysis:/,/estimated total/p' "$T/demo_base.log" | sed 's/^/  | /'
+check "demo Base: only CRF 25 sampled"          "grep -q 'sampling CRF 25' '$T/demo_base.log' && ! grep -qE 'sampling CRF (2[6-9])' '$T/demo_base.log'"
+check "demo Base: selected CRF 25"              "grep -A1 '^Selected:' '$T/demo_base.log' | grep -q 'CRF 25' && grep -q -- '-crf:v:0 25 ' '$(first_job "$DH" c)'"
+
+echo
+echo "== ceiling not reachable within the CRF range"
+rm -f "$DH/compress/work"/c[0-9]*.sh
+TINY_CONF=$(conf_with tiny MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=0.000000001 MOVIE_BASE_VIDEO_SIZE_CEILING_GIB=0.000000001)
+run_menu "$DH" "$DH/compress/work/movie_compress.sh" "1\n2\n1\nn\n" "$T/over_high.log" "$TINY_CONF"
+check "5 High: every CRF 19..23 sampled"        "[[ \$(grep -cE 'sampling CRF (19|2[0-3]) ' '$T/over_high.log') == 5 ]] && ! grep -q 'sampling CRF 24' '$T/over_high.log'"
+check "5 High: warning names the range"         "grep -q 'cannot be met within the' '$T/over_high.log' && grep -q 'High CRF range: even CRF 23' '$T/over_high.log'"
+check "5 High: oversize shown"                  "grep -qE 'GiB above the ceiling' '$T/over_high.log'"
+check "5 High: confirmation asked"              "grep -q '1) Encode at CRF 23 anyway' '$T/over_high.log'"
+check "5 High: confirmed -> CRF 23 job"         "grep -q -- '-crf:v:0 23 ' '$(first_job "$DH" c)'"
+check "5 High: summary says ceiling not met"    "grep -q 'ceiling NOT met' '$T/over_high.log'"
+rm -f "$DH/compress/work"/c[0-9]*.sh
+run_menu "$DH" "$DH/compress/work/movie_compress.sh" "1\n3\n2\nn\n" "$T/over_base.log" "$TINY_CONF"
+check "9 Base: CRF 29 warned, skip -> nothing" "grep -q 'Base CRF range: even CRF 29' '$T/over_base.log' && grep -q 'Nothing queued' '$T/over_base.log' && [[ -z '$(first_job "$DH" c)' ]]"
+
+echo
+echo "== source-quality guard (source already below the CRF demand)"
+GH=$(new_home guard)
+av_source -c:v libx265 -preset ultrafast -crf 45 -x265-params log-level=error "$GH/compress/in/Low.mkv"
+run_menu "$GH" "$GH/compress/work/movie_compress.sh" "1\n2\n1\nn\n" "$T/guard_copy.log"
+gjob=$(first_job "$GH" c)
+check "guard: reported before encoding"         "grep -q 'Source-quality guard: the source video is already below what' '$T/guard_copy.log' && grep -q 'High CRF 19 would need' '$T/guard_copy.log'"
+check "guard: keep source -> video copy job"    "grep -q 'item_expect .*video=copy' '$gjob' && ! grep -q libx265 '$gjob'"
+check "guard: summary says source kept"         "grep -q 'source video kept unchanged (stream copy)' '$T/guard_copy.log'"
+bash "$gjob" < /dev/null > "$T/guard_run.log" 2>&1
+check "guard: copy job ok, video COPIED"        "grep -q 'All encodes finished: 1 ok, 0 failed' '$T/guard_run.log' && grep -q 'Video stream: *COPIED' '$T/guard_run.log'"
+check "guard: audio still copied + verified"    "grep -q 'Audio track 1: *COPIED (E-AC-3 .*payload MD5 MATCH)' '$T/guard_run.log'"
+rm -f "$GH/compress/work"/c[0-9]*.sh "$GH/compress/out"/*.mkv
+run_menu "$GH" "$GH/compress/work/movie_compress.sh" "1\n2\n2\nn\n" "$T/guard_enc.log"
+check "guard: encode anyway -> CRF 19 job"      "grep -q -- '-crf:v:0 19 ' '$(first_job "$GH" c)' && grep -q 'encode anyway chosen' '$T/guard_enc.log'"
+rm -f "$GH/compress/work"/c[0-9]*.sh
+run_menu "$GH" "$GH/compress/work/movie_compress.sh" "1\n2\n3\nn\n" "$T/guard_skip.log"
+check "guard: skip -> nothing queued"           "grep -q 'Nothing queued' '$T/guard_skip.log' && [[ -z '$(first_job "$GH" c)' ]]"
+GA=$(new_home guardavc)
+av_source -c:v libx264 -preset ultrafast -crf 45 "$GA/compress/in/LowAvc.mkv"
+run_menu "$GA" "$GA/compress/work/movie_compress.sh" "1\n2\n1\n2\nn\n" "$T/guard_avc.log"
+check "guard: non-HEVC source cannot be kept"   "grep -q '1) (not available: keeping the source video needs an HEVC source' '$T/guard_avc.log' && grep -q -- '-crf:v:0 19 ' '$(first_job "$GA" c)'"
+mkdir -p "$GH/compress/in/LowShow"
+cp "$GH/compress/in/Low.mkv" "$GH/compress/in/LowShow/E01.mkv"
+cp "$GH/compress/in/Low.mkv" "$GH/compress/in/LowShow/E02.mkv"
+mv "$GH/compress/in/Low.mkv" "$T/Low.mkv"
+run_menu "$GH" "$GH/compress/work/series_compress.sh" "1\n2\n1\ny\n" "$T/guard_series.log"
+sjob=$(first_job "$GH" series)
+check "guard series: episodes listed"           "grep -q 'Source-quality guard: 2 episode(s) are already below' '$T/guard_series.log'"
+check "guard series: both kept (video copy)"    "[[ \$(grep -c 'video=copy' '$sjob') == 2 ]] && ! grep -q libx265 '$sjob'"
+
+echo
+echo "== progress-check: CRF jobs show one encode step"
+PH="$T/phome"
+mkdir -p "$PH/compress/work" "$PH/stub"
+cp -r "$WORK_DIR/lib" "$PH/compress/work/"
+cp "$ROOT/progress-check.sh" "$PH/compress/"
+now=$(date +%s)
+cat > "$PH/stub/tmux" <<EOF
+#!/usr/bin/env bash
+[[ "\$1" == list-sessions ]] && { echo "c7 $now"; echo "c8 $now"; }
+exit 0
+EOF
+chmod +x "$PH/stub/tmux"
+for s in c7 c8; do
+    if [[ $s == c7 ]]; then m=crf c=21 p=encode tier=High; else m=abr c="" p=1/2 tier=Quality; fi
+    printf 'version=1\nsession=%s\ntype=movie\nstatus=running\nitem=1\nitems=1\nok=0\nfailed=0\nname=%s.mkv\ninput=/x/%s.mkv\noutput=/y/%s.mkv\ntier=%s\npass=%s\nmode=%s\ncrf=%s\nduration=3600\nstarted=%s\nupdated=%s\nprogress=%s\nlog_dir=/z\n' \
+        "$s" "$s" "$s" "$s" "$tier" "$p" "$m" "$c" "$now" "$now" "$PH/compress/work/$s.progress" > "$PH/compress/work/$s.state"
+    printf 'out_time_us=1800000000\nspeed=2.0x\nprogress=continue\n' > "$PH/compress/work/$s.progress"
+done
+HOME="$PH" PATH="$PH/stub:$PATH" bash "$PH/compress/progress-check.sh" > "$T/progress.out" 2>&1
+c7=$(sed -n '/^c7 /,/^$/p' "$T/progress.out"); c8=$(sed -n '/^c8 /,/^$/p' "$T/progress.out")
+check "21 CRF job: one encode step with its CRF" "grep -q 'Tier: High .*Encoding, CRF: 21' <<< \"\$c7\""
+check "21 CRF job: no pass 1/2 or 2/2"           "! grep -q 'Pass' <<< \"\$c7\""
+check "21 CRF job: progress and ETA"             "grep -q '50.0%.*ETA 00:15:00' <<< \"\$c7\""
+check "20 Quality job: still Pass 1/2"           "grep -q 'Tier: Quality .*Pass: 1/2' <<< \"\$c8\""
+check "21 job state records mode / CRF"          "grep -qx 'mode=crf' '$WORK_DIR/sdrcrf.state' && grep -qx 'crf=24' '$WORK_DIR/sdrcrf.state'"
 
 echo
 echo "============================================================"

@@ -244,6 +244,186 @@ color_output_args() {
 # hdr_dovi.sh)
 
 # ------------------------------------------------------------
+# Shared video encode settings
+# ------------------------------------------------------------
+
+# x265 preset of every movie / series video encode (final encodes and
+# the CRF sample encodes, so samples behave like the real encode)
+X265_PRESET="slow"
+
+# 1080p downscale of the movie / series menus (aspect kept, even sizes)
+DOWNSCALE_1080P_FILTER="scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2"
+
+# downscale_1080p_dims WIDTH HEIGHT  ->  "WIDTH HEIGHT" after
+# DOWNSCALE_1080P_FILTER
+downscale_1080p_dims() {
+    awk -v w="$1" -v h="$2" 'BEGIN {
+        sx = 1920 / w
+        sy = 1080 / h
+        s = (sx < sy ? sx : sy)
+        if (s > 1) s = 1
+        ow = int((w * s) / 2) * 2
+        oh = int((h * s) / 2) * 2
+        print ow, oh
+    }'
+}
+
+# ------------------------------------------------------------
+# CRF size estimation (sample encodes; the selection math is in
+# policy.sh: crf_select, crf_sample_points, series_crf_spread)
+# ------------------------------------------------------------
+
+# crf_x265_params FILE VIDX  ->  the x265 colour / HDR10 parameters the
+# final encode of FILE uses (probe_hdr in a subshell, so the caller's
+# HDR_* globals are left alone)
+crf_x265_params() {
+    (
+        probe_hdr "$1" "$2" > /dev/null 2>&1
+        x265_color_params
+    )
+}
+
+# crf_sample_encode FILE VIDX FILTER X265_PARAMS CRF START LENGTH OUT
+#
+# Encodes one section of the main video stream the way the final CRF
+# encode does (emit_encode_item): same scaling filter (the selected
+# output resolution), preset, CRF, 10-bit pixel format and x265 colour /
+# HDR10 parameters. Dolby Vision RPUs and HDR10+ dynamic metadata are
+# not added: they are a few bytes per frame and do not change how x265
+# codes the picture. Raw HEVC output, so the file size is the video
+# payload.
+crf_sample_encode() {
+    local file="$1" vidx="$2" filter="$3" x265="$4" crf="$5" start="$6" len="$7" out="$8"
+    local a=()
+
+    [[ -n "$filter" ]] && a+=(-filter:v:0 "$filter")
+    libx265_has_option dolbyvision && a+=(-dolbyvision:v:0 0)
+
+    ffmpeg -nostdin -v error -y -ss "$start" -i "$file" -t "$len" \
+        -map "0:$vidx" "${a[@]+"${a[@]}"}" \
+        -c:v:0 libx265 -preset "$X265_PRESET" -crf:v:0 "$crf" -pix_fmt:v:0 yuv420p10le \
+        -x265-params:v:0 "${x265:+$x265:}log-level=error" \
+        -an -sn -dn -f hevc "$out"
+}
+
+# _crf_cache_dir  ->  sample result cache ("" = caching off:
+# CRF_SAMPLE_CACHE=0)
+_crf_cache_dir() {
+    [[ "${CRF_SAMPLE_CACHE:-1}" == "0" ]] && return 0
+    printf '%s' "${WORK_DIR:-$HOME/compress/work}/cache/crf_samples"
+}
+
+# crf_sample_title FILE VIDX FILTER CRF DURATION POINTS
+#
+# Encodes the sample sections of FILE (crf_sample_points: POINTS
+# sections of CRF_SAMPLE_SECONDS) at CRF. The same sections are used for
+# every CRF. Sets CRF_SAMPLE_BYTES (all sections) and CRF_SAMPLE_SECS
+# (their length). Each section result is cached under
+# WORK_DIR/cache/crf_samples, keyed by the resolved file, its size and
+# mtime, the section and every encode setting, so running the menu
+# again does not re-encode it. Returns 1 when a sample encode fails.
+crf_sample_title() {
+    local file="$1" vidx="$2" filter="$3" crf="$4" dur="$5" points="$6"
+    local x265 cache key start len b line tmp err sig
+    local -a sections
+
+    CRF_SAMPLE_BYTES=0
+    CRF_SAMPLE_SECS=0
+
+    mapfile -t sections < <(crf_sample_points "$dur" "$points" "$CRF_SAMPLE_SECONDS")
+    (( ${#sections[@]} )) || return 1
+
+    x265=$(crf_x265_params "$file" "$vidx")
+    cache=$(_crf_cache_dir)
+    sig="$(readlink -f -- "$file")|$(stat -L -c '%s %Y' -- "$file")|$vidx|$filter|$x265|$X265_PRESET|$crf"
+    [[ -n "$cache" ]] && mkdir -p "$cache" 2>/dev/null
+
+    tmp=$(mktemp "${TMPDIR:-/tmp}/crf-sample.XXXXXX") || return 1
+    err="$tmp.err"
+
+    for line in "${sections[@]}"; do
+        read -r start len <<< "$line"
+        b=""
+
+        if [[ -n "$cache" ]]; then
+            key=$(printf '%s|%s|%s' "$sig" "$start" "$len" | md5sum | cut -c1-32)
+            [[ -s "$cache/$key" ]] && b=$(< "$cache/$key")
+        fi
+
+        if [[ ! "$b" =~ ^[0-9]+$ ]]; then
+            if ! crf_sample_encode "$file" "$vidx" "$filter" "$x265" "$crf" "$start" "$len" "$tmp" 2> "$err" ||
+               [[ ! -s "$tmp" ]]; then
+                echo "    sample encode failed (CRF $crf at ${start}s): $(head -n 3 "$err" | tr '\n' ' ')" >&2
+                rm -f -- "$tmp" "$err"
+                return 1
+            fi
+            b=$(file_bytes "$tmp")
+            [[ -n "$cache" ]] && printf '%s\n' "$b" > "$cache/$key" 2>/dev/null
+        fi
+
+        read -r CRF_SAMPLE_BYTES CRF_SAMPLE_SECS < <(
+            awk -v t="$CRF_SAMPLE_BYTES" -v s="$CRF_SAMPLE_SECS" -v b="$b" -v l="$len" \
+                'BEGIN { printf "%.0f %.3f\n", t + b, s + l }')
+    done
+
+    rm -f -- "$tmp" "$err"
+    return 0
+}
+
+# crf_title_estimate CRF  (ESTIMATOR for crf_select / crf_select_exact)
+#
+# One title: reads CRF_TITLE_FILE CRF_TITLE_VIDX CRF_TITLE_FILTER
+# CRF_TITLE_DURATION CRF_TITLE_POINTS. Leaves the whole-title video
+# estimate (bytes) in CRF_EST_RESULT.
+crf_title_estimate() {
+    local crf="$1" n
+
+    n=$(crf_sample_points "$CRF_TITLE_DURATION" "$CRF_TITLE_POINTS" "$CRF_SAMPLE_SECONDS" | grep -c .)
+    printf '  sampling CRF %s (%s section%s)... ' "$crf" "$n" "$( (( n == 1 )) || echo s)"
+
+    if ! crf_sample_title "$CRF_TITLE_FILE" "$CRF_TITLE_VIDX" "$CRF_TITLE_FILTER" "$crf" \
+            "$CRF_TITLE_DURATION" "$CRF_TITLE_POINTS"; then
+        echo "FAILED"
+        return 1
+    fi
+
+    CRF_EST_RESULT=$(crf_extrapolate "$CRF_SAMPLE_BYTES" "$CRF_SAMPLE_SECS" "$CRF_TITLE_DURATION")
+    echo "~$(size_text "$CRF_EST_RESULT") video"
+}
+
+# crf_series_estimate CRF  (ESTIMATOR for crf_select / crf_select_exact)
+#
+# A series batch: samples the episodes in CRF_SERIES_SAMPLED (indexes
+# into FILES / EP_VIDX / EP_DUR) with CRF_SERIES_FILTER, spreads the
+# result over every episode (series_crf_spread) and leaves the MEDIAN
+# episode estimate in CRF_EST_RESULT. Per-episode estimates are kept in
+# CRF_SERIES_EP_BYTES[crf] ("b0 b1 ...") and CRF_SERIES_EP_FROM[crf].
+crf_series_estimate() {
+    local crf="$1" i rates=() k=0
+
+    for i in "${!EP_DUR[@]}"; do
+        rates[$i]="-"
+    done
+
+    for i in "${CRF_SERIES_SAMPLED[@]}"; do
+        ((k += 1))
+        printf '  sampling CRF %s, episode %d/%d (%s)... ' "$crf" "$k" "${#CRF_SERIES_SAMPLED[@]}" "$(basename "${FILES[$i]}")"
+        if ! crf_sample_title "${FILES[$i]}" "${EP_VIDX[$i]}" "$CRF_SERIES_FILTER" "$crf" \
+                "${EP_DUR[$i]}" "$SERIES_CRF_SAMPLE_POINTS"; then
+            echo "FAILED"
+            return 1
+        fi
+        rates[$i]=$(awk -v b="$CRF_SAMPLE_BYTES" -v s="$CRF_SAMPLE_SECS" 'BEGIN { printf "%.3f", b / s }')
+        echo "~$(size_text "$(crf_extrapolate "$CRF_SAMPLE_BYTES" "$CRF_SAMPLE_SECS" "${EP_DUR[$i]}")") video"
+    done
+
+    series_crf_spread "${rates[@]}" || return 1
+    CRF_EST_RESULT="$SC_MEDIAN_BYTES"
+    CRF_SERIES_EP_BYTES[$crf]="${SC_EP_BYTES[*]}"
+    CRF_SERIES_EP_FROM[$crf]="${SC_EP_FROM[*]}"
+}
+
+# ------------------------------------------------------------
 # Metadata helpers
 # ------------------------------------------------------------
 
@@ -702,7 +882,7 @@ matroska_mux_args() {
 }
 
 # ------------------------------------------------------------
-# Stream mapping for the final (pass 2) mux
+# Stream mapping for the final mux
 # ------------------------------------------------------------
 
 # build_stream_map FILE MAIN_VIDEO_INDEX
@@ -916,27 +1096,50 @@ emit_failed_item() {
     printf 'fi\n\n'
 }
 
-# emit_encode_item INDEX IN OUT TIER VIDEO_KBPS FILTER PASSLOG OVERWRITE
+# emit_encode_item INDEX IN OUT TIER VIDEO FILTER PASSLOG OVERWRITE [EST_VIDEO_BYTES]
 #
-# Two-pass libx265 encode of the main video stream; every other stream
-# is mapped explicitly (see build_stream_map). Every audio stream is
-# copied unchanged (-c:a copy; no tier-dependent audio arguments) and
-# verified afterwards (codec / layout / payload hash, see
-# item_verify_output). Pass 1 reads video only (-an -sn -dn).
+# VIDEO selects the video encode of the main video stream:
+#   crf:N   single-pass libx265 CRF encode (movie / series High, Base,
+#           Custom). No -b:v, no pass logs (PASSLOG is ignored).
+#           EST_VIDEO_BYTES, the pre-encode estimate, is reported against
+#           the actual size afterwards (never a failure).
+#   copy    the source video stream is kept unchanged (source-quality
+#           guard: a CRF encode would not be smaller than the source).
+#           FILTER must be empty.
+#   KBPS    two-pass libx265 at KBPS kb/s (movie Quality); PASSLOG is the
+#           x265 stats file prefix. Pass 1 reads video only (-an -sn -dn).
+#
+# Every other stream is mapped explicitly (see build_stream_map). Every
+# audio stream is copied unchanged (-c:a copy; no tier-dependent audio
+# arguments) and verified afterwards (codec / layout / payload hash, see
+# item_verify_output).
 #
 # Dolby Vision / HDR10+ follow DV_POLICY / HDR10P_POLICY (set by
 # confirm_dynamic_range; see hdr_dovi.sh). Sources with Dolby Vision
-# preserved use the RPU workflow; everything else uses the single
-# ffmpeg pass-2 mux.
+# preserved use the RPU workflow; everything else uses a single ffmpeg
+# encode + mux.
 emit_encode_item() {
     local index="$1"
     local in="$2"
     local out="$3"
     local tier="$4"
-    local kbps="$5"
+    local video="$5"
     local filter="$6"
     local passlog="$7"
     local overwrite="$8"
+    local est="${9:-}"
+
+    local mode kbps="" crf=""
+
+    case "$video" in
+        crf:*) mode="crf"; crf="${video#crf:}" ;;
+        copy)  mode="copy" ;;
+        *)     mode="abr"; kbps="$video" ;;
+    esac
+
+    # only two-pass encodes write x265 stats files
+    [[ "$mode" == "abr" ]] || passlog=""
+    [[ "$est" =~ ^[0-9]+$ ]] || est=""
 
     local vidx x265 color dv="" stale=""
     local dv_policy="none" h10p_policy="none" dv_out_profile="" dv_out_compat=""
@@ -944,6 +1147,16 @@ emit_encode_item() {
     vidx=$(main_video_index "$in")
     probe_hdr "$in" "$vidx"
     build_stream_map "$in" "$vidx"
+
+    if [[ "$mode" == "copy" ]]; then
+        if [[ -n "$filter" ]]; then
+            emit_failed_item "$index" "$in" "$out" "$tier" "$overwrite" \
+                "the source video cannot be kept (stream copy) when it is scaled"
+            return 0
+        fi
+        emit_copy_item "$index" "$in" "$out" "$tier" "$overwrite" "$vidx"
+        return 0
+    fi
 
     # ---- Dolby Vision / HDR10+ policy for this file
     if (( HDR_DV == 1 )); then
@@ -986,16 +1199,28 @@ emit_encode_item() {
         dv="-dolbyvision:v:0 0 "
     fi
 
-    local p1="pass=1:stats=$passlog${x265:+:$x265}"
-    local p2="pass=2:stats=$passlog${x265:+:$x265}"
-    local p1q p2q vf=""
+    # rate:   rate-control options of the video encode
+    # p1q/pq: shell-quoted -x265-params value of pass 1 / the final encode
+    #         ("" = no -x265-params)
+    local rate p1q="" pq="" vf="" label
+    local h10p_arg='dhdr10-info=$ITEM_TMP/hdr10plus.json'
 
-    p1q=$(printf '%q' "$p1")
-    p2q=$(printf '%q' "$p2")
-
-    if [[ "$h10p_policy" == "preserve" ]]; then
-        p1q+='":dhdr10-info=$ITEM_TMP/hdr10plus.json"'
-        p2q+='":dhdr10-info=$ITEM_TMP/hdr10plus.json"'
+    if [[ "$mode" == "abr" ]]; then
+        rate="-b:v:0 ${kbps}k"
+        label="2/2"
+        p1q=$(printf '%q' "pass=1:stats=$passlog${x265:+:$x265}")
+        pq=$(printf '%q' "pass=2:stats=$passlog${x265:+:$x265}")
+        if [[ "$h10p_policy" == "preserve" ]]; then
+            p1q+="\":$h10p_arg\""
+            pq+="\":$h10p_arg\""
+        fi
+    else
+        rate="-crf:v:0 $(printf '%q' "$crf")"
+        label="encode"
+        [[ -n "$x265" ]] && pq=$(printf '%q' "$x265")
+        if [[ "$h10p_policy" == "preserve" ]]; then
+            pq+="\"${x265:+:}$h10p_arg\""
+        fi
     fi
 
     [[ -n "$filter" ]] && vf="-filter:v:0 $(printf '%q' "$filter") "
@@ -1013,8 +1238,9 @@ emit_encode_item() {
         "$index" "$in" "$out" "$tier" "$overwrite" "$passlog"
     # atrans= (empty): no audio track is transcoded; ahash=1: the copied
     # audio payload is hash-compared with the source.
-    printf '   item_expect vidx=%q dv=%q dv_profile=%q dv_compat=%q hdr10p=%q scaled=%q copyts=%q atrans= ahash=1 &&\n' \
-        "$vidx" "$( (( HDR_DV == 1 )) && echo "$dv_policy" || echo none)" \
+    printf '   item_expect vidx=%q mode=%q crf=%q kbps=%q est_vbytes=%q dv=%q dv_profile=%q dv_compat=%q hdr10p=%q scaled=%q copyts=%q atrans= ahash=1 &&\n' \
+        "$vidx" "$mode" "$crf" "$kbps" "$est" \
+        "$( (( HDR_DV == 1 )) && echo "$dv_policy" || echo none)" \
         "$dv_out_profile" "$dv_out_compat" "$h10p_policy" "$scaled" \
         "$( [[ "$dv_policy" == "preserve" ]] && echo 1 || echo 0)"
 
@@ -1026,23 +1252,23 @@ emit_encode_item() {
         printf '   item_step hdr10+ item_hdr10plus_extract %q %q &&\n' "$in" "$vidx"
     fi
 
-    # Pass 1 is the same for every path (the DV path only pins the frame
-    # sequence so that frames and RPUs stay 1:1).
-    printf '   item_run 1/2 ffmpeg -y -i %q \\\n' "$in"
-    printf '      -map 0:%s %s\\\n' "$vidx" "$vf"
-    printf '      -c:v:0 libx265 -preset slow -b:v:0 %sk -pix_fmt:v:0 yuv420p10le %s\\\n' "$kbps" "$dv"
-    printf '      -x265-params:v:0 %s %s\\\n' "$p1q" "$color"
-    [[ "$dv_policy" == "preserve" ]] && printf '      -fps_mode:v:0 passthrough \\\n'
-    printf '      -an -sn -dn -f null /dev/null &&\n'
+    if [[ "$mode" == "abr" ]]; then
+        # Pass 1 is the same for every path (the DV path only pins the
+        # frame sequence so that frames and RPUs stay 1:1).
+        printf '   item_run 1/2 ffmpeg -y -i %q \\\n' "$in"
+        printf '      -map 0:%s %s\\\n' "$vidx" "$vf"
+        _emit_x265_lines "$rate" "$dv" "$p1q" "$color"
+        [[ "$dv_policy" == "preserve" ]] && printf '      -fps_mode:v:0 passthrough \\\n'
+        printf '      -an -sn -dn -f null /dev/null &&\n'
+    fi
 
     if [[ "$dv_policy" == "preserve" ]]; then
-        # Pass 2 -> raw HEVC, RPU injected, wrapped by mkvmerge (DV
+        # Final encode -> raw HEVC, RPU injected, wrapped by mkvmerge (DV
         # configuration record + source timestamps), then the same mux
         # as the normal path with the video taken from the wrapped file.
-        printf '   item_run 2/2 ffmpeg -y -i %q \\\n' "$in"
+        printf '   item_run %s ffmpeg -y -i %q \\\n' "$label" "$in"
         printf '      -map 0:%s %s\\\n' "$vidx" "$vf"
-        printf '      -c:v:0 libx265 -preset slow -b:v:0 %sk -pix_fmt:v:0 yuv420p10le %s\\\n' "$kbps" "$dv"
-        printf '      -x265-params:v:0 %s %s\\\n' "$p2q" "$color"
+        _emit_x265_lines "$rate" "$dv" "$pq" "$color"
         printf '      -fps_mode:v:0 passthrough -an -sn -dn -f hevc "$ITEM_TMP/video.hevc" &&\n'
 
         printf '   item_step dv-inject item_dv_inject %s &&\n' "$(get_resolution "$in" "$vidx" | tr x ' ')"
@@ -1053,16 +1279,52 @@ emit_encode_item() {
         printf '      -c copy %s-c:a copy \\\n' "$MAP_CODEC_ARGS"
         printf '      %s\\\n' "$(source_video_tag_args "$in" "$vidx")"
     else
-        printf '   item_run 2/2 ffmpeg -y -i %q \\\n' "$in"
+        printf '   item_run %s ffmpeg -y -i %q \\\n' "$label" "$in"
         printf '      %s\\\n' "$MAP_ARGS"
         printf '      -c copy %s-c:a copy \\\n' "$MAP_CODEC_ARGS"
         [[ -n "$vf" ]] && printf '      %s\\\n' "$vf"
-        printf '      -c:v:0 libx265 -preset slow -b:v:0 %sk -pix_fmt:v:0 yuv420p10le %s\\\n' "$kbps" "$dv"
-        printf '      -x265-params:v:0 %s %s\\\n' "$p2q" "$color"
+        _emit_x265_lines "$rate" "$dv" "$pq" "$color"
     fi
 
     [[ -n "$MAP_META_ARGS" ]] && printf '      %s\\\n' "$MAP_META_ARGS"
     printf '      %s\\\n' "$stale"
+    printf '      -map_metadata 0 -map_chapters 0 -max_muxing_queue_size 4096 %s\\\n' "$(matroska_mux_args)"
+    emit_part_and_covers "$in"
+    printf 'then\n'
+    printf '    item_succeeded\n'
+    printf 'else\n'
+    printf '    item_failed\n'
+    printf 'fi\n\n'
+}
+
+# _emit_x265_lines RATE DV X265_PARAMS_QUOTED COLOR  ->  the libx265
+# option lines of a generated ffmpeg command
+_emit_x265_lines() {
+    printf '      -c:v:0 libx265 -preset %s %s -pix_fmt:v:0 yuv420p10le %s\\\n' "$X265_PRESET" "$1" "$2"
+    if [[ -n "$3" ]]; then
+        printf '      -x265-params:v:0 %s %s\\\n' "$3" "$4"
+    elif [[ -n "$4" ]]; then
+        printf '      %s\\\n' "$4"
+    fi
+}
+
+# emit_copy_item INDEX IN OUT TIER OVERWRITE VIDX
+#
+# Source-quality guard: the main video stream is copied unchanged (no
+# lossy re-encode that would not be smaller than the source). Everything
+# else is handled exactly like an encode item: all audio copied and
+# hash-verified, subtitles / attachments / covers / chapters / metadata
+# kept. Dolby Vision and HDR10+ stay in the copied stream (verified).
+emit_copy_item() {
+    local index="$1" in="$2" out="$3" tier="$4" overwrite="$5" vidx="$6"
+
+    printf '# ---- item %s  (source video kept: stream copy)\n' "$index"
+    printf 'if item_begin %q %q %q %q %q "" &&\n' "$index" "$in" "$out" "$tier" "$overwrite"
+    printf '   item_expect vidx=%q video=copy mode=copy dv=none hdr10p=none scaled=0 copyts=0 atrans= ahash=1 &&\n' "$vidx"
+    printf '   item_run mux ffmpeg -y -i %q \\\n' "$in"
+    printf '      %s\\\n' "$MAP_ARGS"
+    printf '      -c copy %s-c:a copy \\\n' "$MAP_CODEC_ARGS"
+    [[ -n "$MAP_META_ARGS" ]] && printf '      %s\\\n' "$MAP_META_ARGS"
     printf '      -map_metadata 0 -map_chapters 0 -max_muxing_queue_size 4096 %s\\\n' "$(matroska_mux_args)"
     emit_part_and_covers "$in"
     printf 'then\n'

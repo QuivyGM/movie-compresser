@@ -79,19 +79,35 @@ script_inputs() {
     awk '!seen[$0]++'
 }
 
+# step_text PASS [MODE] [CRF]  ->  what the item is doing:
+#   "Pass: 1/2" / "Pass: 2/2"      two-pass encode (Quality)
+#   "Encoding, CRF: 21"            single-pass CRF encode (no passes)
+#   "Step: mux" / "Step: verify"   other steps
+step_text() {
+    local pass="$1" mode="${2:-}" crf="${3:-}"
+
+    if [[ "$pass" == "encode" ]]; then
+        printf 'Encoding%s' "${crf:+, CRF: $crf}"
+    elif [[ -z "$pass" || "$pass" == "-" || "$pass" == */* ]]; then
+        printf 'Pass: %s' "${pass:--}"
+    else
+        printf 'Step: %s' "$pass"
+    fi
+}
+
 print_row() {
-    # session type item status name tier pass percent encoded total speed eta wall
+    # session type item status name tier step percent encoded total speed eta wall
     local session="$1" type="$2" item="$3" status="$4" name="$5" tier="$6"
-    local pass="$7" pct="$8" enc="$9" total="${10}" speed="${11}" eta="${12}" wall="${13}"
+    local step="$7" pct="$8" enc="$9" total="${10}" speed="${11}" eta="${12}" wall="${13}"
 
     printf '%-9s %-7s %-6s %s\n' "$session" "$type" "$item" "$status"
     printf '    %s\n' "$name"
 
     if [[ "$pct" == "-" ]]; then
-        printf '    Tier: %-9s Pass: %-5s Elapsed: %s\n' "$tier" "$pass" "$wall"
+        printf '    Tier: %-9s %-11s Elapsed: %s\n' "$tier" "$step" "$wall"
     else
-        printf '    Tier: %-9s Pass: %-5s %6s   %s / %s   %sx   ETA %s   Elapsed: %s\n' \
-            "$tier" "$pass" "$pct" "$enc" "$total" "$speed" "$eta" "$wall"
+        printf '    Tier: %-9s %-11s %6s   %s / %s   %sx   ETA %s   Elapsed: %s\n' \
+            "$tier" "$step" "$pct" "$enc" "$total" "$speed" "$eta" "$wall"
     fi
 
     echo
@@ -159,13 +175,13 @@ for entry in "${sessions[@]}"; do
             failed)
                 print_row "$session" "$type" "$item" \
                     "FINISHED WITH ERRORS: ${ST[ok]:-0} ok, ${ST[failed]:-0} failed (session waits for Enter)" \
-                    "Logs: ${ST[log_dir]:-?}" "$tier" "-" "-" "" "" "" "" "$wall"
+                    "Logs: ${ST[log_dir]:-?}" "$tier" "$(step_text -)" "-" "" "" "" "" "$wall"
                 ((shown++))
                 continue
                 ;;
             finished)
                 print_row "$session" "$type" "$item" \
-                    "Finished: ${ST[ok]:-0} ok" "$name" "$tier" "-" "-" "" "" "" "" "$wall"
+                    "Finished: ${ST[ok]:-0} ok" "$name" "$tier" "$(step_text -)" "-" "" "" "" "" "$wall"
                 ((shown++))
                 continue
                 ;;
@@ -176,13 +192,21 @@ for entry in "${sessions[@]}"; do
         label="Encoding"
         (( ${ST[failed]:-0} > 0 )) && label="Encoding (${ST[failed]} failed so far)"
 
+        step=$(step_text "$pass" "${ST[mode]:-}" "${ST[crf]:-}")
+
         if [[ -z "$pass" || "$cur" == "-" ]]; then
-            print_row "$session" "$type" "$item" "Starting${pass:+ pass $pass}" \
-                "$name" "$tier" "${pass:--}" "-" "" "" "" "" "$wall"
+            start="Starting"
+            if [[ "$pass" == "encode" ]]; then
+                start="Starting encode"
+            elif [[ -n "$pass" ]]; then
+                start="Starting pass $pass"
+            fi
+            print_row "$session" "$type" "$item" "$start" \
+                "$name" "$tier" "$step" "-" "" "" "" "" "$wall"
         else
             read -r pct eta <<< "$(progress_fields "$cur" "$duration" "$speed")"
             print_row "$session" "$type" "$item" "$label" \
-                "$name" "$tier" "$pass" "$pct" \
+                "$name" "$tier" "$step" "$pct" \
                 "$(format_hms "$cur")" "$(format_hms "$duration")" \
                 "$speed" "$(format_hms "$eta")" "$wall"
         fi
@@ -255,13 +279,13 @@ for entry in "${sessions[@]}"; do
 
     if [[ -z "$cur" || "$cur" == -* ]]; then
         print_row "$session" "$type" "$item" "Starting (old job format)" \
-            "$name" "$tier" "${pass:--}" "-" "" "" "" "" "$wall"
+            "$name" "$tier" "$(step_text "${pass:--}")" "-" "" "" "" "" "$wall"
     else
         IFS=: read -r h m s <<< "$cur"
         cur_sec=$(awk -v h="$h" -v m="$m" -v s="$s" 'BEGIN { printf "%.0f", h*3600 + m*60 + s }')
         read -r pct eta <<< "$(progress_fields "$cur_sec" "$duration" "${speed:--}")"
         print_row "$session" "$type" "$item" "Encoding (old job format)" \
-            "$name" "$tier" "${pass:--}" "$pct" \
+            "$name" "$tier" "$(step_text "${pass:--}")" "$pct" \
             "$(format_hms "$cur_sec")" "$(format_hms "$duration")" \
             "${speed:--}" "$(format_hms "$eta")" "$wall"
     fi

@@ -46,6 +46,20 @@ bytes_to_gib() {
     awk -v b="$1" 'BEGIN { printf "%.2f", b / 1073741824 }'
 }
 
+# size_text BYTES  ->  "6.40 GiB", or "0.02 GiB (21.4 MiB)" below 0.1 GiB
+size_text() {
+    if [[ ! "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        printf 'N/A'
+        return
+    fi
+
+    awk -v b="$1" 'BEGIN {
+        g = b / 1073741824
+        if (g >= 0.1) printf "%.2f GiB", g
+        else          printf "%.2f GiB (%.1f MiB)", g, b / 1048576
+    }'
+}
+
 # bytes_to_mbps BYTES SECONDS  ->  "12.34"
 bytes_to_mbps() {
     if [[ ! "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
@@ -67,6 +81,20 @@ bps_to_mbps() {
     fi
 
     awk -v b="$1" 'BEGIN { printf "%.2f", b / 1000000 }'
+}
+
+# estimate_error_pct ESTIMATE ACTUAL  ->  "+6.3%" (actual vs estimate;
+# "N/A" when either is unknown)
+estimate_error_pct() {
+    if [[ ! "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ || ! "${2:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        printf 'N/A'
+        return
+    fi
+
+    awk -v e="$1" -v a="$2" 'BEGIN {
+        if (e > 0) printf "%+.1f%%", (a - e) / e * 100
+        else       printf "N/A"
+    }'
 }
 
 # format_hms SECONDS  ->  HH:MM:SS

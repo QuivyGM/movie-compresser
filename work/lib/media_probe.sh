@@ -160,6 +160,28 @@ media_signature() {
         "$1"
 }
 
+# x265_rate_control FILE STREAM_INDEX  ->  how x265 encoded the stream,
+# from the settings SEI x265 writes into the first access unit:
+#   "crf 21.0"     single-pass CRF
+#   "2pass 15000"  two-pass bitrate (kb/s)
+#   "abr 15000"    one-pass bitrate (kb/s)
+#   ""             not x265, or no settings SEI
+x265_rate_control() {
+    ffmpeg -v error -nostdin -i "$1" -map "0:$2" -c copy -frames:v 1 -f hevc - 2>/dev/null |
+        head -c 4000000 | tr -c '[:print:]' '\n' | grep -m1 -o 'rc=[a-z]*.*' |
+        tr ' ' '\n' | awk -F= '
+            $1 == "rc" { rc = $2 }
+            $1 == "crf" { crf = $2 }
+            $1 == "bitrate" { br = $2 }
+            $1 == "stats-read" { sr = $2 }
+            END {
+                if (rc == "crf") print "crf " crf
+                else if (rc == "abr" && sr >= 2) print "2pass " br
+                else if (rc != "") print rc " " br
+            }'
+    return 0
+}
+
 get_duration() {
     ffprobe -v error \
         -show_entries format=duration \

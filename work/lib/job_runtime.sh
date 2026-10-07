@@ -2,8 +2,15 @@
 # Runtime for generated job scripts (work/<session>.sh).
 #
 # Jobs run with `set -uo pipefail` but without -e: each queued item is
-# independent. A failed item is reported, its log and x265 pass stats
-# are kept under work/logs/, and the queue continues with the next item.
+# independent. A failed item is reported, its log (and, for two-pass
+# encodes, the x265 pass stats) are kept under work/logs/, and the queue
+# continues with the next item.
+#
+# Video encode modes (item_expect mode=): crf (single-pass x265 CRF,
+# movie / series High, Base, Custom), abr (two-pass bitrate, movie
+# Quality), copy (source video kept). After a CRF encode the actual
+# video size is reported against the pre-encode estimate and the pair
+# is appended to work/logs/crf_estimates.tsv.
 #
 # Outputs are written to "<output>.part" and only renamed to the final
 # name after ffmpeg succeeded and the result passed a duration check, so
@@ -76,6 +83,8 @@ job_write_state() {
         printf 'output=%s\n' "${ITEM_OUTPUT//$'\n'/ }"
         printf 'tier=%s\n' "$ITEM_TIER"
         printf 'pass=%s\n' "$ITEM_PASS"
+        printf 'mode=%s\n' "${ITEM_EXP[mode]:-}"
+        printf 'crf=%s\n' "${ITEM_EXP[crf]:-}"
         printf 'duration=%s\n' "$ITEM_DURATION"
         printf 'started=%s\n' "$JOB_STARTED"
         printf 'updated=%s\n' "$(date +%s)"
@@ -194,9 +203,10 @@ item_begin() {
 # item_expect KEY=VALUE...
 #
 # What the generated job intends for this item, used by the output
-# verification: vidx (source main video index), video (encode|copy),
-# dv (none|preserve|drop), dv_profile, dv_compat, hdr10p
-# (none|preserve|drop), scaled (0|1).
+# verification and the final report: vidx (source main video index),
+# video (encode|copy), mode (crf|abr|copy), crf, kbps, est_vbytes
+# (pre-encode video estimate of a CRF encode), dv (none|preserve|drop),
+# dv_profile, dv_compat, hdr10p (none|preserve|drop), scaled (0|1).
 item_expect() {
     local kv
 
@@ -266,7 +276,11 @@ item_run() {
     : > "$JOB_PROGRESS"
 
     echo
-    echo "PASS $label"
+    if [[ "$label" == "encode" ]]; then
+        echo "ENCODING (single pass${ITEM_EXP[crf]:+, CRF ${ITEM_EXP[crf]}})"
+    else
+        echo "PASS $label"
+    fi
 
     {
         echo
@@ -286,7 +300,11 @@ item_run() {
     ITEM_CHILD=""
 
     if (( rc != 0 )); then
-        ITEM_FAIL_REASON="pass $label failed (ffmpeg exit $rc)"
+        if [[ "$label" == "encode" ]]; then
+            ITEM_FAIL_REASON="encode failed (ffmpeg exit $rc)"
+        else
+            ITEM_FAIL_REASON="pass $label failed (ffmpeg exit $rc)"
+        fi
     fi
 
     return "$rc"
@@ -495,7 +513,7 @@ item_failed() {
 
     ITEM_PART=""
 
-    # Keep x265 pass stats next to the log for diagnosis.
+    # Keep x265 pass stats (two-pass encodes) next to the log for diagnosis.
     if [[ -n "$ITEM_PASSLOG" ]]; then
         for f in "$ITEM_PASSLOG" "$ITEM_PASSLOG".*; do
             [[ -e "$f" ]] && mv -f -- "$f" "$JOB_LOG_DIR/"
@@ -528,22 +546,74 @@ item_failed() {
 }
 
 # report_output_stats FILE  ->  actual bitrates/sizes from a packet scan
+#
+# CRF encodes also report the tier, the CRF, the pre-encode estimate and
+# the estimate error. The error is information for improving the
+# estimator (logged to work/logs/crf_estimates.tsv), never a failure:
+# the size ceiling is a selection goal, not a byte guarantee.
 report_output_stats() {
     local out="$1"
-    local dur bytes totals vbytes abytes
+    local dur bytes totals vbytes abytes est
 
     dur=$(get_duration "$out" 2>/dev/null || true)
     bytes=$(file_bytes "$out")
     totals=$(media_stream_totals "$out")
     read -r vbytes abytes <<< "$totals"
+    est="${ITEM_EXP[est_vbytes]:-}"
 
     echo
     echo "Finished: $(basename "$out")"
+
+    case "${ITEM_EXP[mode]:-}" in
+        crf)
+            echo "  Tier:                 $ITEM_TIER"
+            echo "  Selected CRF:         ${ITEM_EXP[crf]:-?}"
+            echo "  Video encode mode:    CRF (single pass)"
+            ;;
+        abr)
+            echo "  Video encode mode:    two-pass bitrate (${ITEM_EXP[kbps]:-?} kb/s)"
+            ;;
+        copy)
+            echo "  Video encode mode:    source video copied (not re-encoded)"
+            ;;
+    esac
+
     echo "  Actual video bitrate: $(bytes_to_mbps "$vbytes" "$dur") Mb/s"
     echo "  Actual audio bitrate: $(bytes_to_mbps "$abytes" "$dur") Mb/s"
     echo "  Actual video size:    $(bytes_to_gib "$vbytes") GiB"
+
+    if [[ "${ITEM_EXP[mode]:-}" == "crf" && -n "$est" ]]; then
+        echo "  Estimated video size: $(bytes_to_gib "$est") GiB"
+        echo "  Estimate error:       $(estimate_error_pct "$est" "$vbytes")  (actual vs pre-encode estimate; for information)"
+        record_crf_estimate "$out" "$est" "$vbytes" "$dur"
+    fi
+
     echo "  Actual audio size:    $(bytes_to_gib "$abytes") GiB"
     echo "  Actual file size:     $(bytes_to_gib "$bytes") GiB"
+
+    if [[ -n "${ITEM_EXP[atrans]+x}" && -z "${ITEM_EXP[atrans]}" ]]; then
+        echo "  Audio:                copied unchanged"
+    fi
+}
+
+# record_crf_estimate OUTPUT EST_BYTES ACTUAL_BYTES DURATION
+#
+# Appends one line to work/logs/crf_estimates.tsv (estimate accuracy,
+# for tuning the sampling later). A failure to write is ignored.
+record_crf_estimate() {
+    local out="$1" est="$2" act="$3" dur="$4"
+    local f="$JOB_WORK/logs/crf_estimates.tsv" res
+
+    res=$(get_resolution "$out" "$(main_video_index "$out")" 2>/dev/null || true)
+
+    {
+        [[ -s "$f" ]] ||
+            printf 'date\ttier\tcrf\tresolution\tduration_s\testimated_video_bytes\tactual_video_bytes\terror_pct\tsession\tinput\n'
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$(date '+%F %T')" "$ITEM_TIER" "${ITEM_EXP[crf]:-}" "${res:-?}" \
+            "$(awk -v d="$dur" 'BEGIN { printf "%.0f", d }')" "$est" "$act" \
+            "$(estimate_error_pct "$est" "$act")" "$JOB_SESSION" "$ITEM_INPUT"
+    } >> "$f" 2>/dev/null || true
 }
 
 job_finish() {

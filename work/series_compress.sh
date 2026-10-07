@@ -15,14 +15,18 @@ source "$WORK_DIR/lib/policy.sh"
 
 # ============================================================
 # POLICY  (values: ~/compress/work/lib/compress.conf; math: policy.sh
-# series_video_plan / series_plan)
+# crf_select / series_crf_spread / series_crf_plan; sample encodes:
+# encode_common.sh crf_series_estimate)
 #
-# Base / High: SERIES_*_VIDEO_GIB_PER_HOUR (video only), floor, max
-# Custom:      user-entered video GiB/hour, no floor / max
+# Base / High: x265 CRF, ONE CRF for every episode of the batch: the
+#              lowest CRF of SERIES_*_CRF_MIN..MAX whose median episode
+#              video estimate fits SERIES_*_VIDEO_SIZE_CEILING_GIB
+# Custom:      user-entered CRF, used exactly
 #
-# One fixed video bitrate for every episode. Per episode, a source video
-# bitrate below the fixed bitrate is kept (never increased); one below
-# the tier floor is kept as well (not reduced).
+# Episodes estimated above the ceiling keep the batch CRF (consistent
+# quality) and are listed. An episode whose estimate is not below its
+# source video is only re-encoded when the user chooses so (or its
+# source video is kept / it is skipped).
 #
 # Every audio track is copied unchanged (codec, bitrate, channels,
 # Atmos / DTS:X, titles, flags) and comes on top of the video size;
@@ -37,7 +41,7 @@ fi
 echo "Policy: $(policy_conf_path)"
 for t in High Base; do
     echo
-    series_video_policy_lines "$t"
+    crf_policy_lines series "$t"
 done
 echo
 audio_copy_policy_lines
@@ -100,7 +104,7 @@ FILE_COUNT=${#FILES[@]}
 echo
 echo "Analyzing ${FILE_COUNT} files..."
 
-declare -a EP_DUR EP_VIDX EP_VKBPS EP_AKBPS EP_ABYTES EP_ACH EP_ACODEC EP_ASR
+declare -a EP_DUR EP_VIDX EP_VKBPS EP_VBYTES EP_AKBPS EP_ABYTES EP_ACH EP_ACODEC EP_ASR
 declare -a EP_RES EP_VCODEC EP_PIX EP_FPS EP_RANGE EP_SUBS EP_OTHER EP_HOW EP_H10P EP_REFRESH
 
 for i in "${!FILES[@]}"; do
@@ -129,9 +133,9 @@ for i in "${!FILES[@]}"; do
     EP_HOW[$i]="$STATS_SOURCE"
     EP_REFRESH[$i]="$STATS_REFRESH"
     EP_AKBPS[$i]=$(stats_audio_kbps)
-    # copied source audio (all tracks): its actual size goes on top of
-    # the video target
-    read -r _ EP_ABYTES[$i] _ _ <<< "$(stats_totals "$vidx")"
+    # source video (source-quality guard) and copied source audio (all
+    # tracks; its actual size goes on top of the video estimate)
+    read -r EP_VBYTES[$i] EP_ABYTES[$i] _ _ <<< "$(stats_totals "$vidx")"
 
     EP_ACH[$i]=$(awk -F'\t' '$2 == "audio" { printf "%s ", $5 }' <<< "$info")
     EP_ACODEC[$i]=$(awk -F'\t' '$2 == "audio" { printf "%s ", $3 }' <<< "$info")
@@ -301,18 +305,8 @@ if (( WIDTH > 1920 || HEIGHT > 1080 )); then
                 ;;
             2)
                 DOWNSCALED=1
-                VIDEO_FILTER="scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2"
-
-                read -r OUT_WIDTH OUT_HEIGHT < <(
-                    awk -v w="$WIDTH" -v h="$HEIGHT" 'BEGIN {
-                        sx=1920/w
-                        sy=1080/h
-                        s=(sx<sy?sx:sy)
-                        ow=int((w*s)/2)*2
-                        oh=int((h*s)/2)*2
-                        print ow,oh
-                    }'
-                )
+                VIDEO_FILTER="$DOWNSCALE_1080P_FILTER"
+                read -r OUT_WIDTH OUT_HEIGHT <<< "$(downscale_1080p_dims "$WIDTH" "$HEIGHT")"
                 break
                 ;;
             *)
@@ -323,167 +317,214 @@ if (( WIDTH > 1920 || HEIGHT > 1080 )); then
 fi
 
 # ============================================================
-# PLAN  (policy.sh: series_video_plan, series_plan)
+# TIER
 # ============================================================
 
 per_file() {
     awk -v g="$1" -v n="$FILE_COUNT" 'BEGIN { printf "%.2f", g / n }'
 }
 
-kbps_mbps() {
-    awk -v k="$1" 'BEGIN { printf "%.2f", k / 1000 }'
-}
-
-# show_preview LABEL TIER [CUSTOM_GIB_PER_HOUR]
-show_preview() {
-    local label="$1"
-    local tier="$2"
-
-    series_video_plan "$tier" "${3:-}"
-    series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
-
-    echo "$label"
-    printf "   Video:   %s kb/s fixed%s\n" "$SPLAN_TARGET_KBPS" \
-        "$( (( SPLAN_MAX_LIMITED == 1 )) && echo " (limited by the $(kbps_mbps "$SPLAN_MAX_KBPS") Mb/s max)")"
-    printf "   Total:   ~%s GiB | Video ~%s GiB | Audio ~%s GiB (copied unchanged, on top)\n" \
-        "$P_TOTAL_GIB" "$P_VIDEO_GIB" "$P_AUDIO_GIB"
-
-    printf "   Average: ~%s GiB/file | Video ~%s GiB | Audio ~%s GiB\n" \
-        "$(per_file "$P_TOTAL_GIB")" "$(per_file "$P_VIDEO_GIB")" "$(per_file "$P_AUDIO_GIB")"
-
-    if (( SPLAN_BELOW_FLOOR == 1 )); then
-        printf "   Below the %s Mb/s floor: you will be asked (floor or GiB/hour target)\n" \
-            "$(kbps_mbps "$SPLAN_FLOOR_KBPS")"
-    fi
-
-    if (( P_SRC_BELOW_FLOOR > 0 )); then
-        printf "   %d episode(s) below the floor at the source: kept at their source bitrate\n" "$P_SRC_BELOW_FLOOR"
-    fi
-
-    if (( P_CAPPED > 0 )); then
-        printf "   %d episode(s) kept at their lower source video bitrate\n" "$P_CAPPED"
-    fi
-}
-
-# ============================================================
-# TIER
-# ============================================================
-
 echo
 echo "Compression tier:"
+crf_tier_load series Base
+echo "1) Base        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_CEILING_GIB} GiB per episode (audio copied)"
+crf_tier_load series High
+echo "2) High        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_CEILING_GIB} GiB per episode (audio copied)"
+echo "3) Custom CRF  exactly the CRF you enter (no ceiling; audio copied)"
 
-show_preview "1) Base  [${SERIES_BASE_VIDEO_GIB_PER_HOUR} GiB/hour video + audio]" "Base"
-echo
-
-show_preview "2) High  [${SERIES_HIGH_VIDEO_GIB_PER_HOUR} GiB/hour video + audio]" "High"
-echo
-
-echo "3) Custom video GiB/hour (no floor / max; audio copied)"
-
-CUSTOM_GIB=""
+CUSTOM_CRF=""
 
 while true; do
     echo
     read -rp "Select [1-3]: " t
 
     case "$t" in
-        1)
-            TIER="Base"
-            break
-            ;;
-
-        2)
-            TIER="High"
-            break
-            ;;
-
+        1) TIER="Base"; break ;;
+        2) TIER="High"; break ;;
         3)
-            while true; do
-                read -rp "Custom video GiB/hour: " CUSTOM_GIB
-
-                if awk -v x="$CUSTOM_GIB" \
-                    'BEGIN {exit !(x ~ /^[0-9]+([.][0-9]+)?$/ && x > 0)}'
-                then
-                    break
-                fi
-
-                echo "Enter a positive number, e.g. 2.5"
-            done
-
             TIER="Custom"
-
-            echo
-            echo "Expected result:"
-            show_preview "Custom [${CUSTOM_GIB} GiB/hour video + audio]" \
-                "Custom" "$CUSTOM_GIB"
-
+            while true; do
+                read -rp "Custom CRF: " CUSTOM_CRF
+                crf_valid "$CUSTOM_CRF" && break
+                echo "Enter an x265 CRF from 0 to $CRF_LIMIT, e.g. 21 (lower = higher quality)"
+            done
             break
             ;;
-
-        *)
-            echo "Invalid selection."
-            ;;
+        *) echo "Invalid selection." ;;
     esac
 done
 
+crf_tier_load series "$TIER" "$CUSTOM_CRF"
+
+echo
+crf_policy_lines series "$TIER" "$CUSTOM_CRF"
+
 # ============================================================
-# FIXED VIDEO BITRATE
+# CRF ANALYSIS  (policy.sh: crf_select, series_crf_spread;
+# encode_common.sh: crf_series_estimate)
+#
+# One CRF for every episode. Sampled episodes (spread over the batch)
+# are encoded at the output resolution; the median episode estimate
+# decides whether a CRF fits the per-episode ceiling.
 # ============================================================
 
-series_video_plan "$TIER" "$CUSTOM_GIB"
-GIB_PER_HOUR="$SPLAN_GIB_PER_HOUR"
-VIDEO_KBPS="$SPLAN_TARGET_KBPS"
+mapfile -t CRF_SERIES_SAMPLED < <(series_sample_episodes "$FILE_COUNT" "$SERIES_CRF_SAMPLE_EPISODES")
+CRF_SERIES_FILTER="$VIDEO_FILTER"
+declare -A CRF_SERIES_EP_BYTES=() CRF_SERIES_EP_FROM=()
 
-if (( SPLAN_BELOW_FLOOR == 1 )); then
-    series_plan "$SPLAN_FLOOR_KBPS" "$SPLAN_FLOOR_KBPS"
-    FLOOR_VIDEO_GIB="$P_VIDEO_GIB"
-    series_plan "$SPLAN_TARGET_KBPS" "$SPLAN_FLOOR_KBPS"
-    TARGET_VIDEO_GIB="$P_VIDEO_GIB"
+echo
+printf "Estimating video size from sample encodes (%d of %d episodes, %sx%s output%s):\n" \
+    "${#CRF_SERIES_SAMPLED[@]}" "$FILE_COUNT" "$OUT_WIDTH" "$OUT_HEIGHT" \
+    "$( (( DOWNSCALED == 1 )) && echo ", downscaled like the final encode")"
 
+if [[ "$TIER" == "Custom" ]]; then
+    crf_select_exact "$CUSTOM_CRF" crf_series_estimate || CRF_SELECTED=""
+else
+    crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate || CRF_SELECTED=""
+fi
+
+if [[ -z "$CRF_SELECTED" ]]; then
+    echo
+    echo "CRF analysis failed (sample encode error above)."
+    echo "Compression cancelled."
+    exit 1
+fi
+
+CRF="$CRF_SELECTED"
+read -ra EP_EST <<< "${CRF_SERIES_EP_BYTES[$CRF]}"
+read -ra EP_FROM <<< "${CRF_SERIES_EP_FROM[$CRF]}"
+
+echo
+echo "CRF analysis (median episode video):"
+crf_analysis_lines
+
+echo
+echo "Selected:"
+echo "  CRF $CRF for every episode"
+echo "  median episode video: ~$(size_text "${CRF_EST[$CRF]}")"
+
+if (( CRF_OVER_CEILING == 1 )); then
     echo
     echo "------------------------------------------------------------"
-    echo "${TIER} conflict: the GiB/hour target is below the floor."
-    echo
-
-    printf "%-18s | %-20s | %-20s\n" \
-        "" \
-        "1. ${TIER} floor" \
-        "2. ${GIB_PER_HOUR} GiB/hour"
-
-    printf "%-18s-+-%-20s-+-%-20s\n" \
-        "------------------" \
-        "--------------------" \
-        "--------------------"
-
-    printf "%-18s | %-20s | %-20s\n" \
-        "Video bitrate" \
-        "${SPLAN_FLOOR_KBPS} kb/s" \
-        "${SPLAN_TARGET_KBPS} kb/s"
-
-    printf "%-18s | %-20s | %-20s\n" \
-        "Video, all files" \
-        "~${FLOOR_VIDEO_GIB} GiB" \
-        "~${TARGET_VIDEO_GIB} GiB"
-
+    echo "WARNING: the ${CRF_CEILING_GIB} GiB per-episode video ceiling cannot be met within"
+    echo "the ${TIER} CRF range: even CRF ${CRF_MAX} (the lowest quality ${TIER} allows) gives"
+    echo "a median episode of ~$(bytes_to_gib "${CRF_EST[$CRF]}") GiB video, ~$(crf_oversize_gib "${CRF_EST[$CRF]}" "$CRF_CEILING_BYTES") GiB above the ceiling."
     echo "------------------------------------------------------------"
+    echo "1) Encode every episode at CRF ${CRF_MAX} anyway"
+    echo "2) Cancel"
 
     while true; do
-        read -rp "Select [1-2]: " fc
-
-        case "$fc" in
-            1) VIDEO_KBPS="$SPLAN_FLOOR_KBPS"; break ;;
-            2) VIDEO_KBPS="$SPLAN_TARGET_KBPS"; break ;;
+        read -rp "Select [1-2]: " oc
+        case "$oc" in
+            1) break ;;
+            2) echo "Compression cancelled."; exit 0 ;;
             *) echo "Invalid selection." ;;
         esac
     done
 fi
 
-series_plan "$VIDEO_KBPS" "$SPLAN_FLOOR_KBPS"
+# Episodes above the per-episode ceiling at the batch CRF: reported, not
+# given a different CRF (consistent quality across the season).
+if [[ "$TIER" != "Custom" ]]; then
+    ABOVE=()
+    for i in "${!FILES[@]}"; do
+        (( EP_EST[$i] > CRF_CEILING_BYTES )) && ABOVE+=("$i")
+    done
+
+    if (( ${#ABOVE[@]} )) && (( CRF_OVER_CEILING == 0 )); then
+        echo
+        echo "Note: ${#ABOVE[@]} episode(s) estimated above the ${CRF_CEILING_GIB} GiB ceiling at CRF ${CRF};"
+        echo "they keep CRF ${CRF} like the rest of the season (consistent quality):"
+        for i in "${ABOVE[@]}"; do
+            printf "  %-40.40s ~%s GiB video (%s)\n" "$(basename "${FILES[$i]}")" \
+                "$(bytes_to_gib "${EP_EST[$i]}")" \
+                "$( [[ "${EP_FROM[$i]}" == sample ]] && echo "sampled" || echo "median bitrate")"
+        done
+    fi
+fi
+
+# ============================================================
+# SOURCE-QUALITY GUARD
+#
+# Episodes whose estimate at the batch CRF is not below their source
+# video: a re-encode would only be lossier. The user keeps the source
+# video (stream copy), encodes anyway, or skips those episodes.
+# ============================================================
+
+declare -a EP_VIDEO EP_GUARD_SKIP
+GUARD=()
+
+for i in "${!FILES[@]}"; do
+    EP_VIDEO[$i]="crf:$CRF"
+    EP_GUARD_SKIP[$i]=0
+    crf_above_source "${EP_EST[$i]}" "${EP_VBYTES[$i]:-}" && GUARD+=("$i")
+done
+
+if (( ${#GUARD[@]} )); then
+    CAN_COPY=1
+    for i in "${GUARD[@]}"; do
+        [[ "${EP_VCODEC[$i]}" == "hevc" ]] || CAN_COPY=0
+    done
+    (( DOWNSCALED == 1 )) && CAN_COPY=0
+    [[ "${DV_POLICY:-none}" == "drop" || "${HDR10P_POLICY:-none}" == "drop" ]] && CAN_COPY=0
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "Source-quality guard: ${#GUARD[@]} episode(s) are already below what"
+    echo "${TIER} CRF ${CRF} would need (a re-encode would not be smaller, only lossier):"
+    for i in "${GUARD[@]}"; do
+        printf "  %-40.40s source %s, CRF %s estimate ~%s\n" "$(basename "${FILES[$i]}")" \
+            "$(size_text "${EP_VBYTES[$i]}")" "$CRF" "$(size_text "${EP_EST[$i]}")"
+    done
+    echo "------------------------------------------------------------"
+
+    if (( CAN_COPY == 1 )); then
+        echo "1) Keep their source video unchanged (stream copy; audio, subtitles,"
+        echo "   chapters and metadata handled as usual)"
+    else
+        echo "1) (not available: keeping the source video needs HEVC sources,"
+        echo "   no downscaling and no dropped Dolby Vision / HDR10+)"
+    fi
+    echo "2) Encode them anyway at CRF ${CRF}"
+    echo "3) Skip these episodes"
+
+    while true; do
+        read -rp "Select [1-3]: " sg
+        case "$sg" in
+            1) (( CAN_COPY == 1 )) && break; echo "Invalid selection." ;;
+            2|3) break ;;
+            *) echo "Invalid selection." ;;
+        esac
+    done
+
+    for i in "${GUARD[@]}"; do
+        case "$sg" in
+            1) EP_VIDEO[$i]="copy" ;;
+            3) EP_GUARD_SKIP[$i]=1 ;;
+        esac
+    done
+fi
+
+# expected sizes (estimated video, or the source video when copied)
+PLAN_VIDEO=()
+for i in "${!FILES[@]}"; do
+    if [[ "${EP_VIDEO[$i]}" == "copy" ]]; then
+        PLAN_VIDEO[$i]="${EP_VBYTES[$i]:-copy}"
+    else
+        PLAN_VIDEO[$i]="${EP_EST[$i]}"
+    fi
+done
+series_crf_plan "${PLAN_VIDEO[@]}"
 
 echo
 echo "------------------------------------------------------------"
 echo "Tier:                 $TIER"
-echo "Video target:         ${GIB_PER_HOUR} GiB/hour (video only; audio on top)"
+if [[ "$TIER" == "Custom" ]]; then
+    echo "Video encode:         x265 CRF ${CRF}, single pass, every episode (entered CRF)"
+else
+    echo "Video encode:         x265 CRF ${CRF}, single pass, every episode"
+    echo "                      (${TIER}: CRF ${CRF_MIN}-${CRF_MAX}, ${CRF_CEILING_GIB} GiB video ceiling per episode$( (( CRF_OVER_CEILING == 1 )) && echo "; ceiling NOT met"))"
+fi
 echo "Resolution:           ${WIDTH}x${HEIGHT} -> ${OUT_WIDTH}x${OUT_HEIGHT}"
 echo "Dynamic range:        $(hdr_description)"
 
@@ -495,17 +536,6 @@ fi
 if [[ "$DV_POLICY" == "preserve" ]] && (( DOWNSCALED == 1 )); then
     echo "Dolby Vision:         L5 active-area offsets rescaled to ${OUT_WIDTH}x${OUT_HEIGHT}"
 fi
-printf "Fixed video bitrate:  %s kb/s" "$VIDEO_KBPS"
-if [[ "$VIDEO_KBPS" == "$SPLAN_FLOOR_KBPS" ]] && (( SPLAN_BELOW_FLOOR == 1 )); then
-    printf "  (floor chosen; GiB/hour target was %s kb/s)" "$SPLAN_TARGET_KBPS"
-elif (( SPLAN_MAX_LIMITED == 1 )); then
-    printf "  (limited by the %s Mb/s max; GiB/hour gives %s kb/s)" "$(kbps_mbps "$SPLAN_MAX_KBPS")" "$SPLAN_RATE_KBPS"
-fi
-echo
-if (( SPLAN_FLOOR_KBPS > 0 || SPLAN_MAX_KBPS > 0 )); then
-    printf "  floor %s Mb/s, max %s\n" "$(kbps_mbps "$SPLAN_FLOOR_KBPS")" \
-        "$( (( SPLAN_MAX_KBPS > 0 )) && echo "$(kbps_mbps "$SPLAN_MAX_KBPS") Mb/s" || echo none)"
-fi
 echo "Audio:                all tracks copied unchanged (on top of the video size)"
 
 # same audio layout in every episode (verified above); details of the first
@@ -514,9 +544,10 @@ while IFS= read -r note; do
 done < <(audio_copy_notes "$REFERENCE" "${EP_AKBPS[0]}")
 
 echo
-echo "Per-episode rules (never increase quality settings above the source):"
-echo "  - video: fixed bitrate, or the source video bitrate if that is lower;"
-echo "    a source below the tier floor is kept at its own bitrate"
+echo "Per-episode rules:"
+echo "  - video: the same CRF for every episode (sizes vary with content);"
+echo "    an episode whose estimate is not below its source is only re-encoded"
+echo "    if you chose so above"
 echo "  - audio: every track copied unchanged (optional audio compression"
 echo "    afterwards with audio_compress_menu.sh)"
 echo "------------------------------------------------------------"
@@ -528,44 +559,30 @@ echo "------------------------------------------------------------"
 echo
 echo "Expected sizes:"
 echo
-printf "  %-36s %7s  %-17s %-14s %9s %9s %9s\n" \
-    "Episode" "Minutes" "Video kb/s" "Audio" "Video" "Audio" "Total"
+printf "  %-36s %7s  %-16s %-14s %9s %9s %9s\n" \
+    "Episode" "Minutes" "Video" "Audio" "Video" "Audio" "Total"
 
 for i in "${!FILES[@]}"; do
-    case "${P_EP_VNOTE[$i]}" in
-        src)   vcol="${P_EP_VKBPS[$i]} (src)" ;;
-        floor) vcol="${P_EP_VKBPS[$i]} (src<floor)" ;;
-        *)     vcol="${P_EP_VKBPS[$i]}" ;;
-    esac
+    if (( EP_GUARD_SKIP[$i] == 1 )); then
+        vcol="skipped"
+    elif [[ "${EP_VIDEO[$i]}" == "copy" ]]; then
+        vcol="source (copy)"
+    elif [[ "${EP_FROM[$i]}" == "sample" ]]; then
+        vcol="CRF $CRF sampled"
+    else
+        vcol="CRF $CRF (median)"
+    fi
 
-    printf "  %-36.36s %7s  %-17s %-14.14s %9s %9s %9s\n" \
+    printf "  %-36.36s %7s  %-16s %-14.14s %9s %9s %9s\n" \
         "$(basename "${FILES[$i]}")" \
         "$(awk -v d="${EP_DUR[$i]}" 'BEGIN { printf "%.1f", d / 60 }')" \
         "$vcol" \
         "copy ${P_EP_AKBPS[$i]}k" \
         "~${P_EP_VGIB[$i]}" "~${P_EP_AGIB[$i]}" "~${P_EP_GIB[$i]}"
 done
-echo "  (sizes in GiB)"
-
-if (( P_CAPPED > 0 )); then
-    echo
-    echo "  (src)       = source video bitrate is below ${VIDEO_KBPS} kb/s; encoded at the"
-    echo "                source bitrate instead of raising it."
-fi
-
-if (( P_SRC_BELOW_FLOOR > 0 )); then
-    echo
-    echo "  (src<floor) = source video bitrate is below the ${TIER} floor"
-    echo "                ($(kbps_mbps "$SPLAN_FLOOR_KBPS") Mb/s); kept at the source bitrate, not reduced."
-fi
-
-for i in "${!FILES[@]}"; do
-    if [[ ! "${EP_VKBPS[$i]}" =~ ^[0-9]+$ ]]; then
-        echo
-        echo "  Note: source video bitrate unknown for some episodes; fixed bitrate used."
-        break
-    fi
-done
+echo "  (sizes in GiB; video sizes are estimates from sample encodes)"
+echo "  sampled  = this episode was sample-encoded"
+echo "  (median) = not sampled; median sampled video bitrate x its runtime"
 
 # Stream / title / chapter handling, shown for the first episode (the
 # same rules apply to every episode; each output is verified).
@@ -596,6 +613,12 @@ printf "  Expected total output size: ~%s GiB  (incl. ~%s%% container/subtitles)
 echo
 printf "  Average per file:           ~%s GiB (video ~%s, audio ~%s)\n" \
     "$(per_file "$P_TOTAL_GIB")" "$(per_file "$P_VIDEO_GIB")" "$(per_file "$P_AUDIO_GIB")"
+GUARD_SKIPPED=0
+for i in "${!FILES[@]}"; do
+    (( EP_GUARD_SKIP[$i] == 1 )) && ((GUARD_SKIPPED += 1))
+done
+(( GUARD_SKIPPED > 0 )) &&
+    echo "  (totals include the $GUARD_SKIPPED episode(s) skipped by the source-quality guard)"
 echo
 
 # ============================================================
@@ -622,10 +645,11 @@ for i in "${!FILES[@]}"; do
     fi
 
     EP_OVERWRITE[$i]=0
-    EP_SKIP[$i]=0
+    EP_SKIP[$i]="${EP_GUARD_SKIP[$i]}"
 
     # a symlink (valid or broken) at the output name counts as existing
-    if path_taken "${EP_OUT[$i]}" || path_taken "${EP_OUT[$i]}.part"; then
+    if (( EP_SKIP[$i] == 0 )) &&
+       { path_taken "${EP_OUT[$i]}" || path_taken "${EP_OUT[$i]}.part"; }; then
         ((EXISTING += 1))
     fi
 done
@@ -654,6 +678,7 @@ if (( EXISTING > 0 )); then
     done
 
     for i in "${!FILES[@]}"; do
+        (( EP_SKIP[$i] == 1 )) && continue
         if path_taken "${EP_OUT[$i]}.part"; then
             # Possibly being written by another job: never touch it.
             if [[ "$oc" == "3" ]]; then
@@ -694,9 +719,6 @@ mkdir -p "$OUT_SERIES"
 SESSION=$(next_tmux_session series)
 
 JOB_FILE="$WORK_DIR/${SESSION}.sh"
-PASS_DIR="$WORK_DIR/${SESSION}_passes"
-
-mkdir -p "$PASS_DIR"
 
 # ============================================================
 # BUILD ENCODE JOB
@@ -710,15 +732,17 @@ mkdir -p "$PASS_DIR"
         (( EP_SKIP[$i] == 1 )) && continue
         ((n += 1))
 
+        # single-pass CRF (or source video copy): no x265 pass logs
         emit_encode_item \
             "$n" \
             "${FILES[$i]}" \
             "${EP_OUT[$i]}" \
             "$TIER" \
-            "${P_EP_VKBPS[$i]}" \
+            "${EP_VIDEO[$i]}" \
             "$VIDEO_FILTER" \
-            "$PASS_DIR/pass_$i" \
-            "${EP_OVERWRITE[$i]}"
+            "" \
+            "${EP_OVERWRITE[$i]}" \
+            "${EP_EST[$i]}"
     done
 
     emit_job_footer
