@@ -208,7 +208,10 @@ sed -i 's/^SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=.*/SERIES_HIGH_VIDEO_SIZE_CEILING_
 L="$T/series_ceiling.log"
 menu series_compress.sh "2\n2\n1\nn\n" "$L" "$T/tiny.conf"
 sed -n '/^Estimating/,$p' "$L" | sed 's/^/  | /'
-check "ceiling: too large -> next CRF"   "grep -q '^Result:   too large -> trying CRF 19\$' '$L' && grep -q '^Result:   too large -> trying CRF 20\$' '$L'"
+# far above the ceiling: the adaptive search jumps 2 CRFs at a time,
+# CRF_MAX (21) is the last step
+check "ceiling: too large -> jumping 2 CRFs" "grep -q '^Result:   too large -> jumping to CRF $((SHMIN + 2))\$' '$L' && ! grep -q '^CRF $((SHMIN + 1))\$' '$L'"
+check "ceiling: last step clamped to 21"     "grep -qE '^Result:   too large -> (trying|jumping to) CRF 21\$' '$L' && grep -q '^CRF 21\$' '$L' && ! grep -q '^CRF 22\$' '$L'"
 check "ceiling: limit reached"           "grep -q '^Result:   too large (CRF 21 is the High limit)\$' '$L' && ! grep -q '^Selected:' '$L'"
 check "ceiling: warning kept"            "grep -q '^WARNING: the 0.000001 GiB per-episode video ceiling cannot be met' '$L' && grep -q 'gives a largest regular episode of' '$L'"
 check "ceiling: outliers listed"         "grep -q 'Warning: 3 episodes are estimated above' '$L' && grep -qE '^  S01E01 +~[0-9.]+ GiB video, \+' '$L'"

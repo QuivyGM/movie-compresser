@@ -478,8 +478,12 @@ fi
 #
 # One season CRF for every regular episode: the first CRF (from CRF_MIN
 # up) at which every regular episode's estimate fits the per-episode
-# ceiling. An isolated outlier (the only episode above median +
-# SERIES_CRF_OUTLIER_PCT) does not decide it; it gets its own CRF from
+# ceiling (bracket-and-refine search: +1 / +2 steps, a skipped CRF is
+# sampled unless the own samples of sampled episodes at the next CRF
+# prove it cannot fit, series_crf_certify_over, and the CRF just below
+# the season CRF is always sampled above the ceiling). An isolated
+# outlier (the only episode above median + SERIES_CRF_OUTLIER_PCT) does
+# not decide it; it gets its own CRF from
 # the season CRF up, sampled itself, if it does not fit at the season
 # CRF. Sampled episodes (spread over the batch, plus the longest) are
 # encoded at the output resolution.
@@ -487,11 +491,11 @@ fi
 
 mapfile -t CRF_SERIES_SAMPLED < <(series_sample_episodes "$FILE_COUNT" "$SERIES_CRF_SAMPLE_EPISODES" "$(series_longest_episode)")
 CRF_SERIES_FILTER="$VIDEO_FILTER"
-declare -A CRF_SERIES_EP_BYTES=() CRF_SERIES_EP_FROM=() CRF_EP_EST=()
+declare -A CRF_SERIES_EP_BYTES=() CRF_SERIES_EP_FROM=() CRF_SERIES_RATES=() CRF_EP_EST=()
 
 # crf_series_estimate_shown CRF  (ESTIMATOR: crf_series_estimate, then
-# in compact output the result of this CRF right below its samples;
-# the same largest-regular-episode-vs-ceiling test crf_select applies)
+# in compact output the figures of this CRF right below its samples;
+# its result line comes from crf_series_step_report)
 crf_series_estimate_shown() {
     local c="$1" eb
 
@@ -514,13 +518,31 @@ crf_series_estimate_shown() {
         fi
         printf '%-10s%s GiB\n' "Ceiling:" "$(bytes_to_gib "$CRF_CEILING_BYTES")"
     fi
-    if (( CRF_CEILING_BYTES <= 0 || CRF_EST_RESULT <= CRF_CEILING_BYTES )); then
-        printf '%-10s%s\n' "Selected:" "$(ui_bold "CRF $c")"
-    elif (( 10#$c < 10#$CRF_MAX )); then
-        printf '%-10s%s -> trying CRF %s\n' "Result:" "$(ui_warn "too large")" "$((10#$c + 1))"
-    else
-        printf '%-10s%s (CRF %s is the %s limit)\n' "Result:" "$(ui_warn "too large")" "$CRF_MAX" "$TIER"
+}
+
+# crf_series_step_report KIND CRF [ARG]  (REPORT for crf_select:
+# policy.sh crf_search_up)  ->  compact: the result of each season CRF
+# right below its figures ("too large -> jumping to CRF 14", "fits ->
+# checking CRF 13"), then the verified boundary and "Selected: CRF 14";
+# verbose: only the steps that skip a CRF or check a skipped one
+crf_series_step_report() {
+    if ui_verbose; then
+        crf_title_step_report "$@"
+        return 0
     fi
+    case "$1" in
+        fits)
+            printf '%-10s%s\n' "Selected:" "$(ui_bold "CRF $2")"
+            ;;
+        boundary)
+            echo
+            crf_boundary_lines "$2" "$3"
+            printf '%-10s%s\n' "Selected:" "$(ui_bold "CRF $3")"
+            ;;
+        *)
+            printf '%-10s%s\n' "Result:" "$(crf_step_result "$@")"
+            ;;
+    esac
 }
 
 echo
@@ -534,9 +556,14 @@ else
 fi
 
 if [[ "$TIER" == "Custom" ]]; then
-    crf_select_exact "$CUSTOM_CRF" crf_series_estimate_shown || CRF_SELECTED=""
+    if crf_select_exact "$CUSTOM_CRF" crf_series_estimate_shown; then
+        crf_series_step_report fits "$CRF_SELECTED"
+    else
+        CRF_SELECTED=""
+    fi
 else
-    crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate_shown || CRF_SELECTED=""
+    crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate_shown \
+        crf_series_step_report series_crf_certify_over || CRF_SELECTED=""
 fi
 
 if [[ -z "$CRF_SELECTED" ]]; then
@@ -605,7 +632,8 @@ if [[ -n "$OUTLIER" ]] && (( EP_EST[OUTLIER] > CRF_CEILING_BYTES )); then
             "${EP_LABEL[$OUTLIER]}" "$(bytes_to_gib "${EP_EST[$OUTLIER]}")" "$CRF"
     fi
 
-    if ! series_episode_crf "$OUTLIER" "$CRF" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_episode_estimate; then
+    if ! series_episode_crf "$OUTLIER" "$CRF" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_episode_estimate \
+            crf_episode_step_report; then
         echo
         echo "$(ui_err "CRF analysis failed") (sample encode error above)."
         echo "Compression cancelled."
@@ -759,7 +787,7 @@ fi
 # alone gets a higher CRF now, before the encode (policy.sh
 # series_late_ceiling; the season CRF is not changed), then the guard
 # is decided on its estimate at that CRF
-if ! series_late_ceiling crf_episode_estimate; then
+if ! series_late_ceiling crf_episode_estimate crf_episode_step_report; then
     echo
     echo "$(ui_err "CRF analysis failed") (sample encode error above)."
     echo "Compression cancelled."

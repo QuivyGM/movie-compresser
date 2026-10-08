@@ -133,7 +133,8 @@ crf_sample_title() {   # FILE VIDX FILTER CRF DURATION POINTS
 }
 
 # sel [-k SAMPLED] GIB...  ->  the series menu's selection: season CRF
-# (crf_select over crf_series_estimate), then the isolated outlier's own
+# (crf_select over crf_series_estimate with the menu's season
+# certification series_crf_certify_over), then the isolated outlier's own
 # CRF (series_episode_crf over crf_episode_estimate) when it does not
 # fit at the season CRF. Sets SEL "CRF/tried/over", CRFS (per episode),
 # OUT (outlier index or -), EPC_*.
@@ -147,10 +148,10 @@ sel() {
     done
     mapfile -t CRF_SERIES_SAMPLED < <(series_sample_episodes "$#" "$k" "$(series_longest_episode)")
     CRF_SERIES_FILTER=""
-    declare -gA CRF_SERIES_EP_BYTES=() CRF_SERIES_EP_FROM=() CRF_EP_EST=()
+    declare -gA CRF_SERIES_EP_BYTES=() CRF_SERIES_EP_FROM=() CRF_SERIES_RATES=() CRF_EP_EST=()
     : > "$T/calls"
     crf_tier_load series High
-    crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate > "$T/sel.out"
+    crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate "" series_crf_certify_over > "$T/sel.out"
     SEL="$CRF_SELECTED/${CRF_TRIED[*]}/$CRF_OVER_CEILING"
     read -ra eb <<< "${CRF_SERIES_EP_BYTES[$CRF_SELECTED]}"
     series_batch_stats "$CRF_CEILING_BYTES" "${eb[@]}"
@@ -186,12 +187,13 @@ eq    "two large episodes: season CRF rises to 20"  "$SEL/${CRFS[*]}" "20/18 19 
 eq    "two large episodes: no own CRF"              "$OUT" "-"
 
 sel 3.7 4.2 9.0 3.9 4.0 4.1
-eq    "outlier above at CRF_MAX: 21, flagged"       "${CRFS[2]}/$EPC_OVER/${EPC_TRIED[*]}" "21/1/18 19 20 21"
+# 9.0 GiB = 1.8 x the ceiling at 18: the adaptive search jumps 18 -> 20
+eq    "outlier above at CRF_MAX: 21, flagged"       "${CRFS[2]}/$EPC_OVER/${EPC_TRIED[*]}" "21/1/18 20 21"
 check "outlier: never above CRF_MAX"                "! grep -q '^22 ' '$T/calls'"
 eq    "outlier above: season still 18"              "$SEL" "18/18/0"
 
 sel 9 9 9
-eq    "season above at CRF_MAX: 21 + over"          "$SEL" "21/18 19 20 21/1"
+eq    "season above at CRF_MAX: 21 + over"          "$SEL" "21/18 20 21/1"
 
 sel 6.2 3.6
 eq    "two episodes: both must fit -> 20"           "$SEL/$OUT" "20/18 19 20/0/-"
@@ -297,7 +299,7 @@ eq    "season CRF and other estimates unchanged"    "$CRF_SELECTED/${EP_EST[0]}/
 eq    "E2 estimate map: its own samples 18-20"      "$(series_est_map 1 | tr ':' '\n' | cut -d= -f1 | tr '\n' ' ')" "18 19 20 "
 
 late 9.0
-eq    "still above at CRF_MAX: 21, flagged"         "${EP_CRF[1]}/${EP_OVER[1]}/$(cut -d' ' -f1 "$T/calls" | tr '\n' ' ')" "21/1/18 19 20 21 "
+eq    "still above at CRF_MAX: 21, flagged"         "${EP_CRF[1]}/${EP_OVER[1]}/$(cut -d' ' -f1 "$T/calls" | tr '\n' ' ')" "21/1/18 20 21 "
 check "never above CRF_MAX"                         "! grep -q '^22 ' '$T/calls'"
 
 # Custom (no ceiling): never re-checked

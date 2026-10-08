@@ -186,7 +186,9 @@ eq "never below CRF_MIN (5)"                "$(calls) | $CRF_SELECTED $QUALITY_P
 
 est 8=40 9=35 10=30 11=20
 qsel 0 8 10
-eq "never above CRF_MAX"                    "$(calls) | $CRF_SELECTED" "8 9 10 | 10"
+# 40 GiB = 1.8 x the band's upper edge: upward + 2 (the bracket search of
+# High / Base, tests/crf_adaptive_tests.sh); 9 is above the edge as well
+eq "never above CRF_MAX"                    "$(calls) | $CRF_SELECTED" "8 10 | 10"
 eq "CRF_MAX still above the band: flagged"  "$CRF_OVER_CEILING" 1
 
 est 8=19 7=17.5 6=21 5=23
@@ -216,8 +218,9 @@ est 8=27 9=21
 EST_CALLS=()
 declare -gA CRF_EST=([8]=$(gib_bytes 27))
 CRF_TRIED=(8)
-_crf_quality_try 8 fake_est
-eq "tested map: known CRF not re-estimated" "$(calls) $QE" " $(gib_bytes 27)"
+_CRF_SELECT_EST=fake_est
+_crf_select_probe 8
+eq "tested map: known CRF not re-estimated" "$(calls) $CRF_EST_RESULT/${CRF_TRIED[*]}" " $(gib_bytes 27)/8"
 
 # ------------------------------------------------------------
 echo

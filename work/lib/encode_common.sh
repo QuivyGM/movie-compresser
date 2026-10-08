@@ -450,13 +450,15 @@ crf_title_estimate() {
 # REGULAR episode estimate in CRF_EST_RESULT (series_batch_stats
 # SB_DECIDE against CRF_CEILING_BYTES: an isolated outlier does not
 # decide the season CRF). Per-episode estimates are kept in
-# CRF_SERIES_EP_BYTES[crf] ("b0 b1 ...") and CRF_SERIES_EP_FROM[crf];
-# those of the sampled episodes also in CRF_EP_EST ("INDEX:CRF"), so
+# CRF_SERIES_EP_BYTES[crf] ("b0 b1 ...") and CRF_SERIES_EP_FROM[crf],
+# the sampled bytes/s per episode in CRF_SERIES_RATES[crf] ("r0 - r2 ...",
+# "-" = not sampled; policy.sh series_crf_certify_over); those of the
+# sampled episodes also in CRF_EP_EST ("INDEX:CRF"), so
 # crf_episode_estimate does not encode them again.
 crf_series_estimate() {
     local crf="$1" i rates=() k=0 w=0 label
 
-    declare -gA CRF_EP_EST
+    declare -gA CRF_EP_EST CRF_SERIES_RATES
     for i in "${!EP_DUR[@]}"; do
         rates[$i]="-"
     done
@@ -497,6 +499,7 @@ crf_series_estimate() {
     CRF_EST_RESULT="$SB_DECIDE"
     CRF_SERIES_EP_BYTES[$crf]="${SC_EP_BYTES[*]}"
     CRF_SERIES_EP_FROM[$crf]="${SC_EP_FROM[*]}"
+    CRF_SERIES_RATES[$crf]="${rates[*]}"
     for i in "${CRF_SERIES_SAMPLED[@]}"; do
         CRF_EP_EST[$i:$crf]="${SC_EP_BYTES[$i]}"
     done
@@ -539,6 +542,69 @@ crf_episode_estimate() {
         echo "~$(size_text "$CRF_EST_RESULT") video$( (( cached == 1 )) && echo " (already sampled)")"
     else
         echo "~$(bytes_to_gib "$CRF_EST_RESULT") GiB$( (( cached == 1 )) && echo " (already sampled)")"
+    fi
+}
+
+# crf_step_result KIND CRF [ARG]  ->  the result text of one step of the
+# bracket-and-refine CRF search (policy.sh crf_search_up REPORT kinds
+# other than fits / boundary), e.g. "too large -> jumping to CRF 14"
+crf_step_result() {
+    case "$1" in
+        over)
+            if (( 10#$3 > 10#$2 + 1 )); then
+                printf '%s -> jumping to CRF %s' "$(ui_warn "too large")" "$3"
+            else
+                printf '%s -> trying CRF %s' "$(ui_warn "too large")" "$3"
+            fi
+            ;;
+        check)       printf '%s -> checking CRF %s' "$(ui_warn "too large")" "$3" ;;
+        resume)      printf '%s -> continuing at CRF %s' "$(ui_warn "too large")" "$3" ;;
+        limit)       printf '%s (CRF %s is the %s limit)' "$(ui_warn "too large")" "$2" "${TIER:-tier}" ;;
+        refine)      printf 'fits -> checking CRF %s' "$3" ;;
+        refine-over) printf '%s' "$(ui_warn "too large")" ;;
+        refine-fits) printf 'fits' ;;
+    esac
+}
+
+# crf_boundary_lines LO HI  ->  the verified boundary of the CRF search:
+# LO estimated above the ceiling, HI fits
+crf_boundary_lines() {
+    echo "Boundary:"
+    printf '  CRF %-2s  over\n' "$1"
+    printf '  CRF %-2s  fits\n' "$2"
+}
+
+# crf_step_skips KIND CRF [ARG]  ->  0 for a step that skips a CRF, checks
+# a skipped one or reports the boundary found that way
+crf_step_skips() {
+    case "$1" in
+        over) (( 10#$3 > 10#$2 + 1 )) ;;
+        check|resume|refine|refine-over|refine-fits|boundary) return 0 ;;
+        *)    return 1 ;;
+    esac
+}
+
+# crf_title_step_report KIND CRF [ARG]  (REPORT for crf_select /
+# crf_select_quality, movie): only the steps that skip or check a skipped
+# CRF get a line below the sample line, plus the boundary block; a search
+# without skips looks as before
+crf_title_step_report() {
+    crf_step_skips "$@" || return 0
+    if [[ "$1" == boundary ]]; then
+        echo
+        crf_boundary_lines "$2" "$3"
+    else
+        printf '           %s\n' "$(crf_step_result "$@")"
+    fi
+}
+
+# crf_episode_step_report KIND CRF [ARG]  (REPORT for series_episode_crf)
+crf_episode_step_report() {
+    crf_step_skips "$@" || return 0
+    if [[ "$1" == boundary ]]; then
+        printf '    boundary: CRF %s over, CRF %s fits\n' "$2" "$3"
+    else
+        printf '    %s\n' "$(crf_step_result "$@")"
     fi
 }
 

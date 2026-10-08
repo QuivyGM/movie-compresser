@@ -364,9 +364,11 @@ while true; do
 
         # ====================================================
         # CRF TIERS: High / Base choose the lowest CRF of the tier whose
-        # sampled video estimate fits the ceiling (crf_select); Quality
-        # the lowest CRF whose estimate is inside the acceptable band, searched
-        # from CRF_START in both directions, else the one closest to the target
+        # sampled video estimate fits the ceiling (crf_select: +1 / +2
+        # steps, the CRF just below the chosen one always estimated above
+        # the ceiling); Quality the lowest CRF whose estimate is inside the
+        # acceptable band, searched from CRF_START in both directions (upward
+        # with the same search), else the one closest to the target
         # (crf_select_quality);
         # Custom uses the entered CRF. Audio is not part of the decision.
         # ====================================================
@@ -405,15 +407,16 @@ while true; do
             crf_select_quality "$CRF_MIN" "$CRF_START" "$CRF_MAX" \
                 "$(_gib_bytes "$MOVIE_QUALITY_TARGET_VIDEO_GIB")" \
                 "$(_gib_bytes "$MOVIE_QUALITY_ACCEPT_MIN_GIB")" "$(_gib_bytes "$MOVIE_QUALITY_ACCEPT_MAX_GIB")" \
-                "$SOURCE_VIDEO_BYTES" crf_title_estimate || CRF_SELECTED=""
+                "$SOURCE_VIDEO_BYTES" crf_title_estimate crf_title_step_report || CRF_SELECTED=""
         elif [[ "$QUALITY_STATUS" == "source-limited" ]]; then
             # lowest CRF estimated below the source video: the same search
             # from CRF_START with the band 0 .. source - 1
             crf_select_quality "$CRF_MIN" "$CRF_START" "$CRF_MAX" \
                 "$CRF_CEILING_BYTES" 0 "$CRF_CEILING_BYTES" \
-                "$SOURCE_VIDEO_BYTES" crf_title_estimate || CRF_SELECTED=""
+                "$SOURCE_VIDEO_BYTES" crf_title_estimate crf_title_step_report || CRF_SELECTED=""
         else
-            crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_title_estimate || CRF_SELECTED=""
+            crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_title_estimate \
+                crf_title_step_report || CRF_SELECTED=""
         fi
 
         if [[ -z "$CRF_SELECTED" ]]; then
