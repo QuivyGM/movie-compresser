@@ -6,8 +6,8 @@
 #  1. bash -n on every script
 #  2. unit: audio title rewriting / false-claim detection (Atmos, DTS:X,
 #     codec names, bitrates, commentary text kept)
-#  3. SDR source, audio copied: two-pass job (Quality path, no DV
-#     steps) and single-pass CRF job (High / Base / Custom path); tracks,
+#  3. SDR source, audio copied: two-pass job (generic bitrate path, no DV
+#     steps) and single-pass CRF job (Quality / High / Base / Custom path); tracks,
 #     flags, languages, titles (unchanged), chapters, attachments kept
 #  4. HDR10 source: HDR10 metadata kept; all audio copied unchanged and
 #     verified (codec / layout / payload hash)
@@ -147,28 +147,15 @@ command -v mkvmerge >/dev/null && command -v mkvextract >/dev/null &&
 echo
 echo "== policy: compress.conf loading and validation"
 
-# Quality: max(hours * GiB/hour, min GiB), min(source), cap at max Mb/s
-exp_quality() {   # dur [source_gib]  ->  target Mb/s from the loaded config
-    awk -v r="$MOVIE_QUALITY_VIDEO_GIB_PER_HOUR" -v n="$MOVIE_QUALITY_VIDEO_MIN_GIB" \
-        -v m="$MOVIE_QUALITY_VIDEO_MAX_MBPS" -v d="$1" -v s="${2:-0}" 'BEGIN {
-        g = r * d / 3600; if (g < n) g = n
-        if (s > 0 && s < g) g = s
-        t = g * 1073741824 * 8 / d / 1000000
-        if (m > 0 && t > m) t = m
-        printf "%.3f", t }'
-}
 gib_bytes() { awk -v g="$1" 'BEGIN { printf "%.0f", g * 1073741824 }'; }
 
 check "default compress.conf loads"           "load_policy 2>'$T/pol.err'"
 {
     load_policy 2>/dev/null
-    for dur in 3600 6000 10800 20000; do
-        movie_video_plan Quality "$dur"
-        eq "movie Quality ${dur}s target from config" "$PLAN_TARGET_MBPS" "$(exp_quality "$dur")"
-    done
-    movie_video_plan Quality 5400
-    eq "movie Quality 90 min not below floor" "$PLAN_BELOW_FLOOR" 0
-    check "movie_video_plan is Quality-only"  "! movie_video_plan High 7200 2>/dev/null"
+    crf_tier_load movie Quality
+    eq "movie Quality CRF tier from config" "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB" \
+        "$MOVIE_QUALITY_CRF_MIN $MOVIE_QUALITY_CRF_MAX $MOVIE_QUALITY_ACCEPT_MAX_GIB"
+    check "no two-pass Quality math left"  "! declare -F movie_video_plan >/dev/null"
 
     for tier in Quality High Base Custom; do
         check "movie $tier policy: audio copied" "[[ \"\$(movie_policy_line $tier)\" == *'; audio copied' ]]"
@@ -231,83 +218,18 @@ conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the default config
 }
 
 {
-    # Quality: two-pass GiB/hour with a minimum size (unchanged policy;
-    # fixed values, not the defaults)
-    COMPRESS_CONF=$(conf_with q MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=8.4 MOVIE_QUALITY_VIDEO_MIN_GIB=20 \
-        MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=0)
+    # Quality: CRF chosen for the 18-22 GiB video band (stand-in
+    # estimator; detailed cases: tests/quality_policy_tests.sh)
+    COMPRESS_CONF=$(conf_with q MOVIE_QUALITY_TARGET_VIDEO_GIB=20 MOVIE_QUALITY_ACCEPT_MIN_GIB=18 \
+        MOVIE_QUALITY_ACCEPT_MAX_GIB=22 MOVIE_QUALITY_CRF_MIN=0 MOVIE_QUALITY_CRF_MAX=23)
     load_policy 2>/dev/null
-
-    # 1 short movie: 8.4 * 1.5 = 12.6 GiB < 20 -> the minimum wins
-    movie_video_plan Quality 5400 "$(gib_bytes 60)"
-    eq "Q1 short: rate-based size"        "$PLAN_RATE_GIB" 12.600
-    eq "Q1 short: minimum size wins"      "$PLAN_TARGET_GIB" 20.000
-    eq "Q1 short: bitrate from 20 GiB"    "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 20 5400)"
-    eq "Q1 short: not source limited"     "$PLAN_SOURCE_LIMITED" 0
-
-    # 2 long movie: 8.4 * 3 = 25.2 GiB > 20 -> GiB/hour wins
-    movie_video_plan Quality 10800 "$(gib_bytes 60)"
-    eq "Q2 long: GiB/hour size wins"      "$PLAN_TARGET_GIB" 25.200
-    eq "Q2 long: bitrate from 25.2 GiB"   "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 25.2 10800)"
-
-    # 3 source video smaller than the target -> source size wins
-    movie_video_plan Quality 10800 "$(gib_bytes 15)"
-    eq "Q3 source: source size wins"      "$PLAN_TARGET_GIB" 15.000
-    eq "Q3 source: flagged as limited"    "$PLAN_SOURCE_LIMITED" 1
-    eq "Q3 source: bitrate from source"   "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 15 10800)"
-    movie_video_plan Quality 10800 "$(gib_bytes 2)"
-    eq "Q3 source below floor: no conflict" "$PLAN_BELOW_FLOOR" 0
-
-    # 7 Grand Budapest-style: 1h40m, 24.38 GiB source video
-    movie_video_plan Quality 6000 "$(gib_bytes 24.38)"
-    eq "Q7 GBH: rate-based ~14 GiB"       "$PLAN_RATE_GIB" 14.000
-    eq "Q7 GBH: minimum 20 GiB"           "$PLAN_MIN_GIB" 20.000
-    eq "Q7 GBH: source 24.38 GiB"         "$PLAN_SOURCE_GIB" 24.380
-    eq "Q7 GBH: target 20 GiB video"      "$PLAN_TARGET_GIB" 20.000
-    eq "Q7 GBH: not limited by source"    "$PLAN_SOURCE_LIMITED" 0
-    eq "Q7 GBH: not capped at 20 Mb/s"    "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 20 6000)"
-    check "Q7 GBH: ~28.6 Mb/s"            "awk -v x='$PLAN_TARGET_MBPS' 'BEGIN { exit !(x > 28.5 && x < 28.7) }'"
-    eq "Q7 GBH: expected size ~20 GiB"    "$(video_size_gib "$PLAN_TARGET_MBPS" 6000)" 20.000
-
-    # Quality: a source below its floor still gets the size target
-    mbps_bytes() { awk -v x="$1" 'BEGIN { printf "%.0f", x * 1000000 / 8 * 7200 }'; }
-    COMPRESS_CONF=$(conf_with qsrc MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=0.1 MOVIE_QUALITY_VIDEO_MIN_GIB=0.1 \
-        MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=0)
-    load_policy 2>/dev/null
-    movie_video_plan Quality 7200 "$(mbps_bytes 6)"
-    eq "Quality src<floor: size target kept" "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 0.2 7200)"
-    eq "Quality src<floor: conflict as before" "$PLAN_BELOW_FLOOR" 1
-
-    # 4 nonzero bitrate max limits the calculated bitrate
-    COMPRESS_CONF=$(conf_with qmax MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=8.4 MOVIE_QUALITY_VIDEO_MIN_GIB=20 \
-        MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=25)
-    load_policy 2>/dev/null
-    movie_video_plan Quality 6000 "$(gib_bytes 24.38)"
-    eq "Q4 max: capped at 25 Mb/s"        "$PLAN_TARGET_MBPS" 25.000
-    eq "Q4 max: flagged as limited"       "$PLAN_MAX_LIMITED" 1
-    movie_video_plan Quality 10800
-    eq "Q4 max: below max untouched"      "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 25.2 10800)"
-    eq "Q4 max: not flagged"              "$PLAN_MAX_LIMITED" 0
-
-    # 5 floor conflict: 2 GiB/hour ~ 4.8 Mb/s < 12 Mb/s floor -> menu asks
-    COMPRESS_CONF=$(conf_with qfloor MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=2 MOVIE_QUALITY_VIDEO_MIN_GIB=1 \
-        MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=0)
-    load_policy 2>/dev/null
-    movie_video_plan Quality 7200 "$(gib_bytes 60)"
-    eq "Q5 floor: below floor -> asks"    "$PLAN_BELOW_FLOOR" 1
-    eq "Q5 floor: target not raised"      "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 4 7200)"
-    eq "Q5 floor: floor offered"          "$PLAN_FLOOR_MBPS" 12
-    COMPRESS_CONF=$(conf_with qfloor2 MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=2 MOVIE_QUALITY_VIDEO_MIN_GIB=20 \
-        MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=0)
-    load_policy 2>/dev/null
-    movie_video_plan Quality 3600 "$(gib_bytes 60)"
-    eq "Q5 floor: minimum size lifts above floor" "$PLAN_BELOW_FLOOR" 0
-
-    # 6 changing GiB/hour changes the target
-    COMPRESS_CONF=$(conf_with qrate MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=12 MOVIE_QUALITY_VIDEO_MIN_GIB=20)
-    load_policy 2>/dev/null
-    movie_video_plan Quality 10800
-    eq "Q6 edited GiB/hour: 12 * 3 h"     "$PLAN_TARGET_GIB" 36.000
-    eq "Q6 edited GiB/hour: bitrate"      "$PLAN_TARGET_MBPS" "$(bitrate_for_gib 36 10800)"
+    declare -A QEST=([7]=25.4 [8]=22.7 [9]=20.45 [10]=18.7)
+    qest() { CRF_EST_RESULT=$(gib_bytes "${QEST[$1]:-40}"); }
+    crf_select_quality 0 23 "$(gib_bytes 20)" "$(gib_bytes 18)" "$(gib_bytes 22)" "$(gib_bytes 60)" qest
+    eq "Q1 lowest CRF inside the band"   "$CRF_SELECTED $QUALITY_PICK" "9 band"
+    eq "Q1 searched from CRF_MIN up"     "${CRF_TRIED[*]}" "0 1 2 3 4 5 6 7 8 9"
+    crf_select_quality 0 23 "$(gib_bytes 20)" "$(gib_bytes 18)" "$(gib_bytes 22)" "$(gib_bytes 20.4)" qest
+    eq "Q3 never at or above the source" "$CRF_SELECTED" 10
 
     # edited CRF settings are used
     COMPRESS_CONF=$(conf_with crfedit MOVIE_HIGH_CRF_MIN=18 MOVIE_HIGH_CRF_MAX=22 MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=9.5)
@@ -645,15 +567,15 @@ for k in MOVIE_HIGH_CRF_MIN MOVIE_HIGH_CRF_MAX MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB
     reject_file "missing $k" "$k is not set" "$f"
 done
 reject "decimal kb/s"             "whole number of kb/s"     AUDIO_HIGH_KBPS_5TO6=640.5
-reject "zero Quality GiB/hour"    'MOVIE_QUALITY_VIDEO_GIB_PER_HOUR="0": must be greater than 0' MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=0
-reject "zero Quality minimum"     'MOVIE_QUALITY_VIDEO_MIN_GIB="0": must be greater than 0' MOVIE_QUALITY_VIDEO_MIN_GIB=0
-reject "negative Quality floor"   'MOVIE_QUALITY_VIDEO_FLOOR_MBPS="-1": must not be negative' MOVIE_QUALITY_VIDEO_FLOOR_MBPS=-1
-reject "negative Quality max"     'MOVIE_QUALITY_VIDEO_MAX_MBPS="-5": must not be negative' MOVIE_QUALITY_VIDEO_MAX_MBPS=-5
-reject "non-numeric Quality max"  "not a number"             MOVIE_QUALITY_VIDEO_MAX_MBPS=twelve
-reject "Quality floor above max"  'MOVIE_QUALITY_VIDEO_FLOOR_MBPS (12) is greater than MOVIE_QUALITY_VIDEO_MAX_MBPS (10)' MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=10
-f=$(conf_with qunset); sed -i '/^MOVIE_QUALITY_VIDEO_GIB_PER_HOUR=/d' "$f"
-reject_file "missing Quality GiB/hour" "MOVIE_QUALITY_VIDEO_GIB_PER_HOUR is not set" "$f"
-check "Quality floor 12 max 0 allowed" "( COMPRESS_CONF=\$(conf_with qok MOVIE_QUALITY_VIDEO_FLOOR_MBPS=12 MOVIE_QUALITY_VIDEO_MAX_MBPS=0) load_policy )"
+reject "zero Quality target"      'MOVIE_QUALITY_TARGET_VIDEO_GIB="0": must be greater than 0' MOVIE_QUALITY_TARGET_VIDEO_GIB=0
+reject "zero Quality band min"    'MOVIE_QUALITY_ACCEPT_MIN_GIB="0": must be greater than 0' MOVIE_QUALITY_ACCEPT_MIN_GIB=0
+reject "negative Quality max"     'MOVIE_QUALITY_ACCEPT_MAX_GIB="-5": must not be negative' MOVIE_QUALITY_ACCEPT_MAX_GIB=-5
+reject "non-numeric Quality max"  "not a number"             MOVIE_QUALITY_ACCEPT_MAX_GIB=twelve
+reject "Quality min above target" 'MOVIE_QUALITY_ACCEPT_MIN_GIB (21) is greater than MOVIE_QUALITY_TARGET_VIDEO_GIB (20)' MOVIE_QUALITY_ACCEPT_MIN_GIB=21
+reject "Quality target above max" 'MOVIE_QUALITY_TARGET_VIDEO_GIB (23) is greater than MOVIE_QUALITY_ACCEPT_MAX_GIB (22)' MOVIE_QUALITY_TARGET_VIDEO_GIB=23
+f=$(conf_with qunset); sed -i '/^MOVIE_QUALITY_TARGET_VIDEO_GIB=/d' "$f"
+reject_file "missing Quality target" "MOVIE_QUALITY_TARGET_VIDEO_GIB is not set" "$f"
+check "Quality min = target = max allowed" "( COMPRESS_CONF=\$(conf_with qok MOVIE_QUALITY_ACCEPT_MIN_GIB=20 MOVIE_QUALITY_ACCEPT_MAX_GIB=20) load_policy )"
 f=$(conf_with unset); sed -i '/^SERIES_CONTAINER_RESERVE_PCT=/d' "$f"
 reject_file "missing setting"     "SERIES_CONTAINER_RESERVE_PCT is not set" "$f"
 reject_file "missing file"        "Compression policy file not found" "$T/nope.conf"
@@ -765,7 +687,7 @@ mux_source "$T/hdr10.mkv" "$T/in/HDR10.mkv"
 # ------------------------------------------------------------
 # run_item NAME INPUT FILTER [OVERWRITE] [VIDEO] [EST_VIDEO_BYTES]
 #   ->  job script + output + log. VIDEO: two-pass kb/s (default 1500,
-#   the Quality path), crf:N (High / Base / Custom) or copy
+#   the generic bitrate path), crf:N (Quality / High / Base / Custom) or copy
 run_item() {
     local name="$1" in="$2" filter="$3" overwrite="${4:-0}" video="${5:-1500}" est="${6:-}"
     local job="$WORK_DIR/$name.sh"
@@ -1429,6 +1351,9 @@ if [[ -s "$MH/compress/in/Multi.mkv" ]]; then
         ((n += 1))
         rm -rf "$MH/compress/work"/c[0-9]*.sh "$MH/compress/work"/c[0-9]*_passes
         in="1\n$n\nn\n"; [[ $t == Custom ]] && in="1\n4\n24\nn\n"
+        # Quality: the small source is below the 20 GiB target -> source
+        # guard first; 2 = encode below the source size
+        [[ $t == Quality ]] && in="1\n1\n2\nn\n"
         menu "$MH/compress/work/movie_compress.sh" "$in" "$AC/movie_$t.log"
         job=$(ls "$MH/compress/work"/c[0-9]*.sh 2>/dev/null | head -1)
         check "acopy $n: movie $t job written"          "[[ -n '$job' ]]"
@@ -1438,11 +1363,11 @@ if [[ -s "$MH/compress/in/Multi.mkv" ]]; then
         if [[ -d "${job%.sh}_passes" ]]; then echo 1 > "$AC/movie_${t}_passdir"; else : > "$AC/movie_${t}_passdir"; fi
     done
 
-    # 19 / 20 job shape per tier: Quality two-pass, the others single-pass CRF
+    # 19 / 20 job shape per tier: every tier single-pass CRF (Quality too)
     qj="$AC/movie_Quality_job.sh"
-    check "20 movie Quality: still two-pass bitrate" "[[ \$(grep -c libx265 '$qj') == 2 ]] && grep -q -- '-b:v:0 [0-9]*k' '$qj' && grep -q 'pass=1:stats=' '$qj' && grep -q 'pass=2:stats=' '$qj' && ! grep -q -- '-crf' '$qj'"
-    check "20 movie Quality: pass log dir created"   "[[ -s '$AC/movie_Quality_passdir' ]]"
-    check "20 movie Quality: GiB/hour target summary" "grep -q 'Video target:      rate-based' '$AC/movie_Quality.log' && grep -q 'quality-first \[two-pass' '$AC/movie_Quality.log'"
+    check "20 movie Quality: single-pass CRF"  "[[ \$(grep -c libx265 '$qj') == 1 ]] && grep -q -- '-crf:v:0 [0-9]* ' '$qj' && ! grep -qE -- '-b:v|pass=[12]|stats=' '$qj'"
+    check "20 movie Quality: no pass log dir"  "[[ ! -s '$AC/movie_Quality_passdir' ]]"
+    check "20 movie Quality: CRF summary"      "grep -q 'Quality: CRF 0-23, ' '$AC/movie_Quality.log' && ! grep -qi 'two-pass' '$AC/movie_Quality.log'"
     for tc in High:19 Base:25 Custom:24; do
         tt=${tc%%:*}; c=${tc#*:}; j="$AC/movie_${tt}_job.sh"
         check "19 movie $tt: -crf $c, no -b:v / passes" "grep -q -- '-crf:v:0 $c ' '$j' && ! grep -qE -- '-b:v|pass=[12]|stats=' '$j' && [[ \$(grep -c libx265 '$j') == 1 ]]"
@@ -2141,7 +2066,7 @@ exit 0
 EOF
 chmod +x "$PH/stub/tmux"
 for s in c7 c8; do
-    if [[ $s == c7 ]]; then m=crf c=21 p=encode tier=High; else m=abr c="" p=1/2 tier=Quality; fi
+    if [[ $s == c7 ]]; then m=crf c=21 p=encode tier=High; else m=abr c="" p=1/2 tier=Test; fi
     printf 'version=1\nsession=%s\ntype=movie\nstatus=running\nitem=1\nitems=1\nok=0\nfailed=0\nname=%s.mkv\ninput=/x/%s.mkv\noutput=/y/%s.mkv\ntier=%s\npass=%s\nmode=%s\ncrf=%s\nduration=3600\nstarted=%s\nupdated=%s\nprogress=%s\nlog_dir=/z\n' \
         "$s" "$s" "$s" "$s" "$tier" "$p" "$m" "$c" "$now" "$now" "$PH/compress/work/$s.progress" > "$PH/compress/work/$s.state"
     printf 'out_time_us=1800000000\nspeed=2.0x\nprogress=continue\n' > "$PH/compress/work/$s.progress"
@@ -2151,7 +2076,7 @@ c7=$(sed -n '/^c7 /,/^$/p' "$T/progress.out"); c8=$(sed -n '/^c8 /,/^$/p' "$T/pr
 check "21 CRF job: one encode step with its CRF" "grep -q 'Tier: High .*Encoding, CRF: 21' <<< \"\$c7\""
 check "21 CRF job: no pass 1/2 or 2/2"           "! grep -q 'Pass' <<< \"\$c7\""
 check "21 CRF job: progress and ETA"             "grep -q '50.0%.*ETA 00:15:00' <<< \"\$c7\""
-check "20 Quality job: still Pass 1/2"           "grep -q 'Tier: Quality .*Pass: 1/2' <<< \"\$c8\""
+check "20 two-pass job: still Pass 1/2"          "grep -q 'Tier: Test .*Pass: 1/2' <<< \"\$c8\""
 check "21 sdrcrf job: own .sh / .state removed after success" "[[ ! -e '$WORK_DIR/sdrcrf.sh' && ! -e '$WORK_DIR/sdrcrf.state' ]]"
 
 echo

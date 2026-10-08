@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Compression policy: loads and validates compress.conf and holds the
-# policy math that uses it (movie Quality bitrate target, CRF tier
-# selection for movie / series High, Base and Custom, audio-menu rates).
+# policy math that uses it (CRF tier selection for movie Quality, High,
+# Base and Custom and series High, Base and Custom; audio-menu rates).
 # Sourced, not executed. Needs bitrate.sh.
 #
 # Movie and series compression copy every audio track unchanged; audio
@@ -13,7 +13,7 @@
 # compress.conf is the only place the numbers live.
 
 POLICY_KEYS_POSITIVE=(
-    MOVIE_QUALITY_VIDEO_GIB_PER_HOUR MOVIE_QUALITY_VIDEO_MIN_GIB
+    MOVIE_QUALITY_TARGET_VIDEO_GIB MOVIE_QUALITY_ACCEPT_MIN_GIB MOVIE_QUALITY_ACCEPT_MAX_GIB
     MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB MOVIE_BASE_VIDEO_SIZE_CEILING_GIB
     SERIES_HIGH_VIDEO_SIZE_CEILING_GIB SERIES_BASE_VIDEO_SIZE_CEILING_GIB
     CRF_SAMPLE_SECONDS
@@ -24,14 +24,10 @@ POLICY_KEYS_POSITIVE=(
     AUDIO_COMPACT_KBPS_5TO6 AUDIO_COMPACT_KBPS_7PLUS
 )
 
-# 0 allowed (0 = "no ceiling" / "no limit")
-POLICY_KEYS_NONNEG=(
-    MOVIE_QUALITY_VIDEO_FLOOR_MBPS MOVIE_QUALITY_VIDEO_MAX_MBPS
-)
-
 # x265 CRF values: whole numbers 0..CRF_LIMIT
 CRF_LIMIT=51
 POLICY_KEYS_CRF=(
+    MOVIE_QUALITY_CRF_MIN MOVIE_QUALITY_CRF_MAX
     MOVIE_HIGH_CRF_MIN MOVIE_HIGH_CRF_MAX MOVIE_BASE_CRF_MIN MOVIE_BASE_CRF_MAX
     SERIES_HIGH_CRF_MIN SERIES_HIGH_CRF_MAX SERIES_BASE_CRF_MIN SERIES_BASE_CRF_MAX
 )
@@ -58,6 +54,14 @@ POLICY_KEYS_RETIRED=(
     SERIES_MIN_VIDEO_KBPS
 )
 
+# Settings of the former two-pass Quality policy (GiB/hour with a
+# minimum size, bitrate floor / max), replaced by the Quality CRF tier
+# (video size band); a config that still sets them gets a note.
+POLICY_KEYS_RETIRED_QUALITY=(
+    MOVIE_QUALITY_VIDEO_GIB_PER_HOUR MOVIE_QUALITY_VIDEO_MIN_GIB
+    MOVIE_QUALITY_VIDEO_FLOOR_MBPS MOVIE_QUALITY_VIDEO_MAX_MBPS
+)
+
 # Settings of the former High / Base size-target (GiB/hour, two-pass)
 # video policy, replaced by the CRF tiers; a config that still sets
 # them gets a note.
@@ -80,7 +84,7 @@ _policy_is_num() {
 validate_policy() {
     local k v errs=() f m
 
-    for k in "${POLICY_KEYS_POSITIVE[@]}" "${POLICY_KEYS_NONNEG[@]}"; do
+    for k in "${POLICY_KEYS_POSITIVE[@]}"; do
         if [[ -z "${!k+x}" ]]; then
             errs+=("$k is not set")
             continue
@@ -121,21 +125,23 @@ validate_policy() {
     done
 
     # CRF_MIN (highest quality of the tier) <= CRF_MAX (lowest quality)
-    for f in MOVIE_HIGH MOVIE_BASE SERIES_HIGH SERIES_BASE; do
+    for f in MOVIE_QUALITY MOVIE_HIGH MOVIE_BASE SERIES_HIGH SERIES_BASE; do
         local lo="${f}_CRF_MIN" hi="${f}_CRF_MAX"
         if [[ "${!lo:-}" =~ ^[0-9]+$ && "${!hi:-}" =~ ^[0-9]+$ ]] && (( 10#${!hi} < 10#${!lo} )); then
             errs+=("$hi (${!hi}) is lower than $lo (${!lo})")
         fi
     done
 
-    # floor <= max (when a max is set)
-    for f in MOVIE_QUALITY; do
-        local fl="${f}_VIDEO_FLOOR_MBPS" mx="${f}_VIDEO_MAX_MBPS"
-        if _policy_is_num "${!fl:-}" && _policy_is_num "${!mx:-}" &&
-           awk -v a="${!fl}" -v b="${!mx}" 'BEGIN { exit !(b > 0 && a > b) }'; then
-            errs+=("$fl (${!fl}) is greater than $mx (${!mx})")
-        fi
-    done
+    # Quality band: ACCEPT_MIN <= TARGET <= ACCEPT_MAX
+    local qmin="${MOVIE_QUALITY_ACCEPT_MIN_GIB:-}" qt="${MOVIE_QUALITY_TARGET_VIDEO_GIB:-}" qmax="${MOVIE_QUALITY_ACCEPT_MAX_GIB:-}"
+    if _policy_is_num "$qmin" && _policy_is_num "$qt" &&
+       awk -v a="$qmin" -v b="$qt" 'BEGIN { exit !(a > b) }'; then
+        errs+=("MOVIE_QUALITY_ACCEPT_MIN_GIB ($qmin) is greater than MOVIE_QUALITY_TARGET_VIDEO_GIB ($qt)")
+    fi
+    if _policy_is_num "$qt" && _policy_is_num "$qmax" &&
+       awk -v a="$qt" -v b="$qmax" 'BEGIN { exit !(a > b) }'; then
+        errs+=("MOVIE_QUALITY_TARGET_VIDEO_GIB ($qt) is greater than MOVIE_QUALITY_ACCEPT_MAX_GIB ($qmax)")
+    fi
 
     if _policy_is_num "${SERIES_CONTAINER_RESERVE_PCT:-}"; then
         if awk -v x="$SERIES_CONTAINER_RESERVE_PCT" 'BEGIN { exit !(x >= 100) }'; then
@@ -189,9 +195,10 @@ load_policy() {
 
     # Start clean: a setting missing from the file must not survive from
     # an earlier load (or from the environment).
-    unset "${POLICY_KEYS_POSITIVE[@]}" "${POLICY_KEYS_NONNEG[@]}" \
+    unset "${POLICY_KEYS_POSITIVE[@]}" \
         "${POLICY_KEYS_CRF[@]}" "${POLICY_KEYS_COUNT[@]}" \
         "${POLICY_KEYS_RETIRED[@]}" "${POLICY_KEYS_RETIRED_VIDEO[@]}" \
+        "${POLICY_KEYS_RETIRED_QUALITY[@]}" \
         SERIES_CONTAINER_RESERVE_PCT CRF_DOWN_RETRY_HEADROOM_PCT CRF_DOWN_RETRY_MAX
 
     # shellcheck source=/dev/null
@@ -232,113 +239,54 @@ policy_retired_note() {
         echo "      *_CRF_MIN / *_CRF_MAX / *_VIDEO_SIZE_CEILING_GIB):" >&2
         printf '        %s\n' "${set[@]}" >&2
     fi
+
+    set=()
+    for k in "${POLICY_KEYS_RETIRED_QUALITY[@]}"; do
+        [[ -n "${!k+x}" ]] && set+=("$k")
+    done
+
+    if (( ${#set[@]} )); then
+        echo "Note: $(policy_conf_path) still sets former Quality GiB/hour settings," >&2
+        echo "      which are ignored (Quality is a CRF tier: MOVIE_QUALITY_CRF_MIN / _MAX," >&2
+        echo "      TARGET_VIDEO_GIB and the ACCEPT_MIN_GIB / _MAX_GIB band):" >&2
+        printf '        %s\n' "${set[@]}" >&2
+    fi
     return 0
 }
 
 # ------------------------------------------------------------
-# Movie Quality (two-pass bitrate target)
+# Movie Quality (CRF chosen for a video size band)
 # ------------------------------------------------------------
 
-# movie_video_plan Quality DURATION_SECONDS [SOURCE_VIDEO_BYTES]
-#
-# Quality sizes the video from the runtime:
-#   rate   = hours * MOVIE_QUALITY_VIDEO_GIB_PER_HOUR
-#   target = max(rate, MOVIE_QUALITY_VIDEO_MIN_GIB)
-#   target = min(target, source video size)
-#   bitrate from target and duration, capped at MOVIE_QUALITY_VIDEO_MAX_MBPS
-#   (0 = no cap). Below the floor -> the menu asks floor vs target.
-#
-# The floor conflict is skipped when the source limits the target
-# (encoding above the source is never done, so the floor could not be
-# used). High / Base are CRF tiers (crf_tier_load / crf_select below).
-#
-# Sets:
-#   PLAN_TARGET_MBPS      video target from the policy (the menu still
-#                         applies the "never above source bitrate" cap)
-#   PLAN_FLOOR_MBPS       floor of the tier
-#   PLAN_MAX_MBPS         bitrate max of the tier (0 = none)
-#   PLAN_GIB_PER_HOUR     GiB/hour of the tier
-#   PLAN_SIZE_MBPS        bitrate of the selected size
-#   PLAN_BELOW_FLOOR      1 when the target is below the floor: the menu
-#                         asks floor vs target
-#   PLAN_RATE_GIB         GiB/hour * runtime
-#   PLAN_MIN_GIB          configured minimum size
-#   PLAN_TARGET_GIB       selected video size (after the source limit)
-#   PLAN_SOURCE_GIB       source video size ("" when not known)
-#   PLAN_SOURCE_MBPS      source video bitrate ("" when not known)
-#   PLAN_SOURCE_LIMITED   1 when the source size lowered the target
-#   PLAN_SOURCE_BELOW_FLOOR 1 when the source bitrate is below the floor
-#   PLAN_MAX_LIMITED      1 when the bitrate max lowered the target
-movie_video_plan() {
-    local tier="$1" dur="$2" src_bytes="${3:-}"
-    local gib floor max t
+# quality_band_text  ->  "~20 GiB (18-22)"
+quality_band_text() {
+    printf '~%s GiB (%s-%s)' "$MOVIE_QUALITY_TARGET_VIDEO_GIB" \
+        "$MOVIE_QUALITY_ACCEPT_MIN_GIB" "$MOVIE_QUALITY_ACCEPT_MAX_GIB"
+}
 
-    PLAN_BELOW_FLOOR=0
-    PLAN_SIZE_MBPS=""
-    PLAN_MIN_GIB=""
-    PLAN_SOURCE_GIB=""
-    PLAN_SOURCE_MBPS=""
-    PLAN_SOURCE_LIMITED=0
-    PLAN_SOURCE_BELOW_FLOOR=0
-    PLAN_MAX_LIMITED=0
+# quality_source_limited SOURCE_VIDEO_BYTES  ->  0 when the source video
+# is known and at or below the Quality target (the band cannot be
+# reached without inflating the source; the menu asks first)
+quality_source_limited() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]] && (( $1 > 0 && $1 <= $(_gib_bytes "$MOVIE_QUALITY_TARGET_VIDEO_GIB") ))
+}
 
-    if [[ "$tier" != "Quality" ]]; then
-        echo "movie_video_plan: $tier is not a bitrate tier (High / Base / Custom use CRF)" >&2
-        return 1
-    fi
-
-    floor="$MOVIE_QUALITY_VIDEO_FLOOR_MBPS"
-    max="$MOVIE_QUALITY_VIDEO_MAX_MBPS"
-    PLAN_GIB_PER_HOUR="$MOVIE_QUALITY_VIDEO_GIB_PER_HOUR"
-
-    PLAN_RATE_GIB=$(awk -v r="$PLAN_GIB_PER_HOUR" -v d="$dur" \
-        'BEGIN { printf "%.3f", r * d / 3600 }')
-    PLAN_MIN_GIB=$(awk -v m="$MOVIE_QUALITY_VIDEO_MIN_GIB" 'BEGIN { printf "%.3f", m }')
-    gib=$(max_value "$PLAN_RATE_GIB" "$PLAN_MIN_GIB")
-
-    if [[ "$src_bytes" =~ ^[0-9]+$ ]] && (( src_bytes > 0 )); then
-        PLAN_SOURCE_GIB=$(awk -v b="$src_bytes" 'BEGIN { printf "%.3f", b / 1073741824 }')
-        PLAN_SOURCE_MBPS=$(awk -v b="$src_bytes" -v d="$dur" 'BEGIN { printf "%.3f", b * 8 / d / 1000000 }')
-        if awk -v s="$PLAN_SOURCE_GIB" -v g="$gib" 'BEGIN { exit !(s < g) }'; then
-            gib="$PLAN_SOURCE_GIB"
-            PLAN_SOURCE_LIMITED=1
-        fi
-        awk -v s="$PLAN_SOURCE_MBPS" -v f="$floor" 'BEGIN { exit !(s < f) }' &&
-            PLAN_SOURCE_BELOW_FLOOR=1
-    fi
-
-    PLAN_TARGET_GIB="$gib"
-    if (( PLAN_SOURCE_LIMITED == 1 )); then
-        # exact bytes, not the 0.001 GiB rounded size (small sources)
-        PLAN_SIZE_MBPS="$PLAN_SOURCE_MBPS"
-    else
-        PLAN_SIZE_MBPS=$(bitrate_for_gib "$gib" "$dur")
-    fi
-    t="$PLAN_SIZE_MBPS"
-
-    if awk -v m="$max" -v x="$t" 'BEGIN { exit !(m > 0 && x > m) }'; then
-        t=$(min_value "$max" "$t")
-        PLAN_MAX_LIMITED=1
-    fi
-
-    if (( PLAN_SOURCE_LIMITED == 0 )) &&
-       awk -v x="$t" -v f="$floor" 'BEGIN { exit !(x < f) }'; then
-        PLAN_BELOW_FLOOR=1
-    fi
-
-    PLAN_TARGET_MBPS="$t"
-    PLAN_FLOOR_MBPS="$floor"
-    PLAN_MAX_MBPS="$max"
+# quality_pick_text  ->  why crf_select_quality chose its CRF (QUALITY_PICK)
+quality_pick_text() {
+    case "${QUALITY_PICK:-}" in
+        band)    printf 'lowest CRF inside the %s-%s GiB band' "$MOVIE_QUALITY_ACCEPT_MIN_GIB" "$MOVIE_QUALITY_ACCEPT_MAX_GIB" ;;
+        closest) printf 'no CRF inside the band; closest to %s GiB' "$MOVIE_QUALITY_TARGET_VIDEO_GIB" ;;
+        none)    printf 'no CRF estimated below the source video' ;;
+    esac
 }
 
 # movie_policy_line TIER  ->  one-line description of the effective values
 movie_policy_line() {
     case "$1" in
         Quality)
-            printf 'quality-first [two-pass, %s GiB/hour video, at least %s GiB / %s Mb/s floor / %s]' \
-                "$MOVIE_QUALITY_VIDEO_GIB_PER_HOUR" "$MOVIE_QUALITY_VIDEO_MIN_GIB" \
-                "$MOVIE_QUALITY_VIDEO_FLOOR_MBPS" \
-                "$(awk -v m="$MOVIE_QUALITY_VIDEO_MAX_MBPS" 'BEGIN { print (m > 0) ? m " Mb/s max" : "no bitrate max" }')"
+            printf 'CRF %s-%s [lowest CRF with the video estimate in %s-%s GiB, else closest to %s GiB]' \
+                "$MOVIE_QUALITY_CRF_MIN" "$MOVIE_QUALITY_CRF_MAX" \
+                "$MOVIE_QUALITY_ACCEPT_MIN_GIB" "$MOVIE_QUALITY_ACCEPT_MAX_GIB" "$MOVIE_QUALITY_TARGET_VIDEO_GIB"
             ;;
         High|Base)
             crf_tier_load movie "$1"
@@ -362,19 +310,7 @@ audio_copy_policy_lines() {
 
 # movie_video_policy_lines TIER  ->  the tier's video settings, one per line
 movie_video_policy_lines() {
-    case "$1" in
-        Quality)
-            echo "Quality video policy:"
-            echo "  two-pass bitrate encode"
-            echo "  ${MOVIE_QUALITY_VIDEO_GIB_PER_HOUR} GiB/hour"
-            echo "  minimum preferred video size: ${MOVIE_QUALITY_VIDEO_MIN_GIB} GiB"
-            echo "  bitrate floor: ${MOVIE_QUALITY_VIDEO_FLOOR_MBPS} Mb/s"
-            awk -v m="$MOVIE_QUALITY_VIDEO_MAX_MBPS" 'BEGIN { print "  bitrate max: " ((m > 0) ? m " Mb/s" : "none") }'
-            ;;
-        *)
-            crf_policy_lines movie "$1" "${2:-}"
-            ;;
-    esac
+    crf_policy_lines movie "$1" "${2:-}"
 }
 
 # ------------------------------------------------------------
@@ -430,6 +366,18 @@ crf_tier_load() {
             CRF_CEILING_GIB=""
             CRF_CEILING_BYTES=0
             ;;
+        Quality)
+            # movie only; the "ceiling" is the upper edge of the band
+            # (what the post-encode retry checks the actual video against)
+            if [[ "$scope" != MOVIE ]]; then
+                echo "crf_tier_load: Quality is a movie tier" >&2
+                return 1
+            fi
+            CRF_MIN="$MOVIE_QUALITY_CRF_MIN"
+            CRF_MAX="$MOVIE_QUALITY_CRF_MAX"
+            CRF_CEILING_GIB="$MOVIE_QUALITY_ACCEPT_MAX_GIB"
+            CRF_CEILING_BYTES=$(_gib_bytes "$CRF_CEILING_GIB")
+            ;;
         *)
             echo "crf_tier_load: unknown tier $tier" >&2
             return 1
@@ -451,6 +399,11 @@ crf_policy_lines() {
         else
             echo "  CRF: ${CRF_MIN:-entered in the menu} (used exactly; no size ceiling)"
         fi
+    elif [[ "$tier" == "Quality" ]]; then
+        echo "  CRF range: ${CRF_MIN}-${CRF_MAX} (searched from ${CRF_MIN} upward)"
+        echo "  video target: ${MOVIE_QUALITY_TARGET_VIDEO_GIB} GiB, acceptable ${MOVIE_QUALITY_ACCEPT_MIN_GIB}-${MOVIE_QUALITY_ACCEPT_MAX_GIB} GiB (copied audio not counted)"
+        echo "  lowest CRF estimated inside the band; none inside: closest to the target"
+        echo "  never a CRF estimated at or above the source video size"
     elif [[ "$scope" == series ]]; then
         echo "  CRF range: ${CRF_MIN}-${CRF_MAX} (${CRF_MIN} preferred; raised only while the median episode is above the ceiling)"
         echo "  nominal video ceiling: ${CRF_CEILING_GIB} GiB/episode (episodes above it are listed, same CRF)"
@@ -501,6 +454,88 @@ crf_select() {
     done
 
     CRF_OVER_CEILING=1
+    return 0
+}
+
+# crf_select_quality CRF_MIN CRF_MAX TARGET_BYTES LO_BYTES HI_BYTES SOURCE_BYTES ESTIMATOR
+#
+# Movie Quality: the CRF for a VIDEO size band (audio never involved).
+# A CRF is "usable" when its estimate is below SOURCE_BYTES (unknown
+# source: always), so the band's upper edge is min(HI, source - 1).
+# CRFs are estimated from CRF_MIN upward:
+#   - the first CRF inside LO..upper edge is chosen (the lowest CRF in
+#     the band, as every lower CRF was estimated outside it); stop
+#   - above the band: next CRF
+#   - below LO: one more CRF is estimated (noisy, non-monotonic
+#     estimates); if that one is inside the band it is chosen, else the
+#     search stops
+# Without a CRF inside the band, the usable tested CRF whose estimate is
+# closest to TARGET is chosen (equal distance: the lower CRF). Nothing
+# usable (every estimate at or above the source): the last tested CRF
+# is selected (QUALITY_PICK=none) and the source guard
+# of the menu asks.
+#
+# Sets the crf_select globals (CRF_SELECTED CRF_TRIED CRF_EST
+# CRF_OVER_CEILING: 1 when no tested estimate reached the upper edge)
+# and QUALITY_PICK: band | closest | none.
+crf_select_quality() {
+    local min="$1" max="$2" t="$3" lo="$4" hi="$5" src="$6" est="$7"
+    local c e cap below="" best="" bd d any_fit=0
+
+    declare -gA CRF_EST=()
+    CRF_TRIED=()
+    CRF_SELECTED=""
+    CRF_OVER_CEILING=0
+    QUALITY_PICK=""
+
+    cap="$hi"
+    [[ "$src" =~ ^[0-9]+$ ]] && (( src > 0 && src - 1 < cap )) && cap=$((src - 1))
+
+    for ((c = 10#$min; c <= 10#$max; c++)); do
+        CRF_EST_RESULT=""
+        if ! "$est" "$c" || [[ ! "$CRF_EST_RESULT" =~ ^[0-9]+$ ]]; then
+            CRF_SELECTED=""
+            return 1
+        fi
+
+        CRF_TRIED+=("$c")
+        CRF_EST[$c]="$CRF_EST_RESULT"
+        e="$CRF_EST_RESULT"
+        (( e <= cap )) && any_fit=1
+
+        if (( e >= lo && e <= cap )); then
+            CRF_SELECTED="$c"
+            QUALITY_PICK=band
+            return 0
+        fi
+
+        if [[ -n "$below" ]]; then
+            break
+        fi
+        if (( e < lo )); then
+            below="$c"
+        fi
+    done
+
+    (( any_fit == 1 )) || CRF_OVER_CEILING=1
+
+    for c in "${CRF_TRIED[@]}"; do
+        e="${CRF_EST[$c]}"
+        [[ "$src" =~ ^[0-9]+$ ]] && (( src > 0 && e >= src )) && continue
+        d=$(( e > t ? e - t : t - e ))
+        if [[ -z "$best" ]] || (( d < bd )); then
+            best="$c"
+            bd="$d"
+        fi
+    done
+
+    if [[ -n "$best" ]]; then
+        CRF_SELECTED="$best"
+        QUALITY_PICK=closest
+    else
+        CRF_SELECTED="${CRF_TRIED[-1]}"
+        QUALITY_PICK=none
+    fi
     return 0
 }
 

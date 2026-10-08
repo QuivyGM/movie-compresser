@@ -1167,15 +1167,15 @@ emit_failed_item() {
     printf 'fi\n\n'
 }
 
-# emit_encode_item INDEX IN OUT TIER VIDEO FILTER PASSLOG OVERWRITE [EST_VIDEO_BYTES [RETRY]]
+# emit_encode_item INDEX IN OUT TIER VIDEO FILTER PASSLOG OVERWRITE [EST_VIDEO_BYTES [RETRY [QUALITY]]]
 #
 # VIDEO selects the video encode of the main video stream:
-#   crf:N   single-pass libx265 CRF encode (movie / series High, Base,
-#           Custom). No -b:v, no pass logs (PASSLOG is ignored).
+#   crf:N   single-pass libx265 CRF encode (movie Quality, High, Base, Custom;
+#           series High, Base, Custom). No -b:v, no pass logs (PASSLOG is ignored).
 #           EST_VIDEO_BYTES, the pre-encode estimate, is reported against
 #           the actual size afterwards (never a failure).
 #           RETRY "CEILING_BYTES:CRF_MAX:CRF_MIN:HEADROOM_PCT:DOWN_MAX[:batch]"
-#           (High / Base): an attempt whose actual VIDEO bytes are above
+#           (High / Base / Quality): an attempt whose actual VIDEO bytes are above
 #           the ceiling is re-encoded at CRF + 1 up to CRF_MAX; one that
 #           fits at least HEADROOM_PCT below the ceiling tries CRF - 1
 #           (not below CRF_MIN, at most DOWN_MAX times; job_runtime.sh
@@ -1185,10 +1185,16 @@ emit_failed_item() {
 #           The encode commands are a function (item_encode_INDEX) so a
 #           retry can run them again; they carry the planned CRF, which
 #           item_run replaces for a retry attempt.
+#           QUALITY "TARGET_BYTES:MIN_BYTES:MAX_BYTES:STATUS" (movie
+#           Quality): the video target and acceptable band for the
+#           report; STATUS band | source-limited. With "band" the
+#           downward retry runs while the actual video is below
+#           MIN_BYTES (instead of HEADROOM_PCT below the ceiling).
 #   copy    the source video stream is kept unchanged (source-quality
 #           guard: a CRF encode would not be smaller than the source).
 #           FILTER must be empty.
-#   KBPS    two-pass libx265 at KBPS kb/s (movie Quality); PASSLOG is the
+#   KBPS    two-pass libx265 at KBPS kb/s (not used by the menus any more;
+#           movie Quality is a CRF tier); PASSLOG is the
 #           x265 stats file prefix. Pass 1 reads video only (-an -sn -dn).
 #
 # Every other stream is mapped explicitly (see build_stream_map). Every
@@ -1211,8 +1217,10 @@ emit_encode_item() {
     local overwrite="$8"
     local est="${9:-}"
     local retry="${10:-}"
+    local quality="${11:-}"
 
     local mode kbps="" crf="" rceil="" rmax="" rmin="" rdpct="" rdmax="" rbatch=""
+    local qtarget="" qmin="" qmax="" qstatus=""
 
     case "$video" in
         crf:*) mode="crf"; crf="${video#crf:}" ;;
@@ -1225,6 +1233,9 @@ emit_encode_item() {
     [[ "$est" =~ ^[0-9]+$ ]] || est=""
     if [[ "$mode" == "crf" && -n "$retry" ]]; then
         IFS=: read -r rceil rmax rmin rdpct rdmax rbatch <<< "$retry"
+    fi
+    if [[ "$mode" == "crf" && -n "$quality" ]]; then
+        IFS=: read -r qtarget qmin qmax qstatus <<< "$quality"
     fi
 
     local vidx x265 color dv="" stale=""
@@ -1332,6 +1343,10 @@ emit_encode_item() {
         "$( [[ "$dv_policy" == "preserve" ]] && echo 1 || echo 0)")
     [[ "$mode" == "crf" ]] &&
         expect+=$(printf ' ceiling_vbytes=%q crf_min=%q crf_max=%q down_headroom_pct=%q down_max=%q' "$rceil" "$rmin" "$rmax" "$rdpct" "$rdmax")
+    [[ "$mode" == "crf" && -n "$qtarget" ]] &&
+        expect+=$(printf ' qtarget_vbytes=%q qmin_vbytes=%q qmax_vbytes=%q qstatus=%q' "$qtarget" "$qmin" "$qmax" "${qstatus:-band}")
+    [[ "$mode" == "crf" && -n "$qtarget" && "${qstatus:-band}" == band ]] &&
+        expect+=$(printf ' down_below_vbytes=%q' "$qmin")
 
     # CRF-independent preparation (run once, not per CRF attempt)
     [[ "$dv_policy" == "preserve" ]] &&

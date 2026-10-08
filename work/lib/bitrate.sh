@@ -97,6 +97,43 @@ estimate_error_pct() {
     }'
 }
 
+# gib_text GIB  ->  "20.00"
+gib_text() {
+    awk -v g="${1:-0}" 'BEGIN { printf "%.2f", g }'
+}
+
+# gib_distance ACTUAL_BYTES TARGET_BYTES  ->  "+0.40" / "-1.30" (GiB;
+# "N/A" when either is unknown)
+gib_distance() {
+    if [[ ! "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ || ! "${2:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        printf 'N/A'
+        return
+    fi
+
+    awk -v a="$1" -v t="$2" 'BEGIN { printf "%+.2f", (a - t) / 1073741824 }'
+}
+
+# quality_band_class ACTUAL_BYTES MIN_BYTES MAX_BYTES
+#
+# Movie Quality result against its acceptable band:
+#   ACCEPTABLE    MIN..MAX
+#   OUTSIDE BAND  anything else
+# Prints "N/A" when a value is unknown.
+quality_band_class() {
+    local v
+    for v in "${1:-}" "${2:-}" "${3:-}"; do
+        if [[ ! "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            printf 'N/A'
+            return
+        fi
+    done
+
+    awk -v a="$1" -v lo="$2" -v hi="$3" 'BEGIN {
+        if (a < lo || a > hi) printf "OUTSIDE BAND"
+        else                  printf "ACCEPTABLE"
+    }'
+}
+
 # format_hms SECONDS  ->  HH:MM:SS
 format_hms() {
     local sec="${1:-}"

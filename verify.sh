@@ -158,8 +158,8 @@ inspect_file() {
     row "Resolution" "${res:-N/A}"
     row "Video codec" "${codec:-N/A}"
     if [[ "$codec" == hevc* ]]; then
-        # rate control from the x265 settings in the stream (CRF tiers:
-        # single-pass CRF; Quality: two-pass bitrate)
+        # rate control from the x265 settings in the stream (current tiers:
+        # single-pass CRF, every movie and series tier; two-pass: older outputs)
         local rc
         rc=$(x265_rate_control "$file" "$vidx")
         case "$rc" in

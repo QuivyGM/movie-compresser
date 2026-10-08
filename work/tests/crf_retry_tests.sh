@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Post-encode CRF retry tests (High / Base video ceiling; upward and
-# lower-CRF retries, CRF log header).
+# Post-encode CRF retry tests (High / Base video ceiling, movie Quality
+# band; upward and lower-CRF retries, CRF log header).
 #
 #   bash ~/compress/work/tests/crf_retry_tests.sh
 #
@@ -149,13 +149,72 @@ eq    "8 Custom: never retried"                "$(encoded m8)" "1:24 "
 check "8 Custom: no ceiling check output"      "! grep -q 'ceiling' '$T/m8.log' && [[ -f '$T/out/M.mkv' ]]"
 
 declare -A ITEM_EXP=()
-check "9 Quality (two-pass): no CRF retry"    "ITEM_EXP=([mode]=abr [crf]= [ceiling_vbytes]=$(gib 7) [crf_max]=23); ! item_retry_enabled"
+check "9 two-pass (abr) item: no CRF retry"   "ITEM_EXP=([mode]=abr [crf]= [ceiling_vbytes]=$(gib 7) [crf_max]=23); ! item_retry_enabled"
 check "9 Custom: no CRF retry"                 "ITEM_EXP=([mode]=crf [crf]=24 [ceiling_vbytes]= [crf_max]=); ! item_retry_enabled"
 check "9 High: CRF retry"                      "ITEM_EXP=([mode]=crf [crf]=19 [ceiling_vbytes]=$(gib 7) [crf_max]=23); item_retry_enabled"
 
 movie_job m9 High 19 "$HIGH" "[19]='$(gib 7.4) 0' [20]=fail"
 check "retry fails: completed CRF 19 kept"     "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 19 ]] && [[ '$(verified m9)' == '1:19 ' ]] && grep -q 'WARNING: retry at CRF 20 failed' '$T/m9.log'"
 eq    "retry fails: no temp files left"        "$(leftovers)" ""
+
+# ------------------------------------------------------------
+echo
+echo "== movie Quality (band 18-22 GiB around 20 GiB, CRF 0-23)"
+
+# QBAND [CRF_MIN [CRF_MAX [DOWN_MAX]]]  ->  item_expect extras of a Quality item
+qband() {
+    printf 'ceiling_vbytes=%s crf_min=%s crf_max=%s down_headroom_pct=20 down_max=%s qtarget_vbytes=%s qmin_vbytes=%s qmax_vbytes=%s qstatus=band down_below_vbytes=%s' \
+        "$(gib 22)" "${1:-0}" "${2:-23}" "${3:-2}" "$(gib 20)" "$(gib 18)" "$(gib 22)" "$(gib 18)"
+}
+
+movie_job q1 Quality 9 "$(qband)" "[9]='$(gib 21.5) $(gib 4)'"
+eq    "Q1 21.5 GiB (inside band): no retry toward 20" "$(encoded q1)" "1:9 "
+check "Q1 report: CRF, estimate, actual, target, band, difference, result" \
+    "grep -q '^  Quality check:\$' '$T/q1.log' && grep -q '^    Selected CRF:       9\$' '$T/q1.log' && grep -q '^    Estimated video:    6.80 GiB\$' '$T/q1.log' && grep -q '^    Actual video:       21.50 GiB\$' '$T/q1.log' && grep -q '^    Target:             20.00 GiB\$' '$T/q1.log' && grep -q '^    Acceptable band:    18.00-22.00 GiB\$' '$T/q1.log' && grep -q '^    Difference:         +1.50 GiB\$' '$T/q1.log' && grep -q '^    Result:             ACCEPTABLE\$' '$T/q1.log'"
+check "Q1 audio not counted (4 GiB audio, total 25.5)" "grep -q '^CRF 9 actual: 21.50 GiB / 22.00 GiB ceiling\$' '$T/q1.log'"
+
+movie_job q2 Quality 9 "$(qband)" "[9]='$(gib 23) 0' [10]='$(gib 21) 0'"
+eq    "Q2 23 GiB: retried at CRF + 1"          "$(encoded q2)" "1:9 1:10 "
+check "Q2 accepted CRF 10, reported"           "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 10 ]] && [[ '$(verified q2)' == '1:10 ' ]] && grep -q 'Quality | CRF 9 | est 6.80 GiB | actual 23.00 GiB | band max 22.00 | REJECTED -> retry CRF 10' '$T/q2.log'"
+check "Q2 report: estimate at the planned CRF" "grep -q '^    Estimated video:    n/a at CRF 10 (planned CRF 9: 6.80 GiB)\$' '$T/q2.log' && grep -q '^    Result:             ACCEPTABLE\$' '$T/q2.log'"
+
+movie_job q3 Quality 9 "$(qband)" "[9]='$(gib 16) 0' [8]='$(gib 19) 0'"
+eq    "Q3 16 GiB (below band): CRF - 1 tried"  "$(encoded q3)" "1:9 1:8 "
+check "Q3 lower CRF 8 (19 GiB) kept"           "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 8 ]] && [[ '$(verified q3)' == '1:8 ' ]] && grep -q '^Below the acceptable band -> trying CRF 8\$' '$T/q3.log'"
+eq    "Q3 no temp files left"                  "$(leftovers)" ""
+
+movie_job q4 Quality 9 "$(qband)" "[9]='$(gib 17) 0' [8]='$(gib 23) 0'"
+eq    "Q4 lower CRF above 22 GiB"              "$(encoded q4)" "1:9 1:8 "
+check "Q4 previous accepted encode kept aside, then kept" \
+    "grep -q '^1:8:M.mkv.accepted-crf9.part\$' '$T/q4.seen' && [[ \$(awk '{print \$3}' '$T/out/M.mkv') == 9 ]] && [[ '$(verified q4)' == '1:9 ' ]] && grep -q '^Result: over ceiling -> keeping CRF 9\$' '$T/q4.log'"
+check "Q4 report: OUTSIDE BAND (17 GiB)"       "grep -q '^    Result:             OUTSIDE BAND\$' '$T/q4.log'"
+eq    "Q4 no temp files left"                  "$(leftovers)" ""
+
+movie_job q5 Quality 9 "$(qband)" "[9]='$(gib 17) 0' [8]=fail"
+check "Q5 failed lower-CRF trial: CRF 9 output preserved" \
+    "[[ '$(encoded q5)' == '1:9 1:8 ' ]] && [[ \$(awk '{print \$3}' '$T/out/M.mkv') == 9 ]] && [[ '$(verified q5)' == '1:9 ' ]] && grep -q 'Result: CRF 8 failed' '$T/q5.log'"
+eq    "Q5 no temp files left"                  "$(leftovers)" ""
+
+movie_job q6 Quality 9 "$(qband 9)" "[9]='$(gib 10) 0'"
+eq    "Q6 never below CRF_MIN"                 "$(encoded q6)" "1:9 "
+check "Q6 CRF_MIN message"                     "grep -q '^Below the acceptable band, but CRF 9 is the Quality minimum\$' '$T/q6.log'"
+
+movie_job q7 Quality 9 "$(qband 0 10)" "[9]='$(gib 30) 0' [10]='$(gib 29) 0' [11]='$(gib 21) 0'"
+eq    "Q7 never above CRF_MAX"                 "$(encoded q7)" "1:9 1:10 "
+check "Q7 CRF_MAX kept with a warning"         "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 10 ]] && grep -q '^Result: over ceiling; CRF 10 is the Quality limit\$' '$T/q7.log'"
+
+movie_job q8 Quality 9 "$(qband)" "[9]='$(gib 12) 0' [8]='$(gib 14) 0' [7]='$(gib 16) 0' [6]='$(gib 19) 0'"
+eq    "Q8 lower CRFs limited by CRF_DOWN_RETRY_MAX (2)" "$(encoded q8)" "1:9 1:8 1:7 "
+check "Q8 CRF 7 kept"                          "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 7 ]]"
+
+movie_job q9 Quality 9 "$(qband)" "[9]='$(gib 18) 0'"
+eq    "Q9 exactly 18 GiB: inside band, no retry" "$(encoded q9)" "1:9 "
+
+movie_job q10 Quality 9 "$(qband)" "[9]='$(gib 23) 0' [10]='$(gib 17) 0'"
+eq    "Q10 up then below band: no CRF already over the band retried" "$(encoded q10)" "1:9 1:10 "
+check "Q10 CRF 10 kept"                        "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 10 ]]"
+
+check "Quality: CRF retry enabled"             "ITEM_EXP=([mode]=crf [crf]=9 [ceiling_vbytes]=$(gib 22) [crf_max]=23); item_retry_enabled"
 
 # ------------------------------------------------------------
 echo
@@ -432,12 +491,14 @@ else
     check "real series: both verified at CRF 19" "[[ \$(grep -cE 'AS PLANNED .*CRF 19(\\.0)? \\(single pass\\)' '$T/r2.log') == 2 ]] && [[ -f '$R/out/E01.mkv' && -f '$R/out/E02.mkv' ]] && grep -q 'retrying season at CRF 19' '$T/r2.log'"
     check "real series: no temp files"          "[[ -z \$(find '$R/out' -name '*.part') ]]"
 
-    # Quality (two-pass) and Custom: no retry in the generated job
+    # Quality: single-pass CRF with the band retry; Custom: no retry
     { emit_job_header r3 movie 2
-      emit_encode_item 1 "$R/in/E01.mkv" "$R/out/Q.mkv" Quality 800 "" "$W/p" 0 ""
+      emit_encode_item 1 "$R/in/E01.mkv" "$R/out/Q.mkv" Quality crf:9 "" "" 0 1000 \
+          "$(gib 22):23:0:20:2" "$(gib 20):$(gib 18):$(gib 22):band"
       emit_encode_item 2 "$R/in/E01.mkv" "$R/out/C.mkv" Custom crf:24 "" "" 0 1000 ""
       emit_job_footer; } > "$W/r3.sh"
-    check "generated: Quality has no CRF retry" "! sed -n '/item 1/,/item 2/p' '$W/r3.sh' | grep -q 'item_crf_encode\\|ceiling_vbytes'"
+    check "generated: Quality is CRF with the band retry" \
+        "sed -n '/item 1/,/item 2/p' '$W/r3.sh' | grep -q 'item_crf_encode item_encode_1' && grep -q 'mode=crf crf=9 .*ceiling_vbytes=$(gib 22) crf_min=0 crf_max=23 .*down_below_vbytes=$(gib 18)' '$W/r3.sh' && ! grep -qE 'pass=1|pass=2|-b:v' '$W/r3.sh'"
     check "generated: Custom has no ceiling"    "grep -qF \"ceiling_vbytes='' crf_min='' crf_max=''\" '$W/r3.sh'"
 fi
 

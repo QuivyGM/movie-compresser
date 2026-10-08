@@ -7,25 +7,28 @@
 # continues with the next item.
 #
 # Video encode modes (item_expect mode=): crf (single-pass x265 CRF,
-# movie / series High, Base, Custom), abr (two-pass bitrate, movie
-# Quality), copy (source video kept). After a CRF encode the actual
+# movie Quality / High / Base / Custom, series High / Base / Custom),
+# abr (two-pass bitrate; no menu uses it any more), copy (source video
+# kept). After a CRF encode the actual
 # video size is reported against the pre-encode estimate and the pair
 # is appended to work/logs/crf_estimates.tsv.
 #
-# High / Base CRF encodes (item_expect ceiling_vbytes= crf_max=) are
+# High / Base / movie Quality CRF encodes (item_expect ceiling_vbytes=
+# crf_max=) are
 # checked against the tier's VIDEO ceiling after encoding: the actual
 # main video bytes (packet scan; audio, subtitles and container are not
 # counted) above the ceiling reject the attempt and the encode is
 # repeated at CRF + 1, up to crf_max (item_crf_encode). A result that
 # fits with at least down_headroom_pct to spare tries CRF - 1 (down to
 # crf_min, at most down_max times); a lower attempt above the ceiling is
-# discarded and the fitting one kept. Series
+# discarded and the fitting one kept. Movie Quality uses the upper edge
+# of its acceptable band as the ceiling and tries CRF - 1 only while the
+# actual video is below the band (down_below_vbytes). Series
 # batches (job_crf_batch) keep one CRF for every episode: the MEDIAN
 # episode's actual video decides, and the whole season is re-encoded.
 # Retries write "<output>.retry-crf<N>.part"; a completed earlier
 # attempt is only deleted once a later one has completed, and is kept
-# (not deleted) when the job is interrupted. Custom CRF and Quality
-# never retry.
+# (not deleted) when the job is interrupted. Custom CRF never retries.
 #
 # Outputs are written to "<output>.part" and only renamed to the final
 # name after ffmpeg succeeded and the result passed a duration check, so
@@ -687,6 +690,12 @@ report_output_stats() {
         fi
     fi
 
+    if [[ "${ITEM_EXP[mode]:-}" == "crf" && -n "${ITEM_EXP[qtarget_vbytes]:-}" ]]; then
+        quality_report_lines "$vbytes"
+    elif [[ "${ITEM_EXP[mode]:-}" == "copy" && "${ITEM_TIER:-}" == "Quality" ]]; then
+        echo "  Quality result:       SOURCE-PREFERRED (source video kept)"
+    fi
+
     if (( ${#ITEM_ATTEMPT_ROWS[@]} )); then
         echo "  CRF attempts:"
         item_attempt_lines | sed 's/^/    /'
@@ -705,6 +714,40 @@ report_output_stats() {
 
     if [[ -n "${ITEM_EXP[atrans]+x}" && -z "${ITEM_EXP[atrans]}" ]]; then
         echo "  Audio:                copied unchanged"
+    fi
+}
+
+# quality_report_lines ACTUAL_VIDEO_BYTES  ->  movie Quality: selected
+# CRF, estimated and actual video size against the target and the
+# acceptable band (the post-encode retry has already run). Source-limited
+# items (source video at or below the target) are compared with the
+# source video size; the band does not apply to them.
+quality_report_lines() {
+    local act="$1" t="${ITEM_EXP[qtarget_vbytes]}" lo="${ITEM_EXP[qmin_vbytes]:-}" hi="${ITEM_EXP[qmax_vbytes]:-}"
+    local crf="${ITEM_EXP[crf]:-?}" planned="${ITEM_EXP[crf_planned]:-${ITEM_EXP[crf]:-}}" est="${ITEM_EXP[est_vbytes]:-}" e
+
+    if [[ -z "$est" ]]; then
+        e="n/a"
+    elif [[ "$crf" == "$planned" ]]; then
+        e="$(bytes_to_gib "$est") GiB"
+    else
+        e="n/a at CRF $crf (planned CRF $planned: $(bytes_to_gib "$est") GiB)"
+    fi
+
+    echo "  Quality check:"
+    echo "    Selected CRF:       $crf"
+    echo "    Estimated video:    $e"
+    echo "    Actual video:       $(bytes_to_gib "$act") GiB"
+    if [[ "${ITEM_EXP[qstatus]:-band}" == "source-limited" ]]; then
+        echo "    Target:             below the source video ($(bytes_to_gib "$t") GiB)"
+        echo "    Acceptable band:    not applied (source video at or below the Quality target)"
+        echo "    Difference:         $(gib_distance "$act" "$t") GiB (vs source video)"
+        echo "    Result:             SOURCE-LIMITED"
+    else
+        echo "    Target:             $(bytes_to_gib "$t") GiB"
+        echo "    Acceptable band:    $(bytes_to_gib "$lo")-$(bytes_to_gib "$hi") GiB"
+        echo "    Difference:         $(gib_distance "$act" "$t") GiB"
+        echo "    Result:             $(quality_band_class "$act" "$lo" "$hi")"
     fi
 }
 
@@ -789,7 +832,7 @@ record_crf_estimate() {
 # ------------------------------------------------------------
 
 # item_retry_enabled  ->  0 for a CRF item with a video ceiling and a
-# tier CRF_MAX (Custom / Quality / copy items have none)
+# tier CRF_MAX (Custom / copy items have none)
 item_retry_enabled() {
     [[ "${ITEM_EXP[mode]:-}" == crf &&
        "${ITEM_EXP[ceiling_vbytes]:-}" =~ ^[0-9]+$ && "${ITEM_EXP[crf_max]:-}" =~ ^[0-9]+$ &&
@@ -823,9 +866,11 @@ _gib() { awk -v b="${1:-0}" 'BEGIN { printf "%.2f", b / 1073741824 }'; }
 #   ->  "High | CRF 19 | est 6.80 GiB | actual 7.40 GiB | ceiling 7.00 | REJECTED -> retry CRF 20"
 attempt_line() {
     local est="n/a"
+    local label="ceiling"
+    [[ -n "${ITEM_EXP[qtarget_vbytes]:-}" ]] && label="band max"
     [[ -n "$3" ]] && est="$(_gib "$3") GiB"
-    printf '%s | CRF %s | est %s | actual %s GiB | ceiling %s | %s%s' \
-        "$1" "$2" "$est" "$(_gib "$4")" "$(_gib "$5")" "$6" "${7:+ -> $7}"
+    printf '%s | CRF %s | est %s | actual %s GiB | %s %s | %s%s' \
+        "$1" "$2" "$est" "$(_gib "$4")" "$label" "$(_gib "$5")" "$6" "${7:+ -> $7}"
 }
 
 # item_attempt_note CRF ACTUAL RESULT [REASON]  ->  one attempt of the
@@ -931,7 +976,7 @@ _drop_attempt() {
 item_crf_encode() {
     local fn="$1"
     local planned="${ITEM_EXP[crf]:-}" ceil max min c act prev="" prev_crf="" ok
-    local thr down_max downs=0 nc a2 acc
+    local thr down_max downs=0 nc a2 acc why="Headroom large"
     local -A over=()
 
     ITEM_EXP[crf_planned]="$planned"
@@ -949,6 +994,12 @@ item_crf_encode() {
     down_max="${ITEM_EXP[down_max]:-0}"
     [[ "$down_max" =~ ^[0-9]+$ ]] || down_max=0
     thr=$(_down_threshold "$ceil" "${ITEM_EXP[down_headroom_pct]:-}")
+    # movie Quality: lower CRF only while the actual video is below the
+    # acceptable band (inside the band nothing is re-encoded)
+    if [[ "${ITEM_EXP[down_below_vbytes]:-}" =~ ^[0-9]+$ ]]; then
+        thr=$(( ITEM_EXP[down_below_vbytes] - 1 ))
+        why="Below the acceptable band"
+    fi
     c="$planned"
 
     # ---- phase 1: up until an attempt fits
@@ -1018,24 +1069,24 @@ item_crf_encode() {
     while [[ -n "$thr" ]] && (( act <= thr )); do
         nc=$((c - 1))
         if (( c <= min )); then
-            echo "Headroom large, but CRF $min is the $ITEM_TIER minimum"
+            echo "$why, but CRF $min is the $ITEM_TIER minimum"
             break
         fi
         if (( downs >= down_max )); then
-            (( down_max > 0 )) && echo "Headroom large, but the lower-CRF retry limit ($down_max) is reached"
+            (( down_max > 0 )) && echo "$why, but the lower-CRF retry limit ($down_max) is reached"
             break
         fi
         [[ -n "${over[$nc]:-}" ]] && break
 
         if ! _keep_accepted "$ITEM_PART" "$ITEM_OUTPUT" "$c"; then
             ITEM_PART="$KEPT_PART"
-            echo "Headroom large, but the CRF $c encode cannot be set aside safely; keeping it"
+            echo "$why, but the CRF $c encode cannot be set aside safely; keeping it"
             break
         fi
         acc="$KEPT_PART"
         ITEM_PART="$acc"
 
-        echo "Headroom large -> trying CRF $nc"
+        echo "$why -> trying CRF $nc"
         ((downs += 1))
         ITEM_EXP[crf]="$nc"
         ITEM_CRF_RUN="$nc"

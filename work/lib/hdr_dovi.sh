@@ -8,7 +8,7 @@
 #      with mode 2); L5 active-area offsets rescaled when the video is
 #      downscaled
 #   2. x265 encodes the base layer exactly like a non-DV encode (single
-#      pass CRF, or two-pass for Quality); the final encode writes raw
+#      pass CRF, or two-pass for a bitrate item); the final encode writes raw
 #      HEVC; ffmpeg's own RPU writing is off
 #   3. dovi_tool inject-rpu puts the RPU back (frame counts must match)
 #   4. mkvmerge wraps the HEVC with the source frame timestamps and

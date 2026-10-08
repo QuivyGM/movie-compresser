@@ -80,7 +80,7 @@ script_inputs() {
 }
 
 # step_text PASS [MODE] [CRF]  ->  what the item is doing:
-#   "Pass: 1/2" / "Pass: 2/2"      two-pass encode (Quality)
+#   "Pass: 1/2" / "Pass: 2/2"      two-pass encode (older bitrate jobs)
 #   "Encoding, CRF: 21"            single-pass CRF encode (no passes)
 #   "Step: mux" / "Step: verify"   other steps
 step_text() {
