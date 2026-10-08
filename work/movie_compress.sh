@@ -25,7 +25,7 @@ declare -a DV_POLICIES=() DV_MODES=() HDR10P_POLICIES=() QUALITY_SPECS=() CRF_ES
 
 # Compression policy: ~/compress/work/lib/compress.conf (loaded and validated
 # by work/lib/policy.sh). The policy math lives there as well
-# (crf_select_quality for Quality, crf_select for High / Base); the
+# (crf_select_quality for Quality, crf_select_boundary for High / Base); the
 # sample encodes behind the CRF estimates are in encode_common.sh.
 # Audio is always copied unchanged; audio compression is only done by
 # audio_compress_menu.sh.
@@ -363,13 +363,15 @@ while true; do
     else
 
         # ====================================================
-        # CRF TIERS: High / Base choose the lowest CRF of the tier whose
-        # sampled video estimate fits the ceiling (crf_select: +1 / +2
-        # steps, the CRF just below the chosen one always estimated above
-        # the ceiling); Quality the lowest CRF whose estimate is inside the
-        # acceptable band, searched from CRF_START in both directions (upward
-        # with the same search), else the one closest to the target
-        # (crf_select_quality);
+        # CRF TIERS: High / Base choose the lowest CRF of CRF_MIN..CRF_MAX
+        # whose sampled video estimate fits the ceiling, searched from
+        # CRF_START (crf_select_boundary: upward with +1 / +2 steps when
+        # CRF_START is too large, else downward one CRF at a time; the CRF
+        # just below the chosen one always estimated above the ceiling,
+        # unless the chosen one is CRF_MIN); Quality the lowest CRF whose
+        # estimate is inside the acceptable band, searched from CRF_START
+        # with the same boundary search, else the one closest to the
+        # target (crf_select_quality);
         # Custom uses the entered CRF. Audio is not part of the decision.
         # ====================================================
 
@@ -415,7 +417,7 @@ while true; do
                 "$CRF_CEILING_BYTES" 0 "$CRF_CEILING_BYTES" \
                 "$SOURCE_VIDEO_BYTES" crf_title_estimate crf_title_step_report || CRF_SELECTED=""
         else
-            crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_title_estimate \
+            crf_select_boundary "$CRF_START" "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_title_estimate \
                 crf_title_step_report || CRF_SELECTED=""
         fi
 
@@ -435,7 +437,9 @@ while true; do
         # the ceiling, at CRF - 1 when it fits with CRF_DOWN_RETRY_HEADROOM_PCT
         # to spare and CRF - 1 is predicted to stay CRF_DOWN_RETRY_FIT_MARGIN_PCT
         # below the ceiling (actual x the sampled CRF - 1 / CRF ratio,
-        # CRF_EST_MAPS) (up to CRF_DOWN_RETRY_MAX times, not below CRF_MIN)
+        # CRF_EST_MAPS) (up to CRF_DOWN_RETRY_MAX times, not below CRF_MIN:
+        # the tier's search floor, not CRF_START, so a CRF chosen below
+        # CRF_START is not held to CRF_START)
         # (job_runtime.sh item_crf_encode). Not for Custom, and
         # not when CRF_MAX above the ceiling was already accepted below.
         # Quality: the same retry with the band's upper edge (never at or

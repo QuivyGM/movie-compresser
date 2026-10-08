@@ -49,7 +49,7 @@ conf_with() {
 }
 
 # fixed tier values, independent of the project's current numbers
-COMPRESS_CONF=$(conf_with base SERIES_HIGH_CRF_MIN=18 SERIES_HIGH_CRF_MAX=21 SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=5 \
+COMPRESS_CONF=$(conf_with base SERIES_HIGH_CRF_SEARCH_MIN=18 SERIES_HIGH_CRF_START=18 SERIES_HIGH_CRF_MAX=21 SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=5 \
     SERIES_CRF_OUTLIER_PCT=25 SERIES_CRF_DOWN_RETRY_MAX=1 CRF_DOWN_RETRY_FIT_MARGIN_PCT=5 SERIES_CRF_SAMPLE_EPISODES=4)
 export COMPRESS_CONF
 load_policy > /dev/null
@@ -378,7 +378,7 @@ check "noisy E03 is an outlier at CRF 10, still larger at 12" "(( n10 * 4 > s10 
 
 # ceiling between E03 at CRF 11 and 12: regulars fit at 10, E03 -> 12
 ceil=$(awk -v a="$n11" -v b="$n12" 'BEGIN { printf "%.12f", (a + b) / 2 / 1073741824 }')
-C1=$(conf_with m1 SERIES_HIGH_CRF_MIN=10 SERIES_HIGH_CRF_MAX=14 "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")
+C1=$(conf_with m1 SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=14 "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")
 L="$T/m1.log"
 menu "1\n2\ny\n" "$L" "$C1"
 sed -n '/^Estimating/,$p' "$L" | sed 's/^/  | /'
@@ -405,7 +405,7 @@ check "verbose: table and season totals"    "grep -qE '^  Show.S01E03.mkv +0:02 
 
 # CRF_MAX 11: E03 still above at 11 -> warning, skip this episode
 rm -f "$H/compress/work"/series[0-9]*.sh; rm -rf "$H/compress/out/Show"
-C2=$(conf_with m2 SERIES_HIGH_CRF_MIN=10 SERIES_HIGH_CRF_MAX=11 "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")
+C2=$(conf_with m2 SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=11 "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")
 L="$T/m2.log"
 menu "1\n2\n2\ny\n" "$L" "$C2"
 sed -n '/^------/,/^Select/p' "$L" | sed 's/^/  | /'
@@ -463,7 +463,7 @@ e2_src=$(vbytes "$G2/Guard.S01E02.mkv")
 e2_own=$(est "$G2/Guard.S01E02.mkv" 10)
 check "setup: own estimate < E02 source < conservative estimate" "(( e2_own < e2_src && e2_src < n_fill ))"
 
-GC=$(conf_with guard SERIES_HIGH_CRF_MIN=10 SERIES_HIGH_CRF_MAX=14 SERIES_CRF_SAMPLE_EPISODES=2)
+GC=$(conf_with guard SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=14 SERIES_CRF_SAMPLE_EPISODES=2)
 gmenu() {   # INPUT LOG
     printf "$1" | HOME="$H2" PATH="$T/stub:$PATH" COMPRESS_CONF="$GC" \
         bash "$H2/compress/work/series_compress.sh" > "$2" 2>&1
@@ -520,7 +520,7 @@ check "setup: E02 source <= guess, own CRF 12 sample > 1.6 x guess" "(( e2_src <
 
 # ceiling between E02's own CRF 11 and 12 estimates -> E02 alone to 12
 ceil=$(awk -v a="$r11" -v b="$r12" 'BEGIN { printf "%.12f", (a + b) / 2 / 1073741824 }')
-LC=$(conf_with late SERIES_HIGH_CRF_MIN=10 SERIES_HIGH_CRF_MAX=14 SERIES_CRF_SAMPLE_EPISODES=2 "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")
+LC=$(conf_with late SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=14 SERIES_CRF_SAMPLE_EPISODES=2 "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")
 lmenu() {   # INPUT LOG CONF
     printf "$1" | HOME="$H3" PATH="$T/stub:$PATH" COMPRESS_CONF="$3" \
         bash "$H3/compress/work/series_compress.sh" > "$2" 2>&1
@@ -543,7 +543,7 @@ check "job: E02 at 12 (retry floor = season CRF), the others at 10" \
 # CRF_MAX 11: E02 still above at 11 -> the per-episode prompt; skip it
 rm -f "$H3/compress/work"/series[0-9]*.sh; rm -rf "$H3/compress/out/Late"
 L="$T/l2.log"
-lmenu "1\n2\n2\nn\n" "$L" "$(conf_with late2 SERIES_HIGH_CRF_MIN=10 SERIES_HIGH_CRF_MAX=11 SERIES_CRF_SAMPLE_EPISODES=2 "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")"
+lmenu "1\n2\n2\nn\n" "$L" "$(conf_with late2 SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=11 SERIES_CRF_SAMPLE_EPISODES=2 "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")"
 sed -n '/^Ceiling check/,/^Expected sizes/p' "$L" | sed 's/^/  | /'
 check "CRF_MAX reached: the per-episode over-ceiling prompt" \
     "grep -q 'WARNING: S01E02 cannot meet the .* GiB per-episode video ceiling' '$L' && grep -q 'even CRF 11 (the lowest quality High' '$L' && grep -q '^2) Skip this episode\$' '$L'"

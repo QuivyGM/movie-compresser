@@ -22,9 +22,11 @@ source "$WORK_DIR/lib/naming.sh"
 # crf_series_estimate / crf_episode_estimate)
 #
 # Base / High: x265 CRF, ONE season CRF for every regular episode: the
-#              lowest CRF of SERIES_*_CRF_MIN..MAX at which every
+#              lowest CRF of SERIES_*_CRF_SEARCH_MIN..MAX at which every
 #              regular episode's video estimate fits the per-episode
-#              SERIES_*_VIDEO_SIZE_CEILING_GIB. An isolated outlier (the
+#              SERIES_*_VIDEO_SIZE_CEILING_GIB, searched from
+#              SERIES_*_CRF_START up or down (the adjacent boundary:
+#              CRF N too large, N + 1 fits). An isolated outlier (the
 #              only episode above median + SERIES_CRF_OUTLIER_PCT) does
 #              not set it; it gets its own higher CRF when it does not
 #              fit at the season CRF. Two or more large episodes raise
@@ -476,12 +478,18 @@ fi
 # series_batch_stats, series_episode_crf; encode_common.sh:
 # crf_series_estimate, crf_episode_estimate)
 #
-# One season CRF for every regular episode: the first CRF (from CRF_MIN
-# up) at which every regular episode's estimate fits the per-episode
-# ceiling (bracket-and-refine search: +1 / +2 steps, a skipped CRF is
-# sampled unless the own samples of sampled episodes at the next CRF
-# prove it cannot fit, series_crf_certify_over, and the CRF just below
-# the season CRF is always sampled above the ceiling). An isolated
+# One season CRF for every regular episode: the lowest CRF of
+# CRF_MIN..CRF_MAX at which every regular episode's estimate fits the
+# per-episode ceiling, searched from CRF_START (crf_select_boundary).
+# CRF_START too large: upward (bracket-and-refine: +1 / +2 steps, a
+# skipped CRF is sampled unless the own samples of sampled episodes at
+# the next CRF prove it cannot fit, series_crf_certify_over); CRF_START
+# fits: downward one CRF at a time until the CRF below is too large or
+# CRF_MIN is reached. The CRF just below the season CRF is always
+# sampled above the ceiling (unless the season CRF is CRF_MIN). An
+# episode that was not sampled never makes a CRF too large on its
+# estimate alone: when it decides, it is sampled itself at that CRF
+# first (crf_series_estimate, series_decisive_inferred). An isolated
 # outlier (the only episode above median + SERIES_CRF_OUTLIER_PCT) does
 # not decide it; it gets its own CRF from
 # the season CRF up, sampled itself, if it does not fit at the season
@@ -497,17 +505,19 @@ declare -A CRF_SERIES_EP_BYTES=() CRF_SERIES_EP_FROM=() CRF_SERIES_RATES=() CRF_
 # in compact output the figures of this CRF right below its samples;
 # its result line comes from crf_series_step_report)
 crf_series_estimate_shown() {
-    local c="$1" eb
+    local c="$1" eb ef
 
     crf_series_estimate "$c" || return 1
     ui_verbose && return 0
 
     read -ra eb <<< "${CRF_SERIES_EP_BYTES[$c]}"
+    read -ra ef <<< "${CRF_SERIES_EP_FROM[$c]}"
     series_batch_stats "$CRF_CEILING_BYTES" "${eb[@]}" || return 0
 
     echo
     printf '%-10s%s GiB\n' "Median:" "$(bytes_to_gib "$SB_MEDIAN")"
-    printf '%-10s%s GiB\n' "Largest:" "$(bytes_to_gib "$SB_DECIDE")"
+    printf '%-10s%s GiB (%s, %s)\n' "Largest:" "$(bytes_to_gib "$SB_DECIDE")" \
+        "${EP_LABEL[$SB_DECIDE_IDX]}" "$(series_from_text "${ef[SB_DECIDE_IDX]}")"
     if (( CRF_CEILING_BYTES > 0 )); then
         if [[ -n "$SB_ISOLATED" ]]; then
             printf '%-10s%s ~%s GiB (above median +%s%%; does not set the season CRF)\n' "Outlier:" \
@@ -520,11 +530,12 @@ crf_series_estimate_shown() {
     fi
 }
 
-# crf_series_step_report KIND CRF [ARG]  (REPORT for crf_select:
-# policy.sh crf_search_up)  ->  compact: the result of each season CRF
-# right below its figures ("too large -> jumping to CRF 14", "fits ->
-# checking CRF 13"), then the verified boundary and "Selected: CRF 14";
-# verbose: only the steps that skip a CRF or check a skipped one
+# crf_series_step_report KIND CRF [ARG]  (REPORT for crf_select_boundary:
+# policy.sh crf_search_boundary / crf_search_up)  ->  compact: the result
+# of each season CRF right below its figures ("too large -> jumping to
+# CRF 14", "fits -> checking CRF 13", "fits -> trying CRF 9"), then the
+# verified boundary and "Selected: CRF 14"; verbose: only the steps that
+# skip a CRF, check a skipped one or go below CRF_START
 crf_series_step_report() {
     if ui_verbose; then
         crf_title_step_report "$@"
@@ -538,6 +549,10 @@ crf_series_step_report() {
             echo
             crf_boundary_lines "$2" "$3"
             printf '%-10s%s\n' "Selected:" "$(ui_bold "CRF $3")"
+            ;;
+        floor)
+            printf '%-10s%s\n' "Result:" "$(crf_step_result "$@")"
+            printf '%-10s%s\n' "Selected:" "$(ui_bold "CRF $2")"
             ;;
         *)
             printf '%-10s%s\n' "Result:" "$(crf_step_result "$@")"
@@ -562,7 +577,7 @@ if [[ "$TIER" == "Custom" ]]; then
         CRF_SELECTED=""
     fi
 else
-    crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate_shown \
+    crf_select_boundary "$CRF_START" "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate_shown \
         crf_series_step_report series_crf_certify_over || CRF_SELECTED=""
 fi
 
@@ -746,13 +761,13 @@ if (( ${#ABOVE[@]} )); then
             printf "  %-40.40s ~%s GiB video, +%s GiB (%s)%s\n" "$(basename "${FILES[$i]}")" \
                 "$(bytes_to_gib "${EP_EST[$i]}")" \
                 "$(crf_oversize_gib "${EP_EST[$i]}" "$CRF_CEILING_BYTES")" \
-                "$( [[ "${EP_FROM[$i]}" == sample ]] && echo "sampled" || echo "highest sampled bitrate")" \
+                "$(series_from_text "${EP_FROM[$i]}")" \
                 "$( (( EP_CEIL_SKIP[$i] == 1 )) && echo "; skipped")"
         else
             printf "  %-*s  ~%s GiB video, +%s GiB (%s)%s\n" "$LABEL_W" "${EP_LABEL[$i]}" \
                 "$(bytes_to_gib "${EP_EST[$i]}")" \
                 "$(crf_oversize_gib "${EP_EST[$i]}" "$CRF_CEILING_BYTES")" \
-                "$( [[ "${EP_FROM[$i]}" == sample ]] && echo "sampled" || echo "highest sampled bitrate")" \
+                "$(series_from_text "${EP_FROM[$i]}")" \
                 "$( (( EP_CEIL_SKIP[$i] == 1 )) && echo "; skipped")"
         fi
     done
@@ -941,7 +956,11 @@ if ui_verbose; then
         elif [[ "${EP_VIDEO[$i]}" == "copy" ]]; then
             ccol="copy"; ecol="source"; status="SOURCE VIDEO KEPT"
         else
-            [[ "${EP_FROM[$i]}" == "sample" ]] && ecol="sampled" || ecol="highest"
+            case "${EP_FROM[$i]}" in
+                sample)   ecol="sampled" ;;
+                promoted) ecol="promoted" ;;
+                *)        ecol="highest" ;;
+            esac
             if [[ -n "${IS_ABOVE[$i]:-}" ]]; then
                 status="ABOVE CEILING"
             elif [[ "${EP_CRF[$i]}" != "$CRF" && -n "${IS_LATE[$i]:-}" ]]; then
@@ -963,7 +982,8 @@ if ui_verbose; then
     echo "   audio = actual size of all copied source audio tracks;"
     echo "   total = video + audio + ~${SERIES_CONTAINER_RESERVE_PCT}% container/subtitles)"
     echo "  sampled = this episode was sample-encoded"
-    echo "  highest = not sampled; highest sampled video bitrate x its runtime"
+    echo "  highest = not sampled (inferred); highest sampled video bitrate x its runtime"
+    echo "  promoted = not in the sample set; sampled itself because it decided the season CRF"
     if [[ "$TIER" != "Custom" ]]; then
         echo "  OUTLIER: OWN CRF = isolated outlier, above the ceiling at the season CRF ${CRF}"
         (( ${#LATE[@]} )) &&
@@ -1231,7 +1251,10 @@ JOB_FILE="$WORK_DIR/${SESSION}.sh"
 # CRF_DOWN_RETRY_HEADROOM_PCT to spare and CRF - 1 predicted to fit
 # (CRF_DOWN_RETRY_FIT_MARGIN_PCT, from its estimates per CRF) that
 # episode alone tries CRF - 1, at most SERIES_CRF_DOWN_RETRY_MAX times,
-# never below CRF_MIN (an isolated outlier: never below the season CRF).
+# never below CRF_MIN, the tier's search floor (SERIES_*_CRF_SEARCH_MIN,
+# not CRF_START: a season CRF chosen below CRF_START keeps that room); an
+# isolated outlier or an own CRF from the late ceiling check: never below
+# the season CRF.
 # Not for Custom, and not for an episode whose estimate at CRF_MAX
 # above the ceiling was already accepted.
 # ep_retry_spec INDEX  ->  RETRY of emit_encode_item ("" = none)

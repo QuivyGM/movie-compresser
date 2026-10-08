@@ -29,9 +29,20 @@ POLICY_KEYS_POSITIVE=(
 CRF_LIMIT=51
 POLICY_KEYS_CRF=(
     MOVIE_QUALITY_CRF_MIN MOVIE_QUALITY_CRF_START MOVIE_QUALITY_CRF_MAX
-    MOVIE_HIGH_CRF_MIN MOVIE_HIGH_CRF_MAX MOVIE_BASE_CRF_MIN MOVIE_BASE_CRF_MAX
-    SERIES_HIGH_CRF_MIN SERIES_HIGH_CRF_MAX SERIES_BASE_CRF_MIN SERIES_BASE_CRF_MAX
+    MOVIE_HIGH_CRF_SEARCH_MIN MOVIE_HIGH_CRF_START MOVIE_HIGH_CRF_MAX
+    MOVIE_BASE_CRF_SEARCH_MIN MOVIE_BASE_CRF_START MOVIE_BASE_CRF_MAX
+    SERIES_HIGH_CRF_SEARCH_MIN SERIES_HIGH_CRF_START SERIES_HIGH_CRF_MAX
+    SERIES_BASE_CRF_SEARCH_MIN SERIES_BASE_CRF_START SERIES_BASE_CRF_MAX
 )
+
+# High / Base tiers (*_CRF_START / *_CRF_SEARCH_MIN / *_CRF_MAX)
+POLICY_CRF_TIERS=(MOVIE_HIGH MOVIE_BASE SERIES_HIGH SERIES_BASE)
+
+# Former High / Base *_CRF_MIN: search start and hard floor in one. A
+# config that sets only it keeps the former behaviour (START = SEARCH_MIN
+# = it, no search below it) with a note; set together with the new keys
+# it is an error (_policy_legacy_crf_min).
+POLICY_KEYS_LEGACY_CRF_MIN=(MOVIE_HIGH_CRF_MIN MOVIE_BASE_CRF_MIN SERIES_HIGH_CRF_MIN SERIES_BASE_CRF_MIN)
 
 # whole numbers >= 1
 POLICY_KEYS_COUNT=(
@@ -126,10 +137,24 @@ validate_policy() {
     done
 
     # CRF_MIN (highest quality of the tier) <= CRF_MAX (lowest quality)
-    for f in MOVIE_QUALITY MOVIE_HIGH MOVIE_BASE SERIES_HIGH SERIES_BASE; do
+    for f in MOVIE_QUALITY; do
         local lo="${f}_CRF_MIN" hi="${f}_CRF_MAX"
         if [[ "${!lo:-}" =~ ^[0-9]+$ && "${!hi:-}" =~ ^[0-9]+$ ]] && (( 10#${!hi} < 10#${!lo} )); then
             errs+=("$hi (${!hi}) is lower than $lo (${!lo})")
+        fi
+    done
+
+    # High / Base: CRF_SEARCH_MIN <= CRF_START <= CRF_MAX
+    for k in ${POLICY_LEGACY_CONFLICT[@]+"${POLICY_LEGACY_CONFLICT[@]}"}; do
+        errs+=("$k is replaced by ${k%_MIN}_START and ${k%_MIN}_SEARCH_MIN (set both, remove $k)")
+    done
+    for f in "${POLICY_CRF_TIERS[@]}"; do
+        local sm="${f}_CRF_SEARCH_MIN" st="${f}_CRF_START" mx="${f}_CRF_MAX"
+        if [[ "${!sm:-}" =~ ^[0-9]+$ && "${!st:-}" =~ ^[0-9]+$ ]] && (( 10#${!st} < 10#${!sm} )); then
+            errs+=("$st (${!st}) is lower than $sm (${!sm})")
+        fi
+        if [[ "${!st:-}" =~ ^[0-9]+$ && "${!mx:-}" =~ ^[0-9]+$ ]] && (( 10#${!st} > 10#${!mx} )); then
+            errs+=("$st (${!st}) is greater than $mx (${!mx})")
         fi
     done
 
@@ -224,7 +249,7 @@ load_policy() {
     unset "${POLICY_KEYS_POSITIVE[@]}" \
         "${POLICY_KEYS_CRF[@]}" "${POLICY_KEYS_COUNT[@]}" \
         "${POLICY_KEYS_RETIRED[@]}" "${POLICY_KEYS_RETIRED_VIDEO[@]}" \
-        "${POLICY_KEYS_RETIRED_QUALITY[@]}" \
+        "${POLICY_KEYS_RETIRED_QUALITY[@]}" "${POLICY_KEYS_LEGACY_CRF_MIN[@]}" \
         SERIES_CONTAINER_RESERVE_PCT CRF_DOWN_RETRY_HEADROOM_PCT CRF_DOWN_RETRY_MAX \
         CRF_DOWN_RETRY_FIT_MARGIN_PCT SERIES_CRF_DOWN_RETRY_MAX \
         CRF_ADAPTIVE_STEP_THRESHOLD_PCT
@@ -236,7 +261,39 @@ load_policy() {
     fi
 
     policy_retired_note
+    _policy_legacy_crf_min
     validate_policy
+}
+
+# _policy_legacy_crf_min  ->  a High / Base tier set only with the former
+# *_CRF_MIN (start and hard floor in one) gets *_CRF_START and
+# *_CRF_SEARCH_MIN = that value (the former behaviour: no search below
+# it), with a note. Set together with either new key: listed in
+# POLICY_LEGACY_CONFLICT (an error in validate_policy).
+_policy_legacy_crf_min() {
+    local f old st sm mapped=()
+
+    POLICY_LEGACY_CONFLICT=()
+    for f in "${POLICY_CRF_TIERS[@]}"; do
+        old="${f}_CRF_MIN" st="${f}_CRF_START" sm="${f}_CRF_SEARCH_MIN"
+        [[ -n "${!old+x}" ]] || continue
+        if [[ -n "${!st+x}" || -n "${!sm+x}" ]]; then
+            POLICY_LEGACY_CONFLICT+=("$old")
+            continue
+        fi
+        printf -v "$st" '%s' "${!old}"
+        printf -v "$sm" '%s' "${!old}"
+        mapped+=("$old")
+    done
+
+    if (( ${#mapped[@]} )); then
+        echo "Note: $(policy_conf_path) still sets the former High/Base *_CRF_MIN" >&2
+        echo "      (search start and hard floor in one); used as *_CRF_START and" >&2
+        echo "      *_CRF_SEARCH_MIN, so no CRF below it is searched. Set *_CRF_START /" >&2
+        echo "      *_CRF_SEARCH_MIN instead to allow it:" >&2
+        printf '        %s\n' "${mapped[@]}" >&2
+    fi
+    return 0
 }
 
 # policy_retired_note  ->  note on stderr when the config still sets
@@ -264,7 +321,7 @@ policy_retired_note() {
     if (( ${#set[@]} )); then
         echo "Note: $(policy_conf_path) still sets former High/Base size-target" >&2
         echo "      settings, which are ignored (High and Base are CRF tiers now:" >&2
-        echo "      *_CRF_MIN / *_CRF_MAX / *_VIDEO_SIZE_CEILING_GIB):" >&2
+        echo "      *_CRF_START / *_CRF_SEARCH_MIN / *_CRF_MAX / *_VIDEO_SIZE_CEILING_GIB):" >&2
         printf '        %s\n' "${set[@]}" >&2
     fi
 
@@ -318,8 +375,8 @@ movie_policy_line() {
             ;;
         High|Base)
             crf_tier_load movie "$1"
-            printf 'CRF %s-%s [CRF %s preferred; raised only while the video estimate is above %s GiB]' \
-                "$CRF_MIN" "$CRF_MAX" "$CRF_MIN" "$CRF_CEILING_GIB"
+            printf 'CRF %s-%s, search starts at %s [lowest CRF with the video estimate at or below %s GiB]' \
+                "$CRF_MIN" "$CRF_MAX" "$CRF_START" "$CRF_CEILING_GIB"
             ;;
         Custom)
             printf 'CRF entered in the menu, used exactly'
@@ -344,19 +401,22 @@ movie_video_policy_lines() {
 # ------------------------------------------------------------
 # CRF tiers (movie / series High, Base; Custom)
 #
-# Lower CRF = higher quality. CRF_MIN is the tier's preferred (highest)
-# quality, CRF_MAX the lowest quality it allows. Per title:
+# Lower CRF = higher quality. Three separate bounds per tier:
+#   CRF_START  the first CRF estimated (*_CRF_START); not a bound
+#   CRF_MIN    the lowest CRF the search may choose (*_CRF_SEARCH_MIN),
+#              also the floor of the post-encode lower-CRF retry
+#   CRF_MAX    the lowest quality allowed; never exceeded automatically
+# Per title the adjacent boundary around the VIDEO size ceiling is found
+# (crf_search_boundary):
 #
-#   crf = CRF_MIN
-#   while estimated video size (crf) > ceiling and crf < CRF_MAX:
-#       crf = crf + 1
+#   CRF N over the ceiling, CRF N + 1 fits  ->  N + 1
 #
-# (searched with +1 / +2 steps; the CRF just below the chosen one is
-# always estimated above the ceiling and a skipped CRF is left out only
-# when it is proven too large, so the result is the same; crf_search_up)
-#
-# i.e. the lowest CRF whose estimate fits the VIDEO size ceiling, never
-# below CRF_MIN (unused room is not filled) and never above CRF_MAX
+# START above the ceiling: upward (+1 / +2 steps, bracket-and-refine,
+# crf_search_up); START fits: downward one CRF at a time until the CRF
+# below is above the ceiling, or CRF_MIN is reached and still fits.
+# The result is the lowest CRF of CRF_MIN..CRF_MAX that fits (for one
+# title, whose estimates shrink as the CRF rises: the CRF the sequential
+# CRF_MIN, CRF_MIN + 1, ... search chooses), never above CRF_MAX
 # (CRF_OVER_CEILING=1 when CRF_MAX still does not fit: the menu warns
 # and asks). Audio is copied and never part of the decision.
 #
@@ -378,22 +438,28 @@ crf_valid() {
 # crf_tier_load SCOPE TIER [CUSTOM_CRF]
 #
 # SCOPE: movie | series. TIER: High | Base | Custom.
-# Sets CRF_MIN CRF_MAX CRF_CEILING_GIB CRF_CEILING_BYTES.
-# Custom: CRF_MIN = CRF_MAX = CUSTOM_CRF, no ceiling (CRF_CEILING_BYTES=0).
+# Sets CRF_START (first CRF estimated) CRF_MIN (absolute lowest CRF:
+# search and post-encode retry floor) CRF_MAX CRF_CEILING_GIB
+# CRF_CEILING_BYTES.
+# Custom: CRF_START = CRF_MIN = CRF_MAX = CUSTOM_CRF, no ceiling
+# (CRF_CEILING_BYTES=0).
 crf_tier_load() {
     local scope="${1^^}" tier="$2" u
 
     case "$tier" in
         High|Base)
             u="${tier^^}"
-            local a="${scope}_${u}_CRF_MIN" b="${scope}_${u}_CRF_MAX" c="${scope}_${u}_VIDEO_SIZE_CEILING_GIB"
+            local a="${scope}_${u}_CRF_SEARCH_MIN" s="${scope}_${u}_CRF_START"
+            local b="${scope}_${u}_CRF_MAX" c="${scope}_${u}_VIDEO_SIZE_CEILING_GIB"
             CRF_MIN="${!a}"
+            CRF_START="${!s}"
             CRF_MAX="${!b}"
             CRF_CEILING_GIB="${!c}"
             CRF_CEILING_BYTES=$(_gib_bytes "$CRF_CEILING_GIB")
             ;;
         Custom)
             CRF_MIN="${3:-}"
+            CRF_START="${3:-}"
             CRF_MAX="${3:-}"
             CRF_CEILING_GIB=""
             CRF_CEILING_BYTES=0
@@ -448,11 +514,11 @@ crf_policy_lines() {
             echo "  CRF: ${CRF_MIN:-entered in the menu} (used exactly; no size ceiling)"
         fi
     elif [[ "$scope" == series ]]; then
-        echo "  CRF range: ${CRF_MIN}-${CRF_MAX} (${CRF_MIN} preferred; raised only while a regular episode is above the ceiling)"
+        echo "  CRF range: ${CRF_MIN}-${CRF_MAX}, search starts at ${CRF_START} (lowest CRF at which every regular episode fits)"
         echo "  video ceiling: ${CRF_CEILING_GIB} GiB/episode"
         echo "  one season CRF; only an isolated outlier (> median +${SERIES_CRF_OUTLIER_PCT}%) gets its own higher CRF"
     else
-        echo "  CRF range: ${CRF_MIN}-${CRF_MAX} (${CRF_MIN} preferred, raised only to fit the ceiling)"
+        echo "  CRF range: ${CRF_MIN}-${CRF_MAX}, search starts at ${CRF_START} (lowest CRF that fits the ceiling)"
         echo "  video size ceiling: ${CRF_CEILING_GIB} GiB"
     fi
     echo "  encode: x265 CRF, single pass, preset slow, 10-bit"
@@ -589,6 +655,86 @@ crf_search_up() {
     done
 }
 
+# crf_search_boundary START MIN MAX CEILING_BYTES PROBE [REPORT] [CERTIFY]
+#
+# The adjacent CRF boundary around CEILING_BYTES within MIN..MAX,
+# searched from START (MIN <= START <= MAX; clamped):
+#
+#   CRF N      above the ceiling
+#   CRF N + 1  fits             ->  N + 1 chosen
+#
+#   START above the ceiling: upward, crf_search_up START..MAX (+1 / +2
+#     steps, skipped CRFs probed or certified, CERTIFY; START is probed
+#     once, PROBE caches)
+#   START fits: downward one CRF at a time (no jumps: a skipped CRF could
+#     not be certified on the way down), START - 1, START - 2, ... until
+#     a CRF is above the ceiling (it and the CRF above it are the
+#     boundary) or MIN is reached and still fits (no boundary: MIN is
+#     the lowest CRF allowed)
+# CEILING_BYTES 0 = no ceiling: START.
+#
+# REPORT kinds besides crf_search_up's:
+#   fits C           START (C) fits and is MIN: chosen
+#   down C NEXT      C fits; NEXT (= C - 1) probed next
+#   down-over C      C (probed on the way down) too large
+#   floor C          C fits and is MIN: chosen (reached on the way down)
+#   boundary LO HI   LO too large, HI fits: HI chosen (as crf_search_up)
+#
+# Sets crf_search_up's CRFS_CRF / CRFS_BYTES / CRFS_OVER / CRFS_LOW
+# (the adjacent CRF above the ceiling, "" when none was reached) plus
+# CRFS_DIR (up | down) and CRFS_FLOOR (1 when CRFS_CRF is MIN and fits).
+# Returns 1 when a probe failed (CRFS_CRF empty).
+crf_search_boundary() {
+    local start=$((10#$1)) min=$((10#$2)) max=$((10#$3)) ceil="$4" probe="$5" report="${6:-}" certify="${7:-}"
+    local c e
+
+    CRFS_CRF=""
+    CRFS_BYTES=""
+    CRFS_OVER=0
+    CRFS_LOW=""
+    CRFS_DIR=up
+    CRFS_FLOOR=0
+    (( start < min )) && start="$min"
+    (( start > max )) && start="$max"
+
+    _crfs_probe "$probe" "$start" || return 1
+    c="$start"
+    e="$CRF_EST_RESULT"
+
+    if (( ceil > 0 && e > ceil )); then
+        crf_search_up "$start" "$max" "$ceil" "$probe" "$report" "$certify" || return 1
+        CRFS_DIR=up
+        return 0
+    fi
+
+    CRFS_DIR=down
+    if (( ceil > 0 )); then
+        while (( c > min )); do
+            _crfs_report "$report" down "$c" "$((c - 1))"
+            _crfs_probe "$probe" "$((c - 1))" || { CRFS_CRF=""; return 1; }
+            if (( CRF_EST_RESULT > ceil )); then
+                _crfs_report "$report" down-over "$((c - 1))"
+                _crfs_pick "$report" "$c" "$e" "$((c - 1))"
+                return 0
+            fi
+            c=$((c - 1))
+            e="$CRF_EST_RESULT"
+        done
+    fi
+
+    CRFS_CRF="$c"
+    CRFS_BYTES="$e"
+    if (( c == min )); then
+        CRFS_FLOOR=1
+    fi
+    if (( c < start )); then
+        _crfs_report "$report" floor "$c"
+    else
+        _crfs_report "$report" fits "$c"
+    fi
+    return 0
+}
+
 # _crfs_probe PROBE CRF  ->  CRF_EST_RESULT (whole bytes); 1 = failed
 _crfs_probe() {
     CRF_EST_RESULT=""
@@ -612,14 +758,17 @@ _crfs_pick() {
     _crfs_report "$1" boundary "$4" "$2"
 }
 
-# crf_select CRF_MIN CRF_MAX CEILING_BYTES ESTIMATOR [REPORT] [CERTIFY]
+# crf_select_boundary CRF_START CRF_MIN CRF_MAX CEILING_BYTES ESTIMATOR [REPORT] [CERTIFY]
 #
-# ESTIMATOR CRF: a function that estimates the VIDEO size at CRF and
-# leaves it in CRF_EST_RESULT (whole bytes); non-zero = failed.
-# The lowest CRF from CRF_MIN up whose estimate fits is chosen
-# (crf_search_up: adaptive steps, the boundary below the chosen CRF
-# probed). CEILING_BYTES 0 = no ceiling. REPORT / CERTIFY: see
-# crf_search_up (CERTIFY empty: ESTIMATOR estimates one title).
+# High / Base. ESTIMATOR CRF: a function that estimates the VIDEO size
+# at CRF and leaves it in CRF_EST_RESULT (whole bytes); non-zero =
+# failed. The adjacent boundary around the ceiling is searched from
+# CRF_START in either direction (crf_search_boundary: upward with
+# adaptive steps, downward one CRF at a time) and the lowest CRF of
+# CRF_MIN..CRF_MAX that fits is chosen: CRF_START is not a floor.
+# CEILING_BYTES 0 = no ceiling (CRF_START). REPORT / CERTIFY: see
+# crf_search_boundary / crf_search_up (CERTIFY empty: ESTIMATOR
+# estimates one title). Every CRF is estimated at most once.
 #
 # Sets:
 #   CRF_SELECTED      chosen CRF
@@ -627,20 +776,25 @@ _crfs_pick() {
 #   CRF_EST[crf]      estimated video bytes per tried CRF
 #   CRF_OVER_CEILING  1 when CRF_MAX was reached and still does not fit
 #   CRF_BOUNDARY_LOW  the CRF just below CRF_SELECTED, estimated above
-#                     the ceiling ("" when CRF_SELECTED is CRF_MIN or
-#                     over the ceiling)
+#                     the ceiling ("" when none: CRF_SELECTED is CRF_MIN
+#                     or over the ceiling)
+#   CRF_AT_FLOOR      1 when CRF_SELECTED is CRF_MIN and fits (nothing
+#                     lower allowed; no boundary below it)
+#   CRF_SEARCH_DIR    up (CRF_START above the ceiling) | down
 # Returns 1 when an estimate failed (CRF_SELECTED is then empty).
-crf_select() {
-    local min="$1" max="$2" ceil="$3" est="$4" report="${5:-}" certify="${6:-}"
+crf_select_boundary() {
+    local start="$1" min="$2" max="$3" ceil="$4" est="$5" report="${6:-}" certify="${7:-}"
 
     declare -gA CRF_EST=()
     CRF_TRIED=()
     CRF_SELECTED=""
     CRF_OVER_CEILING=0
     CRF_BOUNDARY_LOW=""
+    CRF_AT_FLOOR=0
+    CRF_SEARCH_DIR=""
     _CRF_SELECT_EST="$est"
 
-    if ! crf_search_up "$min" "$max" "$ceil" _crf_select_probe "$report" "$certify"; then
+    if ! crf_search_boundary "$start" "$min" "$max" "$ceil" _crf_select_probe "$report" "$certify"; then
         CRF_SELECTED=""
         return 1
     fi
@@ -648,7 +802,17 @@ crf_select() {
     CRF_SELECTED="$CRFS_CRF"
     CRF_OVER_CEILING="$CRFS_OVER"
     CRF_BOUNDARY_LOW="$CRFS_LOW"
+    CRF_AT_FLOOR="$CRFS_FLOOR"
+    CRF_SEARCH_DIR="$CRFS_DIR"
     return 0
+}
+
+# crf_select CRF_MIN CRF_MAX CEILING_BYTES ESTIMATOR [REPORT] [CERTIFY]
+#
+# crf_select_boundary with the search starting at CRF_MIN: the lowest CRF
+# from CRF_MIN up whose estimate fits (upward only; same globals).
+crf_select() {
+    crf_select_boundary "$1" "$1" "$2" "$3" "$4" "${5:-}" "${6:-}"
 }
 
 # _crf_select_probe CRF  (PROBE for crf_select)  ->  _CRF_SELECT_EST at
@@ -677,20 +841,24 @@ _crf_select_probe() {
 # SOURCE_BYTES (unknown source: always), so the band's upper edge is
 # min(HI, source - 1).
 #
-# Search (every CRF estimated at most once; CRF_EST is the tested map):
+# Search: the High / Base boundary search (crf_search_boundary, the upper
+# edge as its ceiling, REPORT; every CRF estimated at most once, CRF_EST
+# is the tested map):
 #   1. estimate CRF_START
-#   2. above the upper edge: upward from CRF_START with the High / Base
-#      bracket-and-refine search (crf_search_up, the upper edge as its
-#      ceiling, REPORT): + 1 / + 2 steps, stop at the first estimate at or
-#      below the edge with the CRF just below it estimated above it, or
-#      at CRF_MAX. A CRF left out by a + 2 step is above the edge (one
-#      title's estimates shrink as the CRF rises), so it is never inside
-#      the band and never closer to TARGET than the next CRF estimated
+#   2. above the upper edge: upward from CRF_START (+ 1 / + 2 steps,
+#      bracket-and-refine): stop at the first estimate at or below the
+#      edge with the CRF just below it estimated above it, or at CRF_MAX.
+#      A CRF left out by a + 2 step is above the edge (one title's
+#      estimates shrink as the CRF rises), so it is never inside the
+#      band and never closer to TARGET than the next CRF estimated
 #   3. otherwise (inside the band or below it): CRF - 1, - 2, ... while
 #      the estimate stays at or below the edge (stop at the first
 #      estimate above it, or at CRF_MIN), so the lowest CRF still inside
 #      the band is found even when CRF_START already is inside
-# Each direction only moves one way, so the search always ends.
+# Both sides of the adjacent boundary at the upper edge are estimated
+# (CRF_BOUNDARY_LOW above it, CRF_BOUNDARY_HIGH at or below it; "" when
+# CRF_MIN still fits or CRF_MAX is still above). The CHOICE below is
+# Quality's own (band / closest), not the High / Base "lowest that fits".
 # Selection over every CRF estimated (noisy, non-monotonic estimates
 # included):
 #   - the LOWEST CRF whose estimate is inside LO..upper edge
@@ -701,8 +869,8 @@ _crf_select_probe() {
 #
 # Sets the crf_select globals (CRF_SELECTED, CRF_TRIED in estimation
 # order, CRF_EST, CRF_OVER_CEILING: 1 when no estimate reached the upper
-# edge) and QUALITY_PICK: band | closest | none. Returns 1 when an
-# estimate failed (CRF_SELECTED empty).
+# edge), CRF_BOUNDARY_LOW / CRF_BOUNDARY_HIGH and QUALITY_PICK: band |
+# closest | none. Returns 1 when an estimate failed (CRF_SELECTED empty).
 crf_select_quality() {
     local min="$1" start="$2" max="$3" t="$4" lo="$5" hi="$6" src="$7" est="$8" report="${9:-}"
     local c e cap best="" bd d any_fit=0 low_in=""
@@ -711,37 +879,23 @@ crf_select_quality() {
     CRF_TRIED=()
     CRF_SELECTED=""
     CRF_OVER_CEILING=0
+    CRF_BOUNDARY_LOW=""
+    CRF_BOUNDARY_HIGH=""
     QUALITY_PICK=""
 
     cap="$hi"
     if [[ "$src" =~ ^[0-9]+$ ]] && (( src > 0 && src - 1 < cap )); then
         cap=$((src - 1))
     fi
-    if (( 10#$start < 10#$min )); then start="$min"; fi
-    if (( 10#$start > 10#$max )); then start="$max"; fi
 
     _CRF_SELECT_EST="$est"
-    if ! _crfs_probe _crf_select_probe "$start"; then
+    if ! crf_search_boundary "$start" "$min" "$max" "$cap" _crf_select_probe "$report"; then
         CRF_SELECTED=""
         return 1
     fi
-
-    if (( CRF_EST_RESULT > cap )); then
-        # CRF_START is taken from the tested map, not estimated again
-        if ! crf_search_up "$start" "$max" "$cap" _crf_select_probe "$report"; then
-            CRF_SELECTED=""
-            return 1
-        fi
-    else
-        for ((c = 10#$start - 1; c >= 10#$min; c--)); do
-            if ! _crfs_probe _crf_select_probe "$c"; then
-                CRF_SELECTED=""
-                return 1
-            fi
-            if (( CRF_EST_RESULT > cap )); then
-                break
-            fi
-        done
+    if [[ -n "$CRFS_LOW" ]] && (( CRFS_OVER == 0 )); then
+        CRF_BOUNDARY_LOW="$CRFS_LOW"
+        CRF_BOUNDARY_HIGH="$CRFS_CRF"
     fi
 
     for c in $(printf '%s\n' "${CRF_TRIED[@]}" | sort -n); do
@@ -881,9 +1035,12 @@ crf_est_map() {
 # Episodes are sampled (SERIES_CRF_SAMPLE_EPISODES of them spread over
 # the batch, plus the longest episode; SERIES_CRF_SAMPLE_POINTS sections
 # each); an episode that is not sampled is estimated conservatively from
-# the highest sampled bitrate (series_crf_spread). For each candidate
-# CRF (from CRF_MIN up) every episode's video size is estimated and
-# series_batch_stats sorts the episodes:
+# the highest sampled bitrate (series_crf_spread: inferred). An inferred
+# estimate never makes a CRF fail on its own: a decisive inferred
+# episode is sampled itself at that CRF first (series_decisive_inferred,
+# crf_series_estimate). For each candidate CRF (crf_search_boundary from
+# CRF_START, up or down within CRF_MIN..CRF_MAX) every episode's video
+# size is estimated and series_batch_stats sorts the episodes:
 #   outlier   estimate above median episode x (1 + SERIES_CRF_OUTLIER_PCT/100)
 #   isolated  the ONLY outlier of a batch of 3+ episodes; two or more
 #             outliers are the season's difficulty and count as regular
@@ -938,7 +1095,9 @@ _median() {
 #
 # Sets:
 #   SC_EP_BYTES[i]    estimated video bytes of episode i
-#   SC_EP_FROM[i]     "sample", or "highest" (not sampled: SC_FILL_RATE)
+#   SC_EP_FROM[i]     "sample", or "highest" (not sampled: SC_FILL_RATE);
+#                     crf_series_estimate marks an episode sampled because
+#                     it was decisive "promoted"
 #   SC_MEDIAN_RATE    median sampled bytes/s
 #   SC_FILL_RATE      bytes/s given to the episodes that were not sampled
 #   SC_MEDIAN_BYTES   median of the episode estimates
@@ -990,6 +1149,7 @@ series_crf_spread() {
 #                 batch of 3+ episodes ("" = none)
 #   SB_DECIDE     largest REGULAR episode (all but SB_ISOLATED): what the
 #                 season CRF is checked on (crf_series_estimate)
+#   SB_DECIDE_IDX index of that episode (the first one on a tie)
 #   SB_ABOVE      indexes of the episodes above the ceiling
 #   SB_FITS       1 when SB_DECIDE fits the ceiling (always 1 without one)
 series_batch_stats() {
@@ -1000,6 +1160,7 @@ series_batch_stats() {
     SB_ABOVE=()
     SB_OUTLIERS=()
     SB_ISOLATED=""
+    SB_DECIDE_IDX=""
     SB_MEDIAN=$(_median "${vb[@]}") || return 1
     read -r SB_LARGEST SB_TOTAL < <(printf '%s\n' "${vb[@]}" |
         awk '{ t += $1; if (NR == 1 || $1 > m) m = $1 } END { printf "%.0f %.0f\n", m, t }')
@@ -1016,11 +1177,83 @@ series_batch_stats() {
     SB_DECIDE=0
     for i in "${!vb[@]}"; do
         [[ "$i" == "$SB_ISOLATED" ]] && continue
-        (( vb[i] > SB_DECIDE )) && SB_DECIDE="${vb[i]}"
+        if [[ -z "$SB_DECIDE_IDX" ]] || (( vb[i] > SB_DECIDE )); then
+            SB_DECIDE="${vb[i]}"
+            SB_DECIDE_IDX="$i"
+        fi
     done
 
     SB_FITS=0
     (( ceil <= 0 || SB_DECIDE <= ceil )) && SB_FITS=1
+    return 0
+}
+
+# series_from_sampled FROM  ->  0 when an episode estimate (SC_EP_FROM /
+# EP_FROM) comes from the episode's own samples: "sample" (in the sample
+# set) or "promoted" (not in it, sampled itself because it was decisive,
+# series_decisive_inferred); "highest" (inferred) -> 1
+series_from_sampled() {
+    [[ "$1" == sample || "$1" == promoted ]]
+}
+
+# series_from_text FROM  ->  "sampled" | "sampled after inference" | "inferred"
+series_from_text() {
+    case "$1" in
+        sample)   printf 'sampled' ;;
+        promoted) printf 'sampled after inference' ;;
+        *)        printf 'inferred' ;;
+    esac
+}
+
+# series_decisive_inferred CEILING_BYTES
+#
+# Inferred estimates (episodes not sampled: SC_EP_FROM "highest", the
+# highest sampled bitrate x their runtime) may screen a season CRF but
+# never make it fail on their own. After series_crf_spread and
+# series_batch_stats of one CRF (reads SC_EP_BYTES, SC_EP_FROM, SB_FITS,
+# SB_OUTLIERS, SB_ISOLATED):
+#   - the season fits, or no ceiling (Custom): nothing to sample (1)
+#   - the failure is proven by own samples alone: at least two sampled
+#     episodes above the ceiling (only ONE can be the isolated outlier,
+#     so a regular one is above it whatever the inferred episodes turn
+#     out to be), or one in a batch of 1-2 episodes (no isolated outlier
+#     there): nothing to sample (1), no sample is wasted
+#   - otherwise every inferred REGULAR episode can still change the
+#     decision: one above the ceiling makes the largest regular episode
+#     too large; one that is an outlier keeps a sampled episode above the
+#     ceiling from being the isolated outlier; and any of them, sampled
+#     lower, can lower the median until the ONE sampled episode above the
+#     ceiling becomes the isolated outlier. SD_INDEX = the largest
+#     inferred regular episode (0); it is sampled itself at this CRF and
+#     everything recomputed before the season may fail
+#     (crf_series_estimate), one episode at a time, until the season
+#     fits, the failure is proven as above, or none is left
+#   - no inferred regular episode left: the failure stands (1)
+# An inferred isolated outlier never decides the season (it is sampled
+# itself before it gets its own CRF).
+series_decisive_inferred() {
+    local ceil="$1" i n over=0 best=""
+
+    SD_INDEX=""
+    (( ceil > 0 && SB_FITS == 0 )) || return 1
+
+    n=${#SC_EP_BYTES[@]}
+    for i in "${!SC_EP_BYTES[@]}"; do
+        series_from_sampled "${SC_EP_FROM[$i]:-}" || continue
+        (( SC_EP_BYTES[i] > ceil )) && ((over += 1))
+    done
+    (( over >= 2 || (over >= 1 && n < 3) )) && return 1
+
+    for i in "${!SC_EP_BYTES[@]}"; do
+        series_from_sampled "${SC_EP_FROM[$i]:-}" && continue
+        [[ "$i" == "$SB_ISOLATED" ]] && continue
+        if [[ -z "$best" ]] || (( SC_EP_BYTES[i] > SC_EP_BYTES[best] )); then
+            best="$i"
+        fi
+    done
+
+    [[ -n "$best" ]] || return 1
+    SD_INDEX="$best"
     return 0
 }
 
@@ -1141,7 +1374,7 @@ series_guard_episodes() {
         (( ${EP_CEIL_SKIP[i]:-0} == 1 )) && continue
         crf_above_source "${EP_EST[$i]}" "${EP_VBYTES[$i]:-}" || continue
 
-        if [[ "${EP_FROM[$i]:-}" != sample ]]; then
+        if ! series_from_sampled "${EP_FROM[$i]:-}"; then
             if (( ${#GUARD_SAMPLED[@]} == 0 )); then
                 echo
                 echo "Source check (not sampled; estimated at or above the source video):"
@@ -1198,14 +1431,22 @@ series_late_ceiling() {
 # outliers, episodes above the ceiling, fits or not. Reads CRF_TRIED,
 # CRF_SERIES_EP_BYTES, CRF_CEILING_BYTES, CRF_CEILING_GIB, FILES.
 series_crf_analysis_lines() {
-    local c eb
+    local c eb ef d
 
     for c in "${CRF_TRIED[@]}"; do
         read -ra eb <<< "${CRF_SERIES_EP_BYTES[$c]}"
+        read -ra ef <<< "${CRF_SERIES_EP_FROM[$c]:-}"
         series_batch_stats "${CRF_CEILING_BYTES:-0}" "${eb[@]}" || continue
         echo "  CRF $c:"
         echo "    median episode:  $(size_text "$SB_MEDIAN") video"
-        echo "    largest episode: $(size_text "$SB_LARGEST") video"
+        # the largest REGULAR episode decides; its estimate sampled / inferred
+        d="$(basename "${FILES[$SB_DECIDE_IDX]:-episode $((SB_DECIDE_IDX + 1))}"), $(series_from_text "${ef[SB_DECIDE_IDX]:-}")"
+        if [[ -n "$SB_ISOLATED" ]]; then
+            echo "    largest episode: $(size_text "$SB_LARGEST") video"
+            echo "    largest regular: $(size_text "$SB_DECIDE") video ($d)"
+        else
+            echo "    largest episode: $(size_text "$SB_LARGEST") video ($d)"
+        fi
         if [[ -n "$SB_ISOLATED" ]]; then
             echo "    isolated outlier: $(basename "${FILES[$SB_ISOLATED]:-episode $((SB_ISOLATED + 1))}") ($(size_text "${eb[SB_ISOLATED]}"), above median +${SERIES_CRF_OUTLIER_PCT}%)"
         elif (( ${#SB_OUTLIERS[@]} > 1 )); then

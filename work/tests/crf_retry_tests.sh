@@ -334,6 +334,25 @@ check "d7 says why, CRF 17 kept"              "grep -q 'lower-CRF retry limit (1
 movie_job d7b High 18 "${DOWN/down_max=2/down_max=0}" "[18]='$(gib 2) 0'"
 eq    "d7 limit 0: never lower"               "$(encoded d7b)" "1:18 "
 
+# CRF chosen below the tier's CRF_START (10) by the boundary search: the
+# retry floor is the search floor (crf_min=8, CRF_SEARCH_MIN), never the
+# start, so the selected CRF is not pushed back up and may still go lower
+# (estimates: 8 = 5.35 over, 9 = 4.9 fits, 10 = 4.6)
+FLOOR="ceiling_vbytes=$(gib 5) crf_min=8 crf_max=21 down_headroom_pct=20 down_max=2 down_fit_pct=5 crf_est=8=$(gib 5.35):9=$(gib 4.9):10=$(gib 4.6)"
+movie_job f1 High 9 "$FLOOR" "[9]='$(gib 4.7) 0'"
+eq    "f1 below CRF_START, fits: kept at 9 (not raised to the start)" "$(encoded f1)/$(awk '{print $3}' "$T/out/M.mkv")" "1:9 /9"
+movie_job f2 High 9 "$FLOOR" "[9]='$(gib 3.0) 0' [8]='$(gib 3.4) 0'"
+eq    "f2 below CRF_START, headroom: lower CRF 8 tried (floor = search min)" "$(encoded f2)/$(awk '{print $3}' "$T/out/M.mkv")" "1:9 1:8 /8"
+movie_job f3 High 8 "$FLOOR" "[8]='$(gib 3.0) 0'"
+eq    "f3 at the search floor: no lower CRF"  "$(encoded f3)" "1:8 "
+check "f3 says why"                           "grep -q '^Headroom large, but CRF 8 is the High minimum\$' '$T/f3.log'"
+movie_job f4 High 9 "$FLOOR" "[9]='$(gib 5.2) 0' [10]='$(gib 4.8) 0'"
+eq    "f4 below CRF_START, over: up to 10 as usual" "$(encoded f4)/$(awk '{print $3}' "$T/out/M.mkv")" "1:9 1:10 /10"
+check "menus pass CRF_MIN (the search floor), not CRF_START, as the retry floor" \
+    "grep -qF 'RETRY_SPEC=\"\$CRF_CEILING_BYTES:\$CRF_MAX:\$CRF_MIN:' '$SRC_WORK/movie_compress.sh' && grep -qF 'local i=\"\$1\" min=\"\$CRF_MIN\"' '$SRC_WORK/series_compress.sh' && ! grep -q 'RETRY_SPEC=.*CRF_START' '$SRC_WORK/movie_compress.sh'"
+check "crf_tier_load: CRF_MIN is the search floor" \
+    "( for l in ui bitrate policy; do source '$W/lib/'\$l.sh; done; COMPRESS_CONF='$SRC_WORK/lib/compress.conf' load_policy 2>/dev/null; crf_tier_load movie High; [[ \$CRF_MIN == \$MOVIE_HIGH_CRF_SEARCH_MIN && \$CRF_START == \$MOVIE_HIGH_CRF_START ]] && (( CRF_MIN < CRF_START )) )"
+
 movie_job d8 High 18 "$DOWN" "[18]='$(gib 3) 0' [17]=fail"
 check "d8 lower trial fails: CRF 18 kept"     "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 18 && '$(verified d8)' == '1:18 ' ]] && grep -q 'Result: CRF 17 failed' '$T/d8.log'"
 eq    "d8 no temp files"                      "$(leftovers)" ""

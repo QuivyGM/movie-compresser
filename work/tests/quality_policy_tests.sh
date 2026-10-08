@@ -314,20 +314,21 @@ source "$SRC_WORK/lib/media_stats.sh"
 
 # ------------------------------------------------------------
 echo
-echo "== 6. High / Base / Custom / series unchanged"
+echo "== 6. High / Base / Custom / series (start, search floor, max)"
 crf_tier_load movie High
-eq "movie High from config"   "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB" "$MOVIE_HIGH_CRF_MIN $MOVIE_HIGH_CRF_MAX $MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB"
+eq "movie High from config"   "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB" "$MOVIE_HIGH_CRF_SEARCH_MIN $MOVIE_HIGH_CRF_MAX $MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB"
 eq "movie High policy line"   "$(movie_policy_line High)" \
-    "CRF $MOVIE_HIGH_CRF_MIN-$MOVIE_HIGH_CRF_MAX [CRF $MOVIE_HIGH_CRF_MIN preferred; raised only while the video estimate is above $MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB GiB]; audio copied"
+    "CRF $MOVIE_HIGH_CRF_SEARCH_MIN-$MOVIE_HIGH_CRF_MAX, search starts at $MOVIE_HIGH_CRF_START [lowest CRF with the video estimate at or below $MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB GiB]; audio copied"
+eq "movie High start / floor"  "$CRF_START $CRF_MIN" "$MOVIE_HIGH_CRF_START $MOVIE_HIGH_CRF_SEARCH_MIN"
 crf_tier_load movie Base
-eq "movie Base from config"   "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB" "$MOVIE_BASE_CRF_MIN $MOVIE_BASE_CRF_MAX $MOVIE_BASE_VIDEO_SIZE_CEILING_GIB"
+eq "movie Base from config"   "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB" "$MOVIE_BASE_CRF_SEARCH_MIN $MOVIE_BASE_CRF_MAX $MOVIE_BASE_VIDEO_SIZE_CEILING_GIB"
 crf_tier_load movie Custom 21.5
 eq "Custom exact, no ceiling" "$CRF_MIN $CRF_MAX $CRF_CEILING_BYTES" "21.5 21.5 0"
 eq "Custom policy line"       "$(movie_policy_line Custom)" "CRF entered in the menu, used exactly; audio copied"
 crf_tier_load series High
-eq "series High from config"  "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB" "$SERIES_HIGH_CRF_MIN $SERIES_HIGH_CRF_MAX $SERIES_HIGH_VIDEO_SIZE_CEILING_GIB"
+eq "series High from config"  "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB" "$SERIES_HIGH_CRF_SEARCH_MIN $SERIES_HIGH_CRF_MAX $SERIES_HIGH_VIDEO_SIZE_CEILING_GIB"
 crf_tier_load series Base
-eq "series Base from config"  "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB" "$SERIES_BASE_CRF_MIN $SERIES_BASE_CRF_MAX $SERIES_BASE_VIDEO_SIZE_CEILING_GIB"
+eq "series Base from config"  "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB" "$SERIES_BASE_CRF_SEARCH_MIN $SERIES_BASE_CRF_MAX $SERIES_BASE_VIDEO_SIZE_CEILING_GIB"
 est 19=9 20=7.5 21=6.9 22=5
 EST_CALLS=()
 crf_select 19 23 "$(gib_bytes 7)" fake_est
@@ -352,8 +353,16 @@ check "verbose Quality CRF search block" \
     "grep -q '^Quality CRF search:\$' <<< \"\$pl\" && grep -q '^  Range: 0-23\$' <<< \"\$pl\" && grep -q '^  Start: 8 (first CRF sampled' <<< \"\$pl\" && grep -q '^  Target: 20 GiB\$' <<< \"\$pl\" && grep -q '^  Band: 18-22 GiB' <<< \"\$pl\""
 check "START never called a minimum" \
     "! { crf_policy_lines movie Quality; movie_policy_line Quality; grep -i 'START' '$M' '$SRC_WORK/lib/policy.sh'; } | grep -iE 'start.*minim|minim.*start' | grep -v 'not a minimum'"
-check "High/Base CRF_MIN semantics unchanged" \
-    "[[ \"\$(crf_policy_lines movie High | sed -n 2p)\" == '  CRF range: '$MOVIE_HIGH_CRF_MIN-$MOVIE_HIGH_CRF_MAX' ('$MOVIE_HIGH_CRF_MIN' preferred, raised only to fit the ceiling)' ]]"
+check "High/Base policy: search floor, start, max" \
+    "[[ \"\$(crf_policy_lines movie High | sed -n 2p)\" == '  CRF range: '$MOVIE_HIGH_CRF_SEARCH_MIN-$MOVIE_HIGH_CRF_MAX', search starts at '$MOVIE_HIGH_CRF_START' (lowest CRF that fits the ceiling)' ]]"
+est 19=9 20=7.5 21=6.9 22=5
+EST_CALLS=()
+crf_select_boundary 20 18 23 "$(gib_bytes 7)" fake_est
+eq "High boundary search: CRF_START too large -> upward" "$CRF_SELECTED $(calls) $CRF_BOUNDARY_LOW" "21 20 21 20"
+est 18=8 19=7.2 20=6.5 21=6
+EST_CALLS=()
+crf_select_boundary 20 18 23 "$(gib_bytes 7)" fake_est
+eq "High boundary search: CRF_START fits -> downward to the boundary" "$CRF_SELECTED $(calls) $CRF_BOUNDARY_LOW" "20 20 19 19"
 eq "menu band text"           "$(quality_band_text)" "~20 GiB (18-22)"
 check "movie menu: no two-pass wording" "! grep -qi 'two-pass' '$M'"
 

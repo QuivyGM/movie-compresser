@@ -313,7 +313,7 @@ downscale_1080p_dims() {
 
 # ------------------------------------------------------------
 # CRF size estimation (sample encodes; the selection math is in
-# policy.sh: crf_select, crf_sample_points, series_crf_spread)
+# policy.sh: crf_select_boundary, crf_sample_points, series_crf_spread)
 # ------------------------------------------------------------
 
 # crf_x265_params FILE VIDX  ->  the x265 colour / HDR10 parameters the
@@ -360,8 +360,9 @@ _crf_cache_dir() {
 #
 # Encodes the sample sections of FILE (crf_sample_points: POINTS
 # sections of CRF_SAMPLE_SECONDS) at CRF. The same sections are used for
-# every CRF. Sets CRF_SAMPLE_BYTES (all sections) and CRF_SAMPLE_SECS
-# (their length). Each section result is cached under
+# every CRF. Sets CRF_SAMPLE_BYTES (all sections), CRF_SAMPLE_SECS
+# (their length) and CRF_SAMPLE_PARTS ("START:LENGTH:BYTES" per section;
+# diagnostics only: crf_sample_parts_text). Each section result is cached under
 # WORK_DIR/cache/crf_samples, keyed by the resolved file, its size and
 # mtime, the section and every encode setting, so running the menu
 # again does not re-encode it. Returns 1 when a sample encode fails.
@@ -372,6 +373,7 @@ crf_sample_title() {
 
     CRF_SAMPLE_BYTES=0
     CRF_SAMPLE_SECS=0
+    CRF_SAMPLE_PARTS=""
 
     mapfile -t sections < <(crf_sample_points "$dur" "$points" "$CRF_SAMPLE_SECONDS")
     (( ${#sections[@]} )) || return 1
@@ -403,6 +405,7 @@ crf_sample_title() {
             b=$(file_bytes "$tmp")
             [[ -n "$cache" ]] && printf '%s\n' "$b" > "$cache/$key" 2>/dev/null
         fi
+        CRF_SAMPLE_PARTS+="${CRF_SAMPLE_PARTS:+ }$start:$len:$b"
 
         read -r CRF_SAMPLE_BYTES CRF_SAMPLE_SECS < <(
             awk -v t="$CRF_SAMPLE_BYTES" -v s="$CRF_SAMPLE_SECS" -v b="$b" -v l="$len" \
@@ -411,6 +414,22 @@ crf_sample_title() {
 
     rm -f -- "$tmp" "$err"
     return 0
+}
+
+# crf_sample_parts_text DURATION  ->  "10%: 14.1, 50%: 3.2, 90%: 12.8 Mb/s"
+# (the video bitrate of each section of the last crf_sample_title, at
+# its position in the runtime; verbose diagnostics: does one easy or
+# hard section dominate the estimate?)
+crf_sample_parts_text() {
+    awk -v p="${CRF_SAMPLE_PARTS:-}" -v d="$1" 'BEGIN {
+        n = split(p, s, " ")
+        for (i = 1; i <= n; i++) {
+            split(s[i], f, ":")
+            if (f[2] <= 0) continue
+            pos = (d > 0) ? (f[1] + f[2] / 2) / d * 100 : 0
+            out = out (out == "" ? "" : ", ") sprintf("%.0f%%: %.1f", pos, f[3] * 8 / f[2] / 1000000)
+        }
+        if (out != "") printf "%s Mb/s", out }'
 }
 
 # crf_title_estimate CRF  (ESTIMATOR for crf_select / crf_select_exact)
@@ -455,6 +474,13 @@ crf_title_estimate() {
 # "-" = not sampled; policy.sh series_crf_certify_over); those of the
 # sampled episodes also in CRF_EP_EST ("INDEX:CRF"), so
 # crf_episode_estimate does not encode them again.
+#
+# Decisive inference: when the season does not fit at CRF and an episode
+# that was not sampled decides that (policy.sh series_decisive_inferred),
+# that episode is sampled itself at CRF (CRF_EP_EST / the sample cache
+# reused), its inferred estimate replaced (SC_EP_FROM "promoted") and the
+# figures recomputed (median, largest, outliers, isolated outlier, fit),
+# one episode at a time, before the CRF counts as too large.
 crf_series_estimate() {
     local crf="$1" i rates=() k=0 w=0 label
 
@@ -488,7 +514,7 @@ crf_series_estimate() {
         fi
         rates[$i]=$(awk -v b="$CRF_SAMPLE_BYTES" -v s="$CRF_SAMPLE_SECS" 'BEGIN { printf "%.3f", b / s }')
         if ui_verbose; then
-            echo "~$(size_text "$(crf_extrapolate "$CRF_SAMPLE_BYTES" "$CRF_SAMPLE_SECS" "${EP_DUR[$i]}")") video"
+            echo "~$(size_text "$(crf_extrapolate "$CRF_SAMPLE_BYTES" "$CRF_SAMPLE_SECS" "${EP_DUR[$i]}")") video ($(crf_sample_parts_text "${EP_DUR[$i]}"))"
         else
             echo "~$(bytes_to_gib "$(crf_extrapolate "$CRF_SAMPLE_BYTES" "$CRF_SAMPLE_SECS" "${EP_DUR[$i]}")") GiB"
         fi
@@ -496,13 +522,73 @@ crf_series_estimate() {
 
     series_crf_spread "${rates[@]}" || return 1
     series_batch_stats "${CRF_CEILING_BYTES:-0}" "${SC_EP_BYTES[@]}" || return 1
+
+    local -A promoted=()
+    while series_decisive_inferred "${CRF_CEILING_BYTES:-0}"; do
+        i="$SD_INDEX"
+        _crf_series_promote "$crf" "$i" "$w" || return 1
+        rates[$i]="$CRF_PROMOTE_RATE"
+        promoted[$i]=1
+        series_crf_spread "${rates[@]}" || return 1
+        for i in ${promoted[@]+"${!promoted[@]}"}; do
+            SC_EP_FROM[$i]=promoted
+        done
+        series_batch_stats "${CRF_CEILING_BYTES:-0}" "${SC_EP_BYTES[@]}" || return 1
+    done
+
     CRF_EST_RESULT="$SB_DECIDE"
     CRF_SERIES_EP_BYTES[$crf]="${SC_EP_BYTES[*]}"
     CRF_SERIES_EP_FROM[$crf]="${SC_EP_FROM[*]}"
     CRF_SERIES_RATES[$crf]="${rates[*]}"
-    for i in "${CRF_SERIES_SAMPLED[@]}"; do
+    for i in "${CRF_SERIES_SAMPLED[@]}" ${promoted[@]+"${!promoted[@]}"}; do
         CRF_EP_EST[$i:$crf]="${SC_EP_BYTES[$i]}"
     done
+}
+
+# _crf_series_promote CRF INDEX LABEL_WIDTH  (crf_series_estimate)
+#
+# Episode INDEX was not sampled and decides the season at CRF (policy.sh
+# series_decisive_inferred): shows its inferred estimate, samples it
+# itself at CRF (an estimate already in CRF_EP_EST "INDEX:CRF" is reused;
+# the sections are cached on disk as well, crf_sample_title) and leaves
+# its sampled bytes/s in CRF_PROMOTE_RATE. Reads SC_EP_BYTES and
+# SB_DECIDE_IDX. Returns 1 when the sample encode failed.
+_crf_series_promote() {
+    local crf="$1" i="$2" w="$3" label est cached=0 what
+
+    label="${CRF_SERIES_LABELS[$i]:-$(basename "${FILES[$i]}")}"
+    (( ${#label} > w )) && w=${#label}
+    what="Decisive:"
+    [[ "$i" == "${SB_DECIDE_IDX:-}" ]] && what="Largest:"
+
+    if ui_verbose; then
+        printf '  %s not sampled, decides the season at CRF %s (~%s video, inferred); sampling it... ' \
+            "$(basename "${FILES[$i]}")" "$crf" "$(size_text "${SC_EP_BYTES[$i]}")"
+    else
+        echo
+        printf '%-10s%s GiB (%s, inferred)\n' "$what" "$(bytes_to_gib "${SC_EP_BYTES[$i]}")" "$label"
+        printf '  %-*s  ' "$w" "$label"
+    fi
+
+    if [[ "${CRF_EP_EST[$i:$crf]:-}" =~ ^[0-9]+$ ]]; then
+        est="${CRF_EP_EST[$i:$crf]}"
+        CRF_PROMOTE_RATE=$(awk -v b="$est" -v d="${EP_DUR[$i]}" 'BEGIN { printf "%.3f", (d > 0 ? b / d : 0) }')
+        cached=1
+    else
+        if ! crf_sample_title "${FILES[$i]}" "${EP_VIDX[$i]}" "${CRF_SERIES_FILTER:-}" "$crf" \
+                "${EP_DUR[$i]}" "$SERIES_CRF_SAMPLE_POINTS"; then
+            ui_err FAILED; echo
+            return 1
+        fi
+        CRF_PROMOTE_RATE=$(awk -v b="$CRF_SAMPLE_BYTES" -v s="$CRF_SAMPLE_SECS" 'BEGIN { printf "%.3f", b / s }')
+        est=$(crf_extrapolate "$CRF_SAMPLE_BYTES" "$CRF_SAMPLE_SECS" "${EP_DUR[$i]}")
+    fi
+
+    if ui_verbose; then
+        echo "~$(size_text "$est") video$( (( cached == 1 )) && echo " (already sampled)")"
+    else
+        echo "~$(bytes_to_gib "$est") GiB  sampled after inference$( (( cached == 1 )) && echo " (already sampled)")"
+    fi
 }
 
 # crf_episode_estimate INDEX CRF  (ESTIMATOR for series_episode_crf)
@@ -563,6 +649,9 @@ crf_step_result() {
         refine)      printf 'fits -> checking CRF %s' "$3" ;;
         refine-over) printf '%s' "$(ui_warn "too large")" ;;
         refine-fits) printf 'fits' ;;
+        down)        printf 'fits -> trying CRF %s' "$3" ;;
+        down-over)   printf '%s' "$(ui_warn "too large")" ;;
+        floor)       printf 'fits (lowest %s CRF allowed)' "${TIER:-tier}" ;;
     esac
 }
 
@@ -575,19 +664,21 @@ crf_boundary_lines() {
 }
 
 # crf_step_skips KIND CRF [ARG]  ->  0 for a step that skips a CRF, checks
-# a skipped one or reports the boundary found that way
+# a skipped one, searches below the start CRF or reports the boundary
+# found that way
 crf_step_skips() {
     case "$1" in
         over) (( 10#$3 > 10#$2 + 1 )) ;;
         check|resume|refine|refine-over|refine-fits|boundary) return 0 ;;
+        down|down-over|floor) return 0 ;;
         *)    return 1 ;;
     esac
 }
 
-# crf_title_step_report KIND CRF [ARG]  (REPORT for crf_select /
+# crf_title_step_report KIND CRF [ARG]  (REPORT for crf_select_boundary /
 # crf_select_quality, movie): only the steps that skip or check a skipped
-# CRF get a line below the sample line, plus the boundary block; a search
-# without skips looks as before
+# CRF or go below the start CRF get a line below the sample line, plus the
+# boundary block; an upward search without skips looks as before
 crf_title_step_report() {
     crf_step_skips "$@" || return 0
     if [[ "$1" == boundary ]]; then

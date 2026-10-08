@@ -67,10 +67,10 @@ conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the project config
 COMPRESS_CONF=$(conf_with base \
     MOVIE_QUALITY_TARGET_VIDEO_GIB=20 MOVIE_QUALITY_ACCEPT_MIN_GIB=18 MOVIE_QUALITY_ACCEPT_MAX_GIB=22 \
     MOVIE_QUALITY_CRF_MIN=0 MOVIE_QUALITY_CRF_START=8 MOVIE_QUALITY_CRF_MAX=23 \
-    MOVIE_HIGH_CRF_MIN=12 MOVIE_HIGH_CRF_MAX=23 MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=7 \
-    MOVIE_BASE_CRF_MIN=20 MOVIE_BASE_CRF_MAX=29 MOVIE_BASE_VIDEO_SIZE_CEILING_GIB=2 \
-    SERIES_HIGH_CRF_MIN=10 SERIES_HIGH_CRF_MAX=21 SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=5 \
-    SERIES_BASE_CRF_MIN=13 SERIES_BASE_CRF_MAX=27 SERIES_BASE_VIDEO_SIZE_CEILING_GIB=1.5 \
+    MOVIE_HIGH_CRF_SEARCH_MIN=12 MOVIE_HIGH_CRF_START=12 MOVIE_HIGH_CRF_MAX=23 MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=7 \
+    MOVIE_BASE_CRF_SEARCH_MIN=20 MOVIE_BASE_CRF_START=20 MOVIE_BASE_CRF_MAX=29 MOVIE_BASE_VIDEO_SIZE_CEILING_GIB=2 \
+    SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=21 SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=5 \
+    SERIES_BASE_CRF_SEARCH_MIN=13 SERIES_BASE_CRF_START=13 SERIES_BASE_CRF_MAX=27 SERIES_BASE_VIDEO_SIZE_CEILING_GIB=1.5 \
     SERIES_CRF_OUTLIER_PCT=25 SERIES_CRF_SAMPLE_EPISODES=4 CRF_ADAPTIVE_STEP_THRESHOLD_PCT=150)
 export COMPRESS_CONF
 load_policy > /dev/null
@@ -242,6 +242,31 @@ echo "== 4. randomized tables"
 declare -A B=()
 BCALLS=()
 byte_est() { BCALLS+=("$1"); CRF_EST_RESULT="${B[$1]}"; }
+# calls_once_in_range  ->  0 when no CRF in BCALLS was estimated twice;
+# CALLS_LO / CALLS_HI = lowest / highest CRF estimated (no subshells)
+calls_once_in_range() {
+    local c dup=0
+    local -A seen=()
+    CALLS_LO="" CALLS_HI=""
+    for c in "${BCALLS[@]}"; do
+        [[ -n "${seen[$c]:-}" ]] && dup=1
+        seen[$c]=1
+        [[ -z "$CALLS_LO" ]] || (( c < CALLS_LO )) && CALLS_LO="$c"
+        [[ -z "$CALLS_HI" ]] || (( c > CALLS_HI )) && CALLS_HI="$c"
+    done
+    (( dup == 0 ))
+}
+# steps_var  ->  STEPS_S ("a|b|..." like steps) and STEPS_CHECKS (number
+# of "check" steps), without a subshell
+steps_var() {
+    local s IFS='|'
+    STEPS_S="${STEPS[*]}"
+    STEPS_CHECKS=0
+    for s in "${STEPS[@]}"; do
+        [[ "$s" == check* ]] && ((STEPS_CHECKS += 1))
+    done
+    return 0
+}
 # rand_tables MODE TRIALS  ->  per trial "MIN MAX CEIL v..." (MODE mono:
 # non-increasing, steps -1 % .. -45 % and flat; any: arbitrary)
 rand_tables() {
@@ -277,30 +302,32 @@ rand_run() {
         crf_select "$min" "$max" "$ceil" byte_est rec "${3:-}"
         ((RSEQ += n, RAD += ${#BCALLS[@]}))
         [[ "$CRF_SELECTED/$CRF_OVER_CEILING" == "$ref" ]] && ((same += 1))
-        [[ -z "$(printf '%s\n' "${BCALLS[@]}" | sort | uniq -d)" ]] && ((once += 1))
-        (( $(printf '%s\n' "${BCALLS[@]}" | sort -n | head -n 1) >= min &&
-           $(printf '%s\n' "${BCALLS[@]}" | sort -n | tail -n 1) <= max )) && ((inrange += 1))
+        # checks in the shell itself (no subshells: a process per check
+        # made these loops take minutes on slow-fork systems)
+        calls_once_in_range "$min" "$max" && ((once += 1))
+        (( CALLS_LO >= min && CALLS_HI <= max )) && ((inrange += 1))
         if (( CRF_OVER_CEILING == 1 || CRF_SELECTED == min )) || low_ok "$ceil"; then
             ((low += 1))
         fi
+        steps_var
         # at most one estimate more than sequential per CRF left out and
         # back-filled; one in total without back-fill (the boundary CRF)
-        (( ${#BCALLS[@]} <= n + 1 + $(grep -o 'check' <<< "$(steps)" | wc -l) )) && ((bound += 1))
-        [[ "$(steps)" =~ over\ ([0-9]+)\ ([0-9]+) ]] && (( BASH_REMATCH[2] - BASH_REMATCH[1] == 2 )) && ((RJUMP += 1))
-        [[ "$(steps)" == *check* ]] && ((RCHECK += 1))
-        [[ "$(steps)" == *refine* ]] && ((RREFINE += 1))
+        (( ${#BCALLS[@]} <= n + 1 + STEPS_CHECKS )) && ((bound += 1))
+        [[ "$STEPS_S" =~ over\ ([0-9]+)\ ([0-9]+) ]] && (( BASH_REMATCH[2] - BASH_REMATCH[1] == 2 )) && ((RJUMP += 1))
+        [[ "$STEPS_S" == *check* ]] && ((RCHECK += 1))
+        [[ "$STEPS_S" == *refine* ]] && ((RREFINE += 1))
     done < <(rand_tables "$1" "$2")
     RS="$same/$once/$inrange/$low/$bound"
 }
 
-rand_run mono 400
+t0=$SECONDS; rand_run mono 400
 eq "monotonic (one title): same CRF / once / in range / boundary / bound" "$RS" "400/400/400/400/400"
 check "... jumps ($RJUMP) and boundary refinements ($RREFINE) covered" "(( RJUMP > 50 && RREFINE > 20 ))"
-echo "  (monotonic: sequential $RSEQ estimates, adaptive $RAD)"
-rand_run any 400 unproven
+echo "  (monotonic: sequential $RSEQ estimates, adaptive $RAD; $((SECONDS - t0)) s)"
+t0=$SECONDS; rand_run any 400 unproven
 eq "arbitrary non-monotonic, skips unproven: same CRF / once / in range / boundary / bound" "$RS" "400/400/400/400/400"
 check "... back-fills covered ($RCHECK)" "(( RCHECK > 50 ))"
-echo "  (arbitrary: sequential $RSEQ estimates, adaptive $RAD)"
+echo "  (arbitrary: sequential $RSEQ estimates, adaptive $RAD; $((SECONDS - t0)) s)"
 
 # ------------------------------------------------------------
 echo
@@ -387,34 +414,37 @@ qsel 8 23
 eq "Quality downward unchanged"          "$CRF_SELECTED/${CALLS[*]}" "6/8 7 6 5"
 est 8=19 7=17.5 6=21 5=23
 qsel 8 23
-eq "Quality start inside the band: downward, no jump" "$CRF_SELECTED/${CALLS[*]}/$(steps)" "6/8 7 6 5/"
+eq "Quality start inside the band: downward one CRF at a time, boundary 5 / 6" "$CRF_SELECTED/${CALLS[*]}/$(steps)" "6/8 7 6 5/down 8 7|down 7 6|down 6 5|down-over 5|boundary 5 6"
 est 8=40 9=fail
 qsel 8 23
 eq "Quality failure while searching"     "$?/${CRF_SELECTED:-none}" "1/none"
 
 # randomized Quality: adaptive (150) = sequential (0) for monotonic titles
-qsame=0 qn=0
+# (estimates generated in bytes once: byte_est, no process per probe)
+qsame=0 qn=0 t0=$SECONDS
+Q20=$(gib 20) Q18=$(gib 18) Q22=$(gib 22)
 while read -r start max src vals; do
     [[ "$src" == x ]] && src=""
-    EST=()
+    B=()
     c=0
-    for v in $vals; do EST[$c]="$v"; ((c += 1)); done
+    for v in $vals; do B[$c]="$v"; ((c += 1)); done
     CRF_ADAPTIVE_STEP_THRESHOLD_PCT=0
-    qsel "$start" "$max" "$src"
+    BCALLS=(); crf_select_quality 0 "$start" "$max" "$Q20" "$Q18" "$Q22" "$src" byte_est
     q0="$CRF_SELECTED/$QUALITY_PICK/$CRF_OVER_CEILING"
     CRF_ADAPTIVE_STEP_THRESHOLD_PCT=150
-    qsel "$start" "$max" "$src"
+    BCALLS=(); crf_select_quality 0 "$start" "$max" "$Q20" "$Q18" "$Q22" "$src" byte_est
     [[ "$CRF_SELECTED/$QUALITY_PICK/$CRF_OVER_CEILING" == "$q0" ]] && ((qsame += 1))
     ((qn += 1))
-done < <(awk 'BEGIN { srand(11)
+done < <(awk -v G=$G 'BEGIN { srand(11)
     for (t = 1; t <= 200; t++) {
         start = int(rand() * 12); max = start + int(rand() * 12)
-        src = (rand() < 0.3) ? sprintf("%.2f", 15 + rand() * 30) : ""
+        src = (rand() < 0.3) ? sprintf("%.0f", (15 + rand() * 30) * G) : ""
         v = 10 + rand() * 90; out = ""
-        for (c = 0; c <= max; c++) { out = out " " sprintf("%.3f", v); v = v * (0.55 + rand() * 0.44) }
+        for (c = 0; c <= max; c++) { out = out " " sprintf("%.0f", v * G); v = v * (0.55 + rand() * 0.44) }
         print start, max, (src == "" ? "x" : src), out
     } }')
 eq "Quality randomized: CRF / pick / over = sequential" "$qsame" "$qn"
+echo "  (Quality randomized: $qn titles, $((SECONDS - t0)) s)"
 
 # ------------------------------------------------------------
 echo
@@ -519,11 +549,13 @@ epg() {
 nocalls_dup() { [[ -z "$(sort "$T/calls" | uniq -d)" ]]; }
 
 # 4 episodes, 2 sampled (E1, E4): E2 / E3 are filled with E1's rate
-# (the highest sampled). Only E1 is over by its own sample at 12, so 11
-# is not proven too large (the filled E2 / E3 do not count): sampled
+# (the highest sampled). Only E1 is over by its own sample at 12, so the
+# inferred E2 decides: it is sampled itself at 12 (decisive inference)
+# and, over by its own sample too, proves 11 too large (two own samples)
 both High -k 2 9 9 9 3
 eq "sampled E1 / E4, E2 / E3 filled"        "${CRF_SERIES_SAMPLED[*]}" "0 3"
-eq "one sampled over + filled ones over: 11 sampled" "$(steps | grep -o 'check 12 11')" "check 12 11"
+eq "one sampled over + filled ones over: decisive E2 sampled at 12, 11 proven" \
+    "$(steps | grep -c 'check 12 11')/$(grep -c '^12 2$' "$T/calls")/$(grep -c '^12 3$' "$T/calls")/$(grep -c '^11 ' "$T/calls")" "0/1/0/0"
 eq "... = sequential"                       "$RES" "$RES0"
 check "... no sample encoded twice (cache)" "nocalls_dup"
 both High -k 2 9 3 3 9
@@ -531,8 +563,10 @@ eq "two sampled episodes over at 12: 11 proven, not sampled" "$(steps | grep -c 
 eq "... = sequential"                       "$RES" "$RES0"
 
 # isolated sampled outlier E1 + a longer episode E2 that is not sampled
-# (filled with E3's rate x its runtime, above the ceiling): at 12 only E1
-# is over by its own sample -> 11 is sampled; the season fits at 13
+# (filled with E3's rate x its runtime, above the ceiling). Formerly its
+# inferred estimate alone kept 12 too large (13 chosen); now it is sampled
+# itself at 12 (decisive inference, 1 GiB): 12 fits, 11 is too large by
+# own samples (E5 5.5 GiB) -> 12
 EPG=()
 DUR=([2]=3300 [5]=5400)
 epg 1 10 40 35 30
@@ -542,8 +576,9 @@ epg 2 10 1
 epg 4 10 1
 both High -k 3 1 1 1 1 1
 eq "sampled E1 / E3 / E5"                   "${CRF_SERIES_SAMPLED[*]}" "0 2 4"
-eq "isolated outlier E1 does not prove 11: sampled, 13 chosen" "$SEL/$OUT" "13/10 12 11 13/0/0"
-eq "... report"                             "$(steps)" "over 10 12|check 12 11|resume 11 13|fits 13"
+eq "inferred E2 sampled before it may keep 12 too large: 12 chosen" "$SEL/$OUT" "12/10 12 11/0/0"
+eq "... report"                             "$(steps)" "over 10 12|refine 12 11|refine-over 11|boundary 11 12"
+eq "... E2 sampled after inference at 12"   "$(grep -c '^12 2$' "$T/calls")/$(read -ra ef <<< "${CRF_SERIES_EP_FROM[12]}"; echo "${ef[1]}")" "1/promoted"
 eq "... = sequential (season and outlier CRF)" "$RES" "$RES0"
 DUR=()
 EPG=()
@@ -648,7 +683,12 @@ EPG=()
 # per step, each its own), outliers come and go; 1-6 episodes, some not
 # sampled. The season CRF / over flag / outlier CRF must equal the
 # sequential search.
-ssame=0 sn=0 scheck=0 sjump=0 sseq=0 sad=0
+# Each season trial runs the real season math (series_crf_spread /
+# series_batch_stats, several awk calls per CRF) twice; CRF_TEST_SEASONS
+# trials (default 12, about 9 s each on slow-fork systems; 120 for the
+# long run). The back-fill of unproven skips is covered by the fixed
+# cases above (reclassification, isolated outlier).
+ssame=0 sn=0 scheck=0 sjump=0 sseq=0 sad=0 t0=$SECONDS
 while read -r ne k rest; do
     EPG=()
     read -ra vv <<< "$rest"
@@ -660,11 +700,12 @@ while read -r ne k rest; do
     for ((n = 1; n <= ne; n++)); do args+=(1); done
     both High -k "$k" "${args[@]}"
     [[ "$RES" == "$RES0" ]] && ((ssame += 1))
-    [[ "$(steps)" == *check* ]] && ((scheck += 1))
-    [[ "$(steps)" =~ over\ ([0-9]+)\ ([0-9]+) ]] && (( BASH_REMATCH[2] - BASH_REMATCH[1] == 2 )) && ((sjump += 1))
+    steps_var
+    [[ "$STEPS_S" == *check* ]] && ((scheck += 1))
+    [[ "$STEPS_S" =~ over\ ([0-9]+)\ ([0-9]+) ]] && (( BASH_REMATCH[2] - BASH_REMATCH[1] == 2 )) && ((sjump += 1))
     ((sn += 1, sseq += ROUNDS0, sad += ROUNDS))
-done < <(awk 'BEGIN { srand(5)
-    for (t = 1; t <= 120; t++) {
+done < <(awk -v trials="${CRF_TEST_SEASONS:-12}" 'BEGIN { srand(5)
+    for (t = 1; t <= trials; t++) {
         ne = 1 + int(rand() * 6); k = 1 + int(rand() * ne); out = ne " " k
         for (n = 1; n <= ne; n++) {
             v = 5 * (0.4 + rand() * 2.6); if (rand() < 0.3) v = v * (1.3 + rand() * 1.5)
@@ -674,8 +715,8 @@ done < <(awk 'BEGIN { srand(5)
     } }')
 EPG=()
 eq "randomized seasons: = sequential"      "$ssame" "$sn"
-check "... jumps ($sjump) and unproven skips sampled ($scheck) covered" "(( sjump > 20 && scheck > 3 ))"
-echo "  (seasons: sequential $sseq rounds, adaptive $sad)"
+check "... jumps covered ($sjump; unproven skips sampled: $scheck)" "(( sjump > 0 ))"
+echo "  (seasons: $sn trials, sequential $sseq rounds, adaptive $sad; $((SECONDS - t0)) s)"
 
 # isolated outlier: the season CRF ignores it, it gets its own CRF
 both High 3.7 4.2 6.0 3.9 4.0 4.1
@@ -753,7 +794,7 @@ show > "$T/show.out"
 sed 's/^/  | /' "$T/show.out"
 eq "series compact: example from the request" \
     "$(grep -E '^(CRF [0-9]+$|Largest:|Result:|Selected:|Boundary:|  CRF [0-9]+  |$)' "$T/show.out" | tr '\n' '|')" \
-    "|CRF 10||Largest:  13.05 GiB|Result:   too large -> jumping to CRF 12||CRF 12||Largest:  8.90 GiB|Result:   too large -> jumping to CRF 14||CRF 14||Largest:  4.80 GiB|Result:   fits -> checking CRF 13||CRF 13||Largest:  5.40 GiB|Result:   too large||Boundary:|  CRF 13  over|  CRF 14  fits|Selected: CRF 14|"
+    "|CRF 10||Largest:  13.05 GiB (E1, sampled)|Result:   too large -> jumping to CRF 12||CRF 12||Largest:  8.90 GiB (E1, sampled)|Result:   too large -> jumping to CRF 14||CRF 14||Largest:  4.80 GiB (E1, sampled)|Result:   fits -> checking CRF 13||CRF 13||Largest:  5.40 GiB (E1, sampled)|Result:   too large||Boundary:|  CRF 13  over|  CRF 14  fits|Selected: CRF 14|"
 F=([10]=0.4 [11]=0.383)
 show > "$T/show2.out"
 check "series compact: no skip -> as before" \

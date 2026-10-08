@@ -24,7 +24,7 @@
 #     or sources a running compression job is reading)
 # 10. movie / series menus copy every audio track (all tiers, Custom);
 #     only audio_compress_menu.sh converts audio
-# 11. CRF tiers: High / Base start at CRF_MIN and go up only while the
+# 11. CRF tiers: High / Base start at CRF_START (here = SEARCH_MIN) and go up only while the
 #     sampled video estimate is above the ceiling (bracket-and-refine:
 #     checked by the CRF chosen, the CRF just below it estimated above the
 #     ceiling and over-ceiling flag, not by the order CRFs were estimated;
@@ -157,10 +157,10 @@ conf_set() {
 # All test configs below (conf_with, menus) start from this copy.
 cp "$SRC_WORK/lib/compress.conf" "$T/compress.conf"
 conf_set "$T/compress.conf" \
-    MOVIE_HIGH_CRF_MIN=19 MOVIE_HIGH_CRF_MAX=23 MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=7 \
-    MOVIE_BASE_CRF_MIN=25 MOVIE_BASE_CRF_MAX=29 MOVIE_BASE_VIDEO_SIZE_CEILING_GIB=2 \
-    SERIES_HIGH_CRF_MIN=18 SERIES_HIGH_CRF_MAX=21 SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=5 \
-    SERIES_BASE_CRF_MIN=24 SERIES_BASE_CRF_MAX=27 SERIES_BASE_VIDEO_SIZE_CEILING_GIB=1.5
+    MOVIE_HIGH_CRF_SEARCH_MIN=19 MOVIE_HIGH_CRF_START=19 MOVIE_HIGH_CRF_MAX=23 MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=7 \
+    MOVIE_BASE_CRF_SEARCH_MIN=25 MOVIE_BASE_CRF_START=25 MOVIE_BASE_CRF_MAX=29 MOVIE_BASE_VIDEO_SIZE_CEILING_GIB=2 \
+    SERIES_HIGH_CRF_SEARCH_MIN=18 SERIES_HIGH_CRF_START=18 SERIES_HIGH_CRF_MAX=21 SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=5 \
+    SERIES_BASE_CRF_SEARCH_MIN=24 SERIES_BASE_CRF_START=24 SERIES_BASE_CRF_MAX=27 SERIES_BASE_VIDEO_SIZE_CEILING_GIB=1.5
 export COMPRESS_CONF="$T/compress.conf"
 
 HAVE_MKV=0
@@ -199,10 +199,10 @@ check "default compress.conf loads"           "load_policy 2>'$T/pol.err'"
     eq "audio menu High 5.1 from config"  "$(audio_menu_high_kbps 6)" "$AUDIO_HIGH_KBPS_5TO6"
 
     # the CRF tier values come from compress.conf
-    eq "config: movie High 19-23 / 7 GiB"   "$MOVIE_HIGH_CRF_MIN $MOVIE_HIGH_CRF_MAX $MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB" "19 23 7"
-    eq "config: movie Base 25-29 / 2 GiB"   "$MOVIE_BASE_CRF_MIN $MOVIE_BASE_CRF_MAX $MOVIE_BASE_VIDEO_SIZE_CEILING_GIB" "25 29 2"
-    eq "config: series High 18-21 / 5 GiB"  "$SERIES_HIGH_CRF_MIN $SERIES_HIGH_CRF_MAX $SERIES_HIGH_VIDEO_SIZE_CEILING_GIB" "18 21 5"
-    eq "config: series Base 24-27 / 1.5 GiB" "$SERIES_BASE_CRF_MIN $SERIES_BASE_CRF_MAX $SERIES_BASE_VIDEO_SIZE_CEILING_GIB" "24 27 1.5"
+    eq "config: movie High 19-23 / 7 GiB"   "$MOVIE_HIGH_CRF_START $MOVIE_HIGH_CRF_MAX $MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB" "19 23 7"
+    eq "config: movie Base 25-29 / 2 GiB"   "$MOVIE_BASE_CRF_START $MOVIE_BASE_CRF_MAX $MOVIE_BASE_VIDEO_SIZE_CEILING_GIB" "25 29 2"
+    eq "config: series High 18-21 / 5 GiB"  "$SERIES_HIGH_CRF_START $SERIES_HIGH_CRF_MAX $SERIES_HIGH_VIDEO_SIZE_CEILING_GIB" "18 21 5"
+    eq "config: series Base 24-27 / 1.5 GiB" "$SERIES_BASE_CRF_START $SERIES_BASE_CRF_MAX $SERIES_BASE_VIDEO_SIZE_CEILING_GIB" "24 27 1.5"
     crf_tier_load movie High
     eq "crf_tier_load movie High"         "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB $CRF_CEILING_BYTES" "19 23 7 $(gib_bytes 7)"
     crf_tier_load movie Base
@@ -224,7 +224,7 @@ check "default compress.conf loads"           "load_policy 2>'$T/pol.err'"
     eq "crf_tier_load Custom: exact, no ceiling" "$CRF_MIN $CRF_MAX $CRF_CEILING_BYTES" "21.5 21.5 0"
     pl=$(crf_policy_lines movie High)
     check "policy lines: CRF range + ceiling" \
-        "grep -q 'CRF range: 19-23 (19 preferred' <<< \"\$pl\" && grep -q 'video size ceiling: 7 GiB' <<< \"\$pl\" && grep -q 'audio: copied unchanged' <<< \"\$pl\""
+        "grep -q 'CRF range: 19-23, search starts at 19 (' <<< \"\$pl\" && grep -q 'video size ceiling: 7 GiB' <<< \"\$pl\" && grep -q 'audio: copied unchanged' <<< \"\$pl\""
     check "policy lines: no 'minimum quality' wording" \
         "! { crf_policy_lines movie High; crf_policy_lines series Base; movie_policy_line High; } | grep -qi 'minimum quality'"
 }
@@ -253,7 +253,7 @@ conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the (pinned) test conf
     eq "Q3 never at or above the source" "$CRF_SELECTED" 10
 
     # edited CRF settings are used
-    COMPRESS_CONF=$(conf_with crfedit MOVIE_HIGH_CRF_MIN=18 MOVIE_HIGH_CRF_MAX=22 MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=9.5)
+    COMPRESS_CONF=$(conf_with crfedit MOVIE_HIGH_CRF_SEARCH_MIN=18 MOVIE_HIGH_CRF_START=18 MOVIE_HIGH_CRF_MAX=22 MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=9.5)
     load_policy 2>/dev/null
     crf_tier_load movie High
     eq "edited High CRF settings"         "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB" "18 22 9.5"
@@ -462,7 +462,7 @@ echo "== series CRF: season CRF from the regular episodes"
     eq    "S7 several large episodes: season to 20"    "$SEL" "20/19/0"
     eq    "S7 nothing above the ceiling at 20"         "${#SB_ABOVE[@]}" 0
     eq    "S7 analysis lines (CRF 18)"                 "$(series_crf_analysis_lines | tr -s ' ' | tr '\n' ';' | cut -d';' -f1-6)" \
-        " CRF 18:; median episode: 4.70 GiB video; largest episode: 6.20 GiB video; 2 episodes above median +25% (season difficulty, not outliers); ceiling: 5 GiB/episode; -> regular episode above the ceiling"
+        " CRF 18:; median episode: 4.70 GiB video; largest episode: 6.20 GiB video (E6.mkv, sampled); 2 episodes above median +25% (season difficulty, not outliers); ceiling: 5 GiB/episode; -> regular episode above the ceiling"
     # S8 / S9 Base starts at 24 and keeps it when the median fits 1.5 GiB
     series_sel Base 0.8 0.9 1.0 1.1 0.7 0.9
     eq    "S8 series Base starts at CRF 24"            "$(head -1 "$T/series_calls" | cut -d' ' -f1)" 24
@@ -572,23 +572,30 @@ reject_file() {   # LABEL PATTERN CONF
         bad "rejects $label (message: $(tr '\n' ' ' < "$T/rej.out"))"
     fi
 }
-reject "negative CRF"             'MOVIE_HIGH_CRF_MIN="-1": must not be negative' MOVIE_HIGH_CRF_MIN=-1
+reject "negative CRF"             'MOVIE_HIGH_CRF_SEARCH_MIN="-1": must not be negative' MOVIE_HIGH_CRF_SEARCH_MIN=-1
 reject "CRF above 51"             'SERIES_BASE_CRF_MAX="52": outside the x265 CRF range 0-51' SERIES_BASE_CRF_MAX=52
-reject "decimal CRF in config"    'MOVIE_BASE_CRF_MIN="25.5": must be a whole number' MOVIE_BASE_CRF_MIN=25.5
+reject "decimal CRF in config"    'MOVIE_BASE_CRF_START="25.5": must be a whole number' MOVIE_BASE_CRF_START=25.5
 reject "non-numeric CRF"          'MOVIE_HIGH_CRF_MAX="high": must be a whole number' MOVIE_HIGH_CRF_MAX=high
-reject "High CRF_MAX < CRF_MIN"   'MOVIE_HIGH_CRF_MAX (18) is lower than MOVIE_HIGH_CRF_MIN (19)' MOVIE_HIGH_CRF_MAX=18
-reject "Base CRF_MAX < CRF_MIN"   'MOVIE_BASE_CRF_MAX (24) is lower than MOVIE_BASE_CRF_MIN (25)' MOVIE_BASE_CRF_MAX=24
-reject "series CRF_MAX < CRF_MIN" 'SERIES_HIGH_CRF_MAX (20) is lower than SERIES_HIGH_CRF_MIN (21)' SERIES_HIGH_CRF_MIN=21 SERIES_HIGH_CRF_MAX=20
+reject "High CRF_MAX < CRF_START" 'MOVIE_HIGH_CRF_START (19) is greater than MOVIE_HIGH_CRF_MAX (18)' MOVIE_HIGH_CRF_MAX=18
+reject "Base CRF_MAX < CRF_START" 'MOVIE_BASE_CRF_START (25) is greater than MOVIE_BASE_CRF_MAX (24)' MOVIE_BASE_CRF_MAX=24
+reject "series START < SEARCH_MIN" 'SERIES_HIGH_CRF_START (17) is lower than SERIES_HIGH_CRF_SEARCH_MIN (18)' SERIES_HIGH_CRF_START=17
+reject "former CRF_MIN with the new keys" 'SERIES_BASE_CRF_MIN is replaced by SERIES_BASE_CRF_START and SERIES_BASE_CRF_SEARCH_MIN' SERIES_BASE_CRF_MIN=24
+# a config with only the former *_CRF_MIN: START = SEARCH_MIN = it, with a note
+f=$(conf_with legacymin); sed -i '/^MOVIE_HIGH_CRF_\(START\|SEARCH_MIN\)=/d' "$f"; echo "MOVIE_HIGH_CRF_MIN=17" >> "$f"
+check "former MOVIE_HIGH_CRF_MIN alone: loads, noted" \
+    "( COMPRESS_CONF='$f' load_policy ) 2>'$T/legacy.err' && grep -q 'former High/Base \*_CRF_MIN' '$T/legacy.err' && grep -q MOVIE_HIGH_CRF_MIN '$T/legacy.err'"
+eq "former MOVIE_HIGH_CRF_MIN alone: start = search floor = 17 (no search below)" \
+    "$( COMPRESS_CONF="$f" load_policy 2>/dev/null; crf_tier_load movie High; echo "$CRF_START $CRF_MIN $CRF_MAX" )" "17 17 23"
 reject "zero High ceiling"        'MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB="0": must be greater than 0' MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=0
 reject "negative Base ceiling"    'SERIES_BASE_VIDEO_SIZE_CEILING_GIB="-2": must not be negative' SERIES_BASE_VIDEO_SIZE_CEILING_GIB=-2
 reject "zero sample seconds"      'CRF_SAMPLE_SECONDS="0": must be greater than 0' CRF_SAMPLE_SECONDS=0
 reject "zero sample points"       'MOVIE_CRF_SAMPLE_POINTS="0": must be at least 1' MOVIE_CRF_SAMPLE_POINTS=0
-check "CRF_MIN = CRF_MAX allowed" "( COMPRESS_CONF=\$(conf_with crfeq MOVIE_HIGH_CRF_MIN=21 MOVIE_HIGH_CRF_MAX=21) load_policy )"
-check "CRF 0 allowed"             "( COMPRESS_CONF=\$(conf_with crf0 MOVIE_HIGH_CRF_MIN=0) load_policy )"
-for k in MOVIE_HIGH_CRF_MIN MOVIE_HIGH_CRF_MAX MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB \
-         MOVIE_BASE_CRF_MIN MOVIE_BASE_CRF_MAX MOVIE_BASE_VIDEO_SIZE_CEILING_GIB \
-         SERIES_HIGH_CRF_MIN SERIES_HIGH_CRF_MAX SERIES_HIGH_VIDEO_SIZE_CEILING_GIB \
-         SERIES_BASE_CRF_MIN SERIES_BASE_CRF_MAX SERIES_BASE_VIDEO_SIZE_CEILING_GIB \
+check "CRF_MIN = CRF_MAX allowed" "( COMPRESS_CONF=\$(conf_with crfeq MOVIE_HIGH_CRF_SEARCH_MIN=21 MOVIE_HIGH_CRF_START=21 MOVIE_HIGH_CRF_MAX=21) load_policy )"
+check "CRF 0 allowed"             "( COMPRESS_CONF=\$(conf_with crf0 MOVIE_HIGH_CRF_SEARCH_MIN=0 MOVIE_HIGH_CRF_START=0) load_policy )"
+for k in MOVIE_HIGH_CRF_START MOVIE_HIGH_CRF_SEARCH_MIN MOVIE_HIGH_CRF_MAX MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB \
+         MOVIE_BASE_CRF_START MOVIE_BASE_CRF_SEARCH_MIN MOVIE_BASE_CRF_MAX MOVIE_BASE_VIDEO_SIZE_CEILING_GIB \
+         SERIES_HIGH_CRF_START SERIES_HIGH_CRF_SEARCH_MIN SERIES_HIGH_CRF_MAX SERIES_HIGH_VIDEO_SIZE_CEILING_GIB \
+         SERIES_BASE_CRF_START SERIES_BASE_CRF_SEARCH_MIN SERIES_BASE_CRF_MAX SERIES_BASE_VIDEO_SIZE_CEILING_GIB \
          CRF_SAMPLE_SECONDS MOVIE_CRF_SAMPLE_POINTS SERIES_CRF_SAMPLE_EPISODES SERIES_CRF_SAMPLE_POINTS; do
     f=$(conf_with "unset$k"); sed -i "/^$k=/d" "$f"
     reject_file "missing $k" "$k is not set" "$f"

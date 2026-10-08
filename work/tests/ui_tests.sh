@@ -147,8 +147,11 @@ for e in 1 2 3; do src 320x180 2 "$H/compress/in/Show/Show.S01E0$e.mkv"; done
 src 320x180 2 "$H/compress/in/Mixed/Mixed.S01E01.mkv"
 src 640x360 2 "$H/compress/in/Mixed/Mixed.S01E02.mkv"
 
-# series High CRF_MIN of the project config (where every series sample starts)
-SHMIN=$(sed -n 's/^SERIES_HIGH_CRF_MIN=//p' "$H/compress/work/lib/compress.conf")
+# series High CRF_START (where every series sample starts) and
+# CRF_SEARCH_MIN (the tiny episodes fit at every CRF: the season search
+# goes down to it) of the project config
+SHSTART=$(sed -n 's/^SERIES_HIGH_CRF_START=//p' "$H/compress/work/lib/compress.conf")
+SHMIN=$(sed -n 's/^SERIES_HIGH_CRF_SEARCH_MIN=//p' "$H/compress/work/lib/compress.conf")
 
 menu() {   # SCRIPT INPUT LOG [CONF]
     printf "$2" | HOME="$H" PATH="$T/stub:$PATH" COMPRESS_CONF="${4:-$H/compress/work/lib/compress.conf}" \
@@ -167,8 +170,8 @@ check "avg video from stats"             "grep -qE '^Avg video: +[0-9]+\\.[0-9]{
 check "tier menu"                        "grep -qE '^1\\) Base    CRF [0-9]+-[0-9]+ +<=[0-9.]+ GiB/episode\$' '$L' && grep -qE '^2\\) High    CRF $SHMIN-21 +<=5 GiB/episode\$' '$L' && grep -q '^3) Custom  exact CRF' '$L'"
 check "no repeated tier policy"          "! grep -q 'CRF range' '$L'"
 check "estimating line"                  "grep -q '^Estimating High at 320x180\\.\\.\\.\$' '$L'"
-check "per-episode samples"              "grep -q '^CRF $SHMIN\$' '$L' && [[ \$(grep -cE '^  S01E0[123]  ~[0-9]+\\.[0-9]{2} GiB\$' '$L') == 3 ]]"
-check "CRF result"                       "grep -qE '^Median: +[0-9.]+ GiB\$' '$L' && grep -qE '^Largest: +[0-9.]+ GiB\$' '$L' && grep -q '^Ceiling:  5.00 GiB\$' '$L' && grep -q '^Selected: CRF $SHMIN\$' '$L'"
+check "per-episode samples"              "grep -q '^CRF $SHSTART\$' '$L' && grep -q '^CRF $SHMIN\$' '$L' && n=\$(grep -cE '^  S01E0[123]  ~[0-9]+\\.[0-9]{2} GiB\$' '$L') && (( n >= 3 && n % 3 == 0 ))"
+check "CRF result"                       "grep -qE '^Median: +[0-9.]+ GiB\$' '$L' && grep -qE '^Largest: +[0-9.]+ GiB \\(S01E0[123], sampled\\)\$' '$L' && grep -q '^Ceiling:  5.00 GiB\$' '$L' && grep -q '^Result:   fits -> trying CRF $((SHSTART - 1))\$' '$L' && grep -q '^Result:   fits (lowest High CRF allowed)\$' '$L' && grep -q '^Selected: CRF $SHMIN\$' '$L'"
 check "no long blocks"                   "! grep -qE '^Tier:|Video encode:|Per-episode rules|Object audio|Season totals|^-----' '$L'"
 check "table header, no extra columns"   "grep -q '^Episode   Runtime   Video   Audio   Total\$' '$L' && ! grep -qE 'Estimate|Status|^ *CRF +Video' '$L'"
 check "table rows"                       "[[ \$(grep -cE '^S01E0[123]    0:02      [0-9.]+ +[0-9.]+ +[0-9.]+\$' '$L') == 3 ]]"
@@ -210,7 +213,7 @@ menu series_compress.sh "2\n2\n1\nn\n" "$L" "$T/tiny.conf"
 sed -n '/^Estimating/,$p' "$L" | sed 's/^/  | /'
 # far above the ceiling: the adaptive search jumps 2 CRFs at a time,
 # CRF_MAX (21) is the last step
-check "ceiling: too large -> jumping 2 CRFs" "grep -q '^Result:   too large -> jumping to CRF $((SHMIN + 2))\$' '$L' && ! grep -q '^CRF $((SHMIN + 1))\$' '$L'"
+check "ceiling: too large -> jumping 2 CRFs" "grep -q '^Result:   too large -> jumping to CRF $((SHSTART + 2))\$' '$L' && ! grep -q '^CRF $((SHSTART + 1))\$' '$L'"
 check "ceiling: last step clamped to 21"     "grep -qE '^Result:   too large -> (trying|jumping to) CRF 21\$' '$L' && grep -q '^CRF 21\$' '$L' && ! grep -q '^CRF 22\$' '$L'"
 check "ceiling: limit reached"           "grep -q '^Result:   too large (CRF 21 is the High limit)\$' '$L' && ! grep -q '^Selected:' '$L'"
 check "ceiling: warning kept"            "grep -q '^WARNING: the 0.000001 GiB per-episode video ceiling cannot be met' '$L' && grep -q 'gives a largest regular episode of' '$L'"
@@ -239,19 +242,19 @@ sed 's/^/  | /' "$L"
 check "no policy dump"                   "! grep -qE 'Policy:|video policy|^Audio:\$' '$L'"
 check "analysis line"                    "grep -qE '^Analyzing source\\.\\.\\. OK    Source stats: (scanned|scanned \\+ refreshed)\$' '$L'"
 check "header"                           "grep -qE '^Source: +Film.mkv\$' '$L' && grep -qE '^Runtime: +00:00:02\$' '$L' && grep -qE '^Video: +320x180 H264 8-bit +[0-9.]+ Mb/s   [0-9.]+ GiB\$' '$L' && grep -qE '^Dynamic range: +SDR\$' '$L' && grep -qE '^Audio: +1 track, [0-9.]+ GiB, copied unchanged\$' '$L'"
-check "tier menu"                        "grep -qE '^1\\) Quality  CRF search  <=[0-9.]+ GiB \\(source-limited\\)\$' '$L' && grep -qE '^2\\) High     CRF 12-23 +<=7 GiB\$' '$L' && grep -q '^4) Custom   exact CRF' '$L'"
-check "estimating + samples"             "grep -q '^Estimating High at 320x180\\.\\.\\.\$' '$L' && grep -qE '^  CRF 12   ~[0-9.]+ GiB\$' '$L' && ! grep -q 'sampling CRF' '$L'"
-check "CRF result"                       "grep -qE '^Video: +~[0-9.]+ GiB\$' '$L' && grep -q '^Ceiling:  7.00 GiB\$' '$L' && grep -q '^Selected: CRF 12\$' '$L' && grep -qE '^Total: +~[0-9.]+ GiB\$' '$L'"
-check "compact summary"                  "grep -q '^Added: Film.mkv\$' '$L' && grep -q '^  High | CRF 12 | 320x180 | SDR | audio copied\$' '$L' && grep -q '^  Output: Film HEVC High.mkv\$' '$L'"
+check "tier menu"                        "grep -qE '^1\\) Quality  CRF search  <=[0-9.]+ GiB \\(source-limited\\)\$' '$L' && grep -qE '^2\\) High     CRF 10-23 +<=7 GiB\$' '$L' && grep -q '^4) Custom   exact CRF' '$L'"
+check "estimating + samples"             "grep -q '^Estimating High at 320x180\\.\\.\\.\$' '$L' && grep -qE '^  CRF 12   ~[0-9.]+ GiB\$' '$L' && grep -q '^           fits -> trying CRF 11\$' '$L' && ! grep -q 'sampling CRF' '$L'"
+check "CRF result"                       "grep -qE '^Video: +~[0-9.]+ GiB\$' '$L' && grep -q '^Ceiling:  7.00 GiB\$' '$L' && grep -q '^Selected: CRF 10\$' '$L' && grep -qE '^Total: +~[0-9.]+ GiB\$' '$L'"
+check "compact summary"                  "grep -q '^Added: Film.mkv\$' '$L' && grep -q '^  High | CRF 10 | 320x180 | SDR | audio copied\$' '$L' && grep -q '^  Output: Film HEVC High.mkv\$' '$L'"
 check "no long summary"                  "! grep -qE 'Video encode:|Compression tier: +High|^-----|Object audio' '$L'"
 check "compact: no ANSI / tabs / long lines" "compact '$L'"
-check "job: High CRF retry planned"      "grep -q 'mode=crf crf=12 .* ceiling_vbytes=7516192768 crf_min=12 crf_max=23' '$H/compress/work/c1.sh' && grep -q '^   item_crf_encode item_encode_1\$' '$H/compress/work/c1.sh'"
+check "job: High CRF retry planned"      "grep -q 'mode=crf crf=10 .* ceiling_vbytes=7516192768 crf_min=10 crf_max=23' '$H/compress/work/c1.sh' && grep -q '^   item_crf_encode item_encode_1\$' '$H/compress/work/c1.sh'"
 
 rm -f "$H/compress/work"/c[0-9]*.sh "$H/compress/work"/*.state
 L="$T/movie_verbose.log"
 COMPRESS_VERBOSE=1 menu movie_compress.sh "1\n2\nn\n" "$L"
 check "verbose: policy + sampling + summary" \
-    "grep -q '^Policy: ' '$L' && grep -q 'sampling CRF 12 (' '$L' && grep -q '^Values from: ' '$L' && grep -q '^Added:\$' '$L' && grep -q 'Video encode: *x265 CRF 12' '$L'"
+    "grep -q '^Policy: ' '$L' && grep -q 'sampling CRF 12 (' '$L' && grep -q '^Values from: ' '$L' && grep -q '^Added:\$' '$L' && grep -q 'Video encode: *x265 CRF 10' '$L'"
 
 # Quality: the tiny source is smaller than the 20 GiB target -> source guard
 # first; "encode anyway" = lowest Quality CRF estimated below the source
