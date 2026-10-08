@@ -51,8 +51,16 @@ HDR_TOOLS_DETECTED=0
 #   MKVMERGE          path or ""
 #   FFMPEG_DOVI_BSF   1 if ffmpeg has the dovi_rpu bitstream filter
 #   FFMPEG_X265_DV    1 if ffmpeg's libx265 wrapper has -dolbyvision
+# Every function that reads these globals calls hdr_tools_detect first
+# (it runs the detection once per shell). HDR_TOOLS_DETECTED=1 without
+# the globals (e.g. set by a caller, or the globals unset afterwards)
+# does not count as detected: the tools are looked up again, so a set -u
+# shell never reads an unset tool variable and a missing tool is never
+# assumed.
 hdr_tools_detect() {
-    (( HDR_TOOLS_DETECTED == 1 )) && return 0
+    if (( ${HDR_TOOLS_DETECTED:-0} == 1 )) && _hdr_tools_globals_set; then
+        return 0
+    fi
 
     DOVI_TOOL=$(hdr_find_tool dovi_tool)
     DOVI_TOOL_VERSION=""
@@ -81,6 +89,17 @@ hdr_tools_detect() {
 
     X265_HDR10PLUS=""
     HDR_TOOLS_DETECTED=1
+}
+
+# _hdr_tools_globals_set  ->  0 when every global hdr_tools_detect sets
+# exists (empty = tool missing is fine; unset = not detected)
+_hdr_tools_globals_set() {
+    local v
+    for v in DOVI_TOOL DOVI_TOOL_VERSION DOVI_TOOL_OK HDR10PLUS_TOOL MKVMERGE \
+             FFMPEG_DOVI_BSF FFMPEG_X265_DV; do
+        [[ -n "${!v+x}" ]] || return 1
+    done
+    return 0
 }
 
 # x265_hdr10plus_supported  ->  0 when libx265 accepts dhdr10-info
@@ -245,6 +264,11 @@ confirm_dynamic_range() {
     fi
 
     (( HDR_DV == 1 || HDR_HDR10PLUS == 1 )) || return 0
+
+    # The HDR10+ / Dolby Vision decisions below need the tool globals
+    # (HDR10PLUS_TOOL, DOVI_TOOL, DOVI_TOOL_OK, MKVMERGE) in every output
+    # mode, not only when the verbose tool report happens to run first.
+    hdr_tools_detect
 
     echo
     (( verbose == 1 )) && hdr_tools_report

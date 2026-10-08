@@ -33,6 +33,7 @@
 #     warning; source-quality guard (keep source video / encode / skip);
 #     estimate vs actual reported; progress-check shows one encode step
 # 12. HDR10 / HDR10+ (needs hdr10plus_tool) / Dolby Vision on the CRF path
+# 13. HDR tool initialization in the menus under set -u (hdr_init_tests.sh)
 #
 # Runs in a temporary copy of work/ so real logs/jobs are untouched.
 # Everything here is synthetic: it proves the mechanics, not behaviour
@@ -2085,6 +2086,13 @@ bash "$SRC_WORK/tests/job_cleanup_tests.sh" > "$T/job_cleanup.out" 2>&1
 grep -E '^  (ok|FAIL) ' "$T/job_cleanup.out"
 PASS=$((PASS + $(grep -c '^  ok ' "$T/job_cleanup.out")))
 FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/job_cleanup.out")))
+
+echo
+echo "== HDR tool initialization under set -u (hdr_init_tests.sh)"
+bash "$SRC_WORK/tests/hdr_init_tests.sh" > "$T/hdr_init.out" 2>&1
+grep -E '^  (ok|FAIL|skipped:) ' "$T/hdr_init.out"
+PASS=$((PASS + $(grep -c '^  ok ' "$T/hdr_init.out")))
+FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/hdr_init.out")))
 
 echo
 echo "============================================================"
