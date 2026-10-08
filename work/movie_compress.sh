@@ -21,7 +21,7 @@ source "$WORK_DIR/lib/policy.sh"
 # (assigned empty: "set -u" rejects ${#INPUTS[@]} of a never-assigned
 # array when every movie was skipped)
 declare -a INPUTS=() OUTPUTS=() VIDEOS=() EST_VBYTES=() RETRIES=() FILTERS=() TIERS=() OVERWRITES=()
-declare -a DV_POLICIES=() DV_MODES=() HDR10P_POLICIES=() QUALITY_SPECS=()
+declare -a DV_POLICIES=() DV_MODES=() HDR10P_POLICIES=() QUALITY_SPECS=() CRF_EST_MAPS=()
 
 # Compression policy: ~/compress/work/lib/compress.conf (loaded and validated
 # by work/lib/policy.sh). The policy math lives there as well
@@ -430,7 +430,9 @@ while true; do
 
         # High / Base: re-encoded at CRF + 1 when the actual video is above
         # the ceiling, at CRF - 1 when it fits with CRF_DOWN_RETRY_HEADROOM_PCT
-        # to spare (up to CRF_DOWN_RETRY_MAX times, not below CRF_MIN)
+        # to spare and CRF - 1 is predicted to stay CRF_DOWN_RETRY_FIT_MARGIN_PCT
+        # below the ceiling (actual x the sampled CRF - 1 / CRF ratio,
+        # CRF_EST_MAPS) (up to CRF_DOWN_RETRY_MAX times, not below CRF_MIN)
         # (job_runtime.sh item_crf_encode). Not for Custom, and
         # not when CRF_MAX above the ceiling was already accepted below.
         # Quality: the same retry with the band's upper edge (never at or
@@ -451,7 +453,7 @@ while true; do
                 QUALITY_SPEC="$SOURCE_VIDEO_BYTES:0:$CRF_CEILING_BYTES:source-limited"
                 ;;
             *)
-                [[ "$TIER" != "Custom" ]] && RETRY_SPEC="$CRF_CEILING_BYTES:$CRF_MAX:$CRF_MIN:$CRF_DOWN_RETRY_HEADROOM_PCT:$CRF_DOWN_RETRY_MAX"
+                [[ "$TIER" != "Custom" ]] && RETRY_SPEC="$CRF_CEILING_BYTES:$CRF_MAX:$CRF_MIN:$CRF_DOWN_RETRY_HEADROOM_PCT:$CRF_DOWN_RETRY_MAX::$CRF_DOWN_RETRY_FIT_MARGIN_PCT"
                 ;;
         esac
 
@@ -615,6 +617,9 @@ while true; do
     EST_VBYTES+=("$EST_VIDEO_BYTES")
     RETRIES+=("$RETRY_SPEC")
     QUALITY_SPECS+=("$QUALITY_SPEC")
+    EST_MAP=""
+    [[ "$VIDEO_SPEC" == crf:* ]] && EST_MAP=$(crf_est_map)
+    CRF_EST_MAPS+=("$EST_MAP")
     FILTERS+=("$FILTER")
     TIERS+=("$TIER")
     OVERWRITES+=("$RESOLVED_OVERWRITE")
@@ -780,7 +785,8 @@ JOB_FILE="$WORK_DIR/$SESSION.sh"
             "${OVERWRITES[$i]}" \
             "${EST_VBYTES[$i]}" \
             "${RETRIES[$i]}" \
-            "${QUALITY_SPECS[$i]}"
+            "${QUALITY_SPECS[$i]}" \
+            "${CRF_EST_MAPS[$i]}"
     done
 
     emit_job_footer

@@ -446,12 +446,17 @@ crf_title_estimate() {
 #
 # A series batch: samples the episodes in CRF_SERIES_SAMPLED (indexes
 # into FILES / EP_VIDX / EP_DUR) with CRF_SERIES_FILTER, spreads the
-# result over every episode (series_crf_spread) and leaves the MEDIAN
-# episode estimate in CRF_EST_RESULT. Per-episode estimates are kept in
-# CRF_SERIES_EP_BYTES[crf] ("b0 b1 ...") and CRF_SERIES_EP_FROM[crf].
+# result over every episode (series_crf_spread) and leaves the LARGEST
+# REGULAR episode estimate in CRF_EST_RESULT (series_batch_stats
+# SB_DECIDE against CRF_CEILING_BYTES: an isolated outlier does not
+# decide the season CRF). Per-episode estimates are kept in
+# CRF_SERIES_EP_BYTES[crf] ("b0 b1 ...") and CRF_SERIES_EP_FROM[crf];
+# those of the sampled episodes also in CRF_EP_EST ("INDEX:CRF"), so
+# crf_episode_estimate does not encode them again.
 crf_series_estimate() {
     local crf="$1" i rates=() k=0 w=0 label
 
+    declare -gA CRF_EP_EST
     for i in "${!EP_DUR[@]}"; do
         rates[$i]="-"
     done
@@ -488,9 +493,53 @@ crf_series_estimate() {
     done
 
     series_crf_spread "${rates[@]}" || return 1
-    CRF_EST_RESULT="$SC_MEDIAN_BYTES"
+    series_batch_stats "${CRF_CEILING_BYTES:-0}" "${SC_EP_BYTES[@]}" || return 1
+    CRF_EST_RESULT="$SB_DECIDE"
     CRF_SERIES_EP_BYTES[$crf]="${SC_EP_BYTES[*]}"
     CRF_SERIES_EP_FROM[$crf]="${SC_EP_FROM[*]}"
+    for i in "${CRF_SERIES_SAMPLED[@]}"; do
+        CRF_EP_EST[$i:$crf]="${SC_EP_BYTES[$i]}"
+    done
+}
+
+# crf_episode_estimate INDEX CRF  (ESTIMATOR for series_episode_crf)
+#
+# One episode of the series batch (FILES / EP_VIDX / EP_DUR,
+# CRF_SERIES_FILTER, SERIES_CRF_SAMPLE_POINTS), sampled itself at CRF,
+# also when the batch estimate did not sample it. Leaves its video
+# estimate in CRF_EST_RESULT and remembers it in CRF_EP_EST
+# ("INDEX:CRF"); a remembered estimate is not encoded again (the
+# sections themselves are cached on disk as well, crf_sample_title).
+crf_episode_estimate() {
+    local i="$1" crf="$2" label cached=0
+
+    declare -gA CRF_EP_EST
+    label="${CRF_SERIES_LABELS[$i]:-$(basename "${FILES[$i]}")}"
+
+    if ui_verbose; then
+        printf '  sampling CRF %s, episode %s (%s)... ' "$crf" "$((i + 1))" "$(basename "${FILES[$i]}")"
+    else
+        printf '  %s  CRF %-4s ' "$label" "$crf"
+    fi
+
+    if [[ "${CRF_EP_EST[$i:$crf]:-}" =~ ^[0-9]+$ ]]; then
+        CRF_EST_RESULT="${CRF_EP_EST[$i:$crf]}"
+        cached=1
+    else
+        if ! crf_sample_title "${FILES[$i]}" "${EP_VIDX[$i]}" "${CRF_SERIES_FILTER:-}" "$crf" \
+                "${EP_DUR[$i]}" "$SERIES_CRF_SAMPLE_POINTS"; then
+            ui_err FAILED; echo
+            return 1
+        fi
+        CRF_EST_RESULT=$(crf_extrapolate "$CRF_SAMPLE_BYTES" "$CRF_SAMPLE_SECS" "${EP_DUR[$i]}")
+        CRF_EP_EST[$i:$crf]="$CRF_EST_RESULT"
+    fi
+
+    if ui_verbose; then
+        echo "~$(size_text "$CRF_EST_RESULT") video$( (( cached == 1 )) && echo " (already sampled)")"
+    else
+        echo "~$(bytes_to_gib "$CRF_EST_RESULT") GiB$( (( cached == 1 )) && echo " (already sampled)")"
+    fi
 }
 
 # ------------------------------------------------------------
@@ -1167,21 +1216,26 @@ emit_failed_item() {
     printf 'fi\n\n'
 }
 
-# emit_encode_item INDEX IN OUT TIER VIDEO FILTER PASSLOG OVERWRITE [EST_VIDEO_BYTES [RETRY [QUALITY]]]
+# emit_encode_item INDEX IN OUT TIER VIDEO FILTER PASSLOG OVERWRITE [EST_VIDEO_BYTES [RETRY [QUALITY [CRF_EST]]]]
 #
 # VIDEO selects the video encode of the main video stream:
 #   crf:N   single-pass libx265 CRF encode (movie Quality, High, Base, Custom;
 #           series High, Base, Custom). No -b:v, no pass logs (PASSLOG is ignored).
 #           EST_VIDEO_BYTES, the pre-encode estimate, is reported against
 #           the actual size afterwards (never a failure).
-#           RETRY "CEILING_BYTES:CRF_MAX:CRF_MIN:HEADROOM_PCT:DOWN_MAX[:batch]"
+#           RETRY "CEILING_BYTES:CRF_MAX:CRF_MIN:HEADROOM_PCT:DOWN_MAX[:batch[:FIT_PCT]]"
 #           (High / Base / Quality): an attempt whose actual VIDEO bytes are above
 #           the ceiling is re-encoded at CRF + 1 up to CRF_MAX; one that
 #           fits at least HEADROOM_PCT below the ceiling tries CRF - 1
 #           (not below CRF_MIN, at most DOWN_MAX times; job_runtime.sh
-#           item_crf_encode). ":batch" (series): the episode joins the
-#           job's one-CRF season batch (job_crf_batch) instead of being
-#           encoded on its own. "" = no retry (Custom).
+#           item_crf_encode). FIT_PCT (High / Base): CRF - 1 only when
+#           its predicted size (actual x CRF_EST ratio) stays FIT_PCT
+#           below the ceiling. ":batch" (job scripts of earlier
+#           versions): the episode joins a one-CRF season batch
+#           (job_crf_batch); series episodes are now items of their own
+#           (field empty). "" = no retry (Custom).
+#           CRF_EST "CRF=BYTES:..." the pre-encode estimates per CRF (for
+#           the FIT_PCT prediction).
 #           The encode commands are a function (item_encode_INDEX) so a
 #           retry can run them again; they carry the planned CRF, which
 #           item_run replaces for a retry attempt.
@@ -1218,8 +1272,9 @@ emit_encode_item() {
     local est="${9:-}"
     local retry="${10:-}"
     local quality="${11:-}"
+    local crf_est="${12:-}"
 
-    local mode kbps="" crf="" rceil="" rmax="" rmin="" rdpct="" rdmax="" rbatch=""
+    local mode kbps="" crf="" rceil="" rmax="" rmin="" rdpct="" rdmax="" rbatch="" rfit=""
     local qtarget="" qmin="" qmax="" qstatus=""
 
     case "$video" in
@@ -1232,7 +1287,7 @@ emit_encode_item() {
     [[ "$mode" == "abr" ]] || passlog=""
     [[ "$est" =~ ^[0-9]+$ ]] || est=""
     if [[ "$mode" == "crf" && -n "$retry" ]]; then
-        IFS=: read -r rceil rmax rmin rdpct rdmax rbatch <<< "$retry"
+        IFS=: read -r rceil rmax rmin rdpct rdmax rbatch rfit <<< "$retry"
     fi
     if [[ "$mode" == "crf" && -n "$quality" ]]; then
         IFS=: read -r qtarget qmin qmax qstatus <<< "$quality"
@@ -1347,6 +1402,11 @@ emit_encode_item() {
         expect+=$(printf ' qtarget_vbytes=%q qmin_vbytes=%q qmax_vbytes=%q qstatus=%q' "$qtarget" "$qmin" "$qmax" "${qstatus:-band}")
     [[ "$mode" == "crf" && -n "$qtarget" && "${qstatus:-band}" == band ]] &&
         expect+=$(printf ' down_below_vbytes=%q' "$qmin")
+    # High / Base: lower CRF only when predicted to fit (job_runtime.sh)
+    [[ "$mode" == "crf" && -n "$rfit" ]] &&
+        expect+=$(printf ' down_fit_pct=%q' "$rfit")
+    [[ "$mode" == "crf" && "$crf_est" =~ ^[0-9.]+=[0-9]+(:[0-9.]+=[0-9]+)*$ ]] &&
+        expect+=$(printf ' crf_est=%q' "$crf_est")
 
     # CRF-independent preparation (run once, not per CRF attempt)
     [[ "$dv_policy" == "preserve" ]] &&

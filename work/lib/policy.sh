@@ -16,6 +16,7 @@ POLICY_KEYS_POSITIVE=(
     MOVIE_QUALITY_TARGET_VIDEO_GIB MOVIE_QUALITY_ACCEPT_MIN_GIB MOVIE_QUALITY_ACCEPT_MAX_GIB
     MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB MOVIE_BASE_VIDEO_SIZE_CEILING_GIB
     SERIES_HIGH_VIDEO_SIZE_CEILING_GIB SERIES_BASE_VIDEO_SIZE_CEILING_GIB
+    SERIES_CRF_OUTLIER_PCT
     CRF_SAMPLE_SECONDS
     AUDIO_HIGH_TRIGGER_KBPS AUDIO_COMPACT_TRIGGER_GIB AUDIO_COMPACT_LIMIT_GIB
     AUDIO_HIGH_KBPS_1 AUDIO_HIGH_KBPS_2 AUDIO_HIGH_KBPS_3TO4
@@ -169,11 +170,19 @@ validate_policy() {
          awk -v x="$CRF_DOWN_RETRY_HEADROOM_PCT" 'BEGIN { exit !(x >= 100) }'; then
         errs+=("CRF_DOWN_RETRY_HEADROOM_PCT=\"$CRF_DOWN_RETRY_HEADROOM_PCT\": not a number 0-99")
     fi
-    if [[ -z "${CRF_DOWN_RETRY_MAX+x}" ]]; then
-        errs+=("CRF_DOWN_RETRY_MAX is not set")
-    elif [[ ! "$CRF_DOWN_RETRY_MAX" =~ ^[0-9]+$ ]]; then
-        errs+=("CRF_DOWN_RETRY_MAX=\"$CRF_DOWN_RETRY_MAX\": must be a whole number (0 = off)")
+    if [[ -z "${CRF_DOWN_RETRY_FIT_MARGIN_PCT+x}" ]]; then
+        errs+=("CRF_DOWN_RETRY_FIT_MARGIN_PCT is not set")
+    elif ! _policy_is_num "$CRF_DOWN_RETRY_FIT_MARGIN_PCT" ||
+         awk -v x="$CRF_DOWN_RETRY_FIT_MARGIN_PCT" 'BEGIN { exit !(x >= 100) }'; then
+        errs+=("CRF_DOWN_RETRY_FIT_MARGIN_PCT=\"$CRF_DOWN_RETRY_FIT_MARGIN_PCT\": not a number 0-99")
     fi
+    for k in CRF_DOWN_RETRY_MAX SERIES_CRF_DOWN_RETRY_MAX; do
+        if [[ -z "${!k+x}" ]]; then
+            errs+=("$k is not set")
+        elif [[ ! "${!k}" =~ ^[0-9]+$ ]]; then
+            errs+=("$k=\"${!k}\": must be a whole number (0 = off)")
+        fi
+    done
 
     if _policy_is_num "${AUDIO_COMPACT_LIMIT_GIB:-}" && _policy_is_num "${AUDIO_COMPACT_TRIGGER_GIB:-}" &&
        awk -v l="$AUDIO_COMPACT_LIMIT_GIB" -v t="$AUDIO_COMPACT_TRIGGER_GIB" 'BEGIN { exit !(l > t) }'; then
@@ -208,7 +217,8 @@ load_policy() {
         "${POLICY_KEYS_CRF[@]}" "${POLICY_KEYS_COUNT[@]}" \
         "${POLICY_KEYS_RETIRED[@]}" "${POLICY_KEYS_RETIRED_VIDEO[@]}" \
         "${POLICY_KEYS_RETIRED_QUALITY[@]}" \
-        SERIES_CONTAINER_RESERVE_PCT CRF_DOWN_RETRY_HEADROOM_PCT CRF_DOWN_RETRY_MAX
+        SERIES_CONTAINER_RESERVE_PCT CRF_DOWN_RETRY_HEADROOM_PCT CRF_DOWN_RETRY_MAX \
+        CRF_DOWN_RETRY_FIT_MARGIN_PCT SERIES_CRF_DOWN_RETRY_MAX
 
     # shellcheck source=/dev/null
     if ! source "$conf"; then
@@ -425,9 +435,9 @@ crf_policy_lines() {
             echo "  CRF: ${CRF_MIN:-entered in the menu} (used exactly; no size ceiling)"
         fi
     elif [[ "$scope" == series ]]; then
-        echo "  CRF range: ${CRF_MIN}-${CRF_MAX} (${CRF_MIN} preferred; raised only while the median episode is above the ceiling)"
-        echo "  nominal video ceiling: ${CRF_CEILING_GIB} GiB/episode (episodes above it are listed, same CRF)"
-        echo "  one CRF for every episode of the batch"
+        echo "  CRF range: ${CRF_MIN}-${CRF_MAX} (${CRF_MIN} preferred; raised only while a regular episode is above the ceiling)"
+        echo "  video ceiling: ${CRF_CEILING_GIB} GiB/episode"
+        echo "  one season CRF; only an isolated outlier (> median +${SERIES_CRF_OUTLIER_PCT}%) gets its own higher CRF"
     else
         echo "  CRF range: ${CRF_MIN}-${CRF_MAX} (${CRF_MIN} preferred, raised only to fit the ceiling)"
         echo "  video size ceiling: ${CRF_CEILING_GIB} GiB"
@@ -679,33 +689,56 @@ crf_analysis_lines() {
     done
 }
 
+# crf_est_map  ->  "CRF=BYTES:..." of every CRF estimated (CRF_TRIED /
+# CRF_EST); the job uses it to predict a lower CRF's size (item_expect
+# crf_est=)
+crf_est_map() {
+    local c out=""
+
+    for c in "${CRF_TRIED[@]}"; do
+        out+="${out:+:}$c=${CRF_EST[$c]}"
+    done
+    printf '%s' "$out"
+}
+
 # ------------------------------------------------------------
 # Series CRF
 #
-# One CRF for the whole batch (season / folder), so episodes look the
-# same. Episodes are sampled (SERIES_CRF_SAMPLE_EPISODES of them, spread
-# over the batch, SERIES_CRF_SAMPLE_POINTS sections each); an episode
-# that is not sampled gets the median sampled video bitrate. For each
-# candidate CRF (from CRF_MIN up) every episode's video size is
-# estimated, and the batch counts as fitting when the MEDIAN episode
-# estimate is within the per-episode ceiling. One unusually complex
-# episode therefore does not push every episode to a worse CRF; it is
-# listed as above the ceiling instead. The CRF never varies per episode.
+# One SEASON CRF for the batch (season / folder), so episodes look the
+# same; only an isolated outlier episode gets its own, higher CRF.
+# Episodes are sampled (SERIES_CRF_SAMPLE_EPISODES of them spread over
+# the batch, plus the longest episode; SERIES_CRF_SAMPLE_POINTS sections
+# each); an episode that is not sampled is estimated conservatively from
+# the highest sampled bitrate (series_crf_spread). For each candidate
+# CRF (from CRF_MIN up) every episode's video size is estimated and
+# series_batch_stats sorts the episodes:
+#   outlier   estimate above median episode x (1 + SERIES_CRF_OUTLIER_PCT/100)
+#   isolated  the ONLY outlier of a batch of 3+ episodes; two or more
+#             outliers are the season's difficulty and count as regular
+#   regular   every other episode: ALL of them must fit the ceiling
+# The season CRF is the first CRF whose largest regular episode fits;
+# the isolated outlier then gets the lowest CRF from the season CRF up
+# whose own estimate fits (series_episode_crf). Never above CRF_MAX.
 # ------------------------------------------------------------
 
-# series_sample_episodes COUNT WANTED  ->  episode indexes to sample,
-# spread over the batch (first and last included), one per line
+# series_sample_episodes COUNT WANTED [ALSO]  ->  episode indexes to
+# sample, spread over the batch (first and last included), ascending,
+# one per line; ALSO (the longest episode) is added when it is not
+# among them
 series_sample_episodes() {
-    awk -v n="$1" -v k="$2" 'BEGIN {
+    awk -v n="$1" -v k="$2" -v x="${3:-}" 'BEGIN {
         if (k >= n) { for (i = 0; i < n; i++) print i; exit }
-        if (k <= 1) { print int((n - 1) / 2); exit }
-        last = -1
-        for (j = 0; j < k; j++) {
-            i = int(j * (n - 1) / (k - 1) + 0.5)
-            if (i != last) print i
-            last = i
-        }
+        if (k <= 1) pick[int((n - 1) / 2)] = 1
+        else for (j = 0; j < k; j++) pick[int(j * (n - 1) / (k - 1) + 0.5)] = 1
+        if (x ~ /^[0-9]+$/ && x + 0 < n) pick[x + 0] = 1
+        for (i = 0; i < n; i++) if (i in pick) print i
     }'
+}
+
+# series_longest_episode  ->  index of the longest episode (EP_DUR; the
+# first one on a tie)
+series_longest_episode() {
+    printf '%s\n' "${EP_DUR[@]}" | awk '$1 + 0 > m || NR == 1 { m = $1 + 0; i = NR - 1 } END { if (NR) print i }'
 }
 
 # _median VALUE...  ->  median (mean of the two middle values for an
@@ -720,14 +753,23 @@ _median() {
 # series_crf_spread RATE...
 #
 # RATE: per episode (EP_DUR order) the sampled video bytes per second,
-# or "-" when that episode was not sampled. Reads EP_DUR.
+# or "-" when that episode was not sampled. Reads EP_DUR and
+# SERIES_CRF_OUTLIER_PCT.
+#
+# An episode that was not sampled may be as difficult as any sampled
+# one, so it gets the HIGHEST sampled bitrate (the median would hide a
+# difficult episode). Only with 3+ sampled episodes, a SINGLE sampled
+# rate more than SERIES_CRF_OUTLIER_PCT above the median sampled rate is
+# an isolated outlier: that episode keeps its own estimate, and the next
+# highest rate fills the others. Two or more such rates are the season's
+# difficulty and the highest is used.
 #
 # Sets:
 #   SC_EP_BYTES[i]    estimated video bytes of episode i
-#   SC_EP_FROM[i]     "sample" or "median" (median sampled bitrate)
+#   SC_EP_FROM[i]     "sample", or "highest" (not sampled: SC_FILL_RATE)
 #   SC_MEDIAN_RATE    median sampled bytes/s
-#   SC_MEDIAN_BYTES   median of the episode estimates (the batch value
-#                     crf_select compares with the per-episode ceiling)
+#   SC_FILL_RATE      bytes/s given to the episodes that were not sampled
+#   SC_MEDIAN_BYTES   median of the episode estimates
 series_crf_spread() {
     local rates=("$@") i sampled=()
 
@@ -739,17 +781,21 @@ series_crf_spread() {
     done
     (( ${#sampled[@]} )) || return 1
 
-    SC_MEDIAN_RATE=$(printf '%s\n' "${sampled[@]}" | sort -g | awk '{ v[NR] = $1 } END {
-        if (NR % 2) printf "%.3f", v[(NR + 1) / 2]
-        else printf "%.3f", (v[NR / 2] + v[NR / 2 + 1]) / 2 }')
+    read -r SC_MEDIAN_RATE SC_FILL_RATE < <(printf '%s\n' "${sampled[@]}" | sort -g |
+        awk -v p="$SERIES_CRF_OUTLIER_PCT" '{ v[NR] = $1 } END {
+            med = (NR % 2) ? v[(NR + 1) / 2] : (v[NR / 2] + v[NR / 2 + 1]) / 2
+            hi = 0
+            for (i = 1; i <= NR; i++) if (v[i] > med * (1 + p / 100)) hi++
+            fill = (NR >= 3 && hi == 1) ? v[NR - 1] : v[NR]
+            printf "%.3f %.3f\n", med, fill }')
 
     for i in "${!EP_DUR[@]}"; do
         if [[ "${rates[$i]:-}" =~ ^[0-9.]+$ ]]; then
             SC_EP_BYTES[$i]=$(awk -v r="${rates[$i]}" -v d="${EP_DUR[$i]}" 'BEGIN { printf "%.0f", r * d }')
             SC_EP_FROM[$i]="sample"
         else
-            SC_EP_BYTES[$i]=$(awk -v r="$SC_MEDIAN_RATE" -v d="${EP_DUR[$i]}" 'BEGIN { printf "%.0f", r * d }')
-            SC_EP_FROM[$i]="median"
+            SC_EP_BYTES[$i]=$(awk -v r="$SC_FILL_RATE" -v d="${EP_DUR[$i]}" 'BEGIN { printf "%.0f", r * d }')
+            SC_EP_FROM[$i]="highest"
         fi
     done
 
@@ -759,39 +805,190 @@ series_crf_spread() {
 # series_batch_stats CEILING_BYTES VIDEO_BYTES...
 #
 # Season figures for one CRF. VIDEO_BYTES: estimated video bytes per
-# episode (EP_DUR order). CEILING_BYTES 0 = no ceiling (Custom).
+# episode (EP_DUR order). CEILING_BYTES 0 = no ceiling (Custom). Reads
+# SERIES_CRF_OUTLIER_PCT.
 #
 # Sets:
-#   SB_MEDIAN    median episode video bytes (what the ceiling is checked on)
-#   SB_LARGEST   largest episode video bytes
-#   SB_TOTAL     sum of the episode video bytes
-#   SB_ABOVE     indexes of the episodes above the nominal ceiling
-#   SB_FITS      1 when the median episode fits the ceiling (always 1
-#                without a ceiling)
+#   SB_MEDIAN     median episode video bytes
+#   SB_LARGEST    largest episode video bytes
+#   SB_TOTAL      sum of the episode video bytes
+#   SB_LIMIT      outlier threshold: SB_MEDIAN x (1 + SERIES_CRF_OUTLIER_PCT/100)
+#   SB_OUTLIERS   indexes of the episodes above SB_LIMIT
+#   SB_ISOLATED   index of the isolated outlier: the only outlier of a
+#                 batch of 3+ episodes ("" = none)
+#   SB_DECIDE     largest REGULAR episode (all but SB_ISOLATED): what the
+#                 season CRF is checked on (crf_series_estimate)
+#   SB_ABOVE      indexes of the episodes above the ceiling
+#   SB_FITS       1 when SB_DECIDE fits the ceiling (always 1 without one)
 series_batch_stats() {
     local ceil="$1" i
     shift
     local vb=("$@")
 
     SB_ABOVE=()
+    SB_OUTLIERS=()
+    SB_ISOLATED=""
     SB_MEDIAN=$(_median "${vb[@]}") || return 1
     read -r SB_LARGEST SB_TOTAL < <(printf '%s\n' "${vb[@]}" |
         awk '{ t += $1; if (NR == 1 || $1 > m) m = $1 } END { printf "%.0f %.0f\n", m, t }')
+    SB_LIMIT=$(awk -v m="$SB_MEDIAN" -v p="$SERIES_CRF_OUTLIER_PCT" 'BEGIN { printf "%.0f", m * (1 + p / 100) }')
 
-    if (( ceil > 0 )); then
-        for i in "${!vb[@]}"; do
-            (( vb[i] > ceil )) && SB_ABOVE+=("$i")
-        done
+    for i in "${!vb[@]}"; do
+        (( vb[i] > SB_LIMIT )) && SB_OUTLIERS+=("$i")
+        (( ceil > 0 && vb[i] > ceil )) && SB_ABOVE+=("$i")
+    done
+    if (( ${#vb[@]} >= 3 && ${#SB_OUTLIERS[@]} == 1 )); then
+        SB_ISOLATED="${SB_OUTLIERS[0]}"
     fi
 
+    SB_DECIDE=0
+    for i in "${!vb[@]}"; do
+        [[ "$i" == "$SB_ISOLATED" ]] && continue
+        (( vb[i] > SB_DECIDE )) && SB_DECIDE="${vb[i]}"
+    done
+
     SB_FITS=0
-    (( ceil <= 0 || SB_MEDIAN <= ceil )) && SB_FITS=1
+    (( ceil <= 0 || SB_DECIDE <= ceil )) && SB_FITS=1
+    return 0
+}
+
+# series_episode_crf INDEX FROM_CRF CRF_MAX CEILING_BYTES ESTIMATOR
+#
+# Own CRF of the isolated outlier: from FROM_CRF (the season CRF) up,
+# the first CRF whose estimate for episode INDEX fits the ceiling, never
+# above CRF_MAX. ESTIMATOR INDEX CRF leaves that episode's video bytes in
+# CRF_EST_RESULT (non-zero = failed).
+#
+# Sets EPC_CRF (chosen CRF), EPC_BYTES (its estimate), EPC_TRIED (CRFs
+# estimated, in order) and EPC_OVER (1 when even CRF_MAX does not fit).
+# Returns 1 when an estimate failed (EPC_CRF empty).
+series_episode_crf() {
+    local i="$1" from="$2" max="$3" ceil="$4" est="$5" c
+
+    EPC_CRF=""
+    EPC_BYTES=""
+    EPC_OVER=0
+    EPC_TRIED=()
+
+    for ((c = 10#$from; c <= 10#$max; c++)); do
+        CRF_EST_RESULT=""
+        if ! "$est" "$i" "$c" || [[ ! "$CRF_EST_RESULT" =~ ^[0-9]+$ ]]; then
+            EPC_CRF=""
+            return 1
+        fi
+        EPC_TRIED+=("$c")
+        EPC_CRF="$c"
+        EPC_BYTES="$CRF_EST_RESULT"
+        if (( ceil <= 0 || CRF_EST_RESULT <= ceil )); then
+            return 0
+        fi
+    done
+
+    EPC_OVER=1
+    return 0
+}
+
+# series_est_map INDEX  ->  "CRF=BYTES:..." of episode INDEX for the job's
+# lower-CRF prediction: its season estimates (CRF_SERIES_EP_BYTES over
+# CRF_TRIED), its own sampled estimates (CRF_EP_EST "INDEX:CRF") taking
+# precedence
+series_est_map() {
+    local i="$1" c k out=""
+    local -a eb
+    local -A m=()
+
+    for c in "${CRF_TRIED[@]}"; do
+        read -ra eb <<< "${CRF_SERIES_EP_BYTES[$c]:-}"
+        [[ -n "${eb[i]:-}" ]] && m[$c]="${eb[i]}"
+    done
+    for k in ${CRF_EP_EST[@]+"${!CRF_EP_EST[@]}"}; do
+        [[ "${k%%:*}" == "$i" ]] && m[${k#*:}]="${CRF_EP_EST[$k]}"
+    done
+    for c in $(printf '%s\n' ${m[@]+"${!m[@]}"} | sort -n); do
+        out+="${out:+:}$c=${m[$c]}"
+    done
+    printf '%s' "$out"
+}
+
+# series_guard_episodes ESTIMATOR
+#
+# Source-quality guard of the series menu: GUARD = indexes of the
+# episodes whose estimate at their CRF (EP_CRF / EP_EST) is not below
+# their source video (EP_VBYTES). An episode flagged only from the
+# conservative not-sampled estimate (EP_FROM not "sample": highest
+# sampled bitrate x runtime) is first estimated itself at its CRF
+# (ESTIMATOR INDEX CRF, e.g. crf_episode_estimate, cached) and only kept
+# when its own estimate still is not below the source; EP_EST / EP_FROM
+# take the own estimate. Episodes skipped at the ceiling (EP_CEIL_SKIP)
+# are left out. GUARD_SAMPLED = the episodes sampled here. Prints a
+# header line before the first such sample. Returns 1 when an estimate
+# failed.
+series_guard_episodes() {
+    local est="$1" i
+
+    GUARD=()
+    GUARD_SAMPLED=()
+
+    for i in "${!EP_EST[@]}"; do
+        (( ${EP_CEIL_SKIP[i]:-0} == 1 )) && continue
+        crf_above_source "${EP_EST[$i]}" "${EP_VBYTES[$i]:-}" || continue
+
+        if [[ "${EP_FROM[$i]:-}" != sample ]]; then
+            if (( ${#GUARD_SAMPLED[@]} == 0 )); then
+                echo
+                echo "Source check (not sampled; estimated at or above the source video):"
+            fi
+            CRF_EST_RESULT=""
+            if ! "$est" "$i" "${EP_CRF[$i]}" || [[ ! "$CRF_EST_RESULT" =~ ^[0-9]+$ ]]; then
+                return 1
+            fi
+            EP_EST[$i]="$CRF_EST_RESULT"
+            EP_FROM[$i]="sample"
+            GUARD_SAMPLED+=("$i")
+            crf_above_source "${EP_EST[$i]}" "${EP_VBYTES[$i]:-}" || continue
+        fi
+
+        GUARD+=("$i")
+    done
+    return 0
+}
+
+# series_late_ceiling ESTIMATOR
+#
+# After series_guard_episodes: an episode whose not-sampled estimate was
+# replaced by its own sample there (GUARD_SAMPLED) and is now above the
+# per-episode ceiling gets its own CRF before the encode: from its
+# current CRF up (series_episode_crf with ESTIMATOR, e.g.
+# crf_episode_estimate; its own sample at the current CRF is reused
+# from the cache), never above CRF_MAX. The season CRF and every other
+# episode stay as they are. Updates EP_CRF / EP_EST / EP_OVER (1: still
+# above the ceiling at CRF_MAX). LATE = the episodes changed. Reads
+# CRF_CEILING_BYTES (0, Custom: nothing to do) and CRF_MAX. Prints a
+# header line before the first one. Returns 1 when an estimate failed.
+series_late_ceiling() {
+    local est="$1" i
+
+    LATE=()
+    (( ${CRF_CEILING_BYTES:-0} > 0 )) || return 0
+
+    for i in ${GUARD_SAMPLED[@]+"${GUARD_SAMPLED[@]}"}; do
+        (( EP_EST[i] > CRF_CEILING_BYTES )) || continue
+        if (( ${#LATE[@]} == 0 )); then
+            echo
+            echo "Ceiling check (own sample above the ceiling at its CRF):"
+        fi
+        series_episode_crf "$i" "${EP_CRF[$i]}" "$CRF_MAX" "$CRF_CEILING_BYTES" "$est" || return 1
+        EP_CRF[$i]="$EPC_CRF"
+        EP_EST[$i]="$EPC_BYTES"
+        EP_OVER[$i]="$EPC_OVER"
+        LATE+=("$i")
+    done
     return 0
 }
 
 # series_crf_analysis_lines  ->  per tried CRF: median / largest episode,
-# episodes above the nominal ceiling, fits or not. Reads CRF_TRIED,
-# CRF_SERIES_EP_BYTES, CRF_CEILING_BYTES, CRF_CEILING_GIB.
+# outliers, episodes above the ceiling, fits or not. Reads CRF_TRIED,
+# CRF_SERIES_EP_BYTES, CRF_CEILING_BYTES, CRF_CEILING_GIB, FILES.
 series_crf_analysis_lines() {
     local c eb
 
@@ -801,10 +998,15 @@ series_crf_analysis_lines() {
         echo "  CRF $c:"
         echo "    median episode:  $(size_text "$SB_MEDIAN") video"
         echo "    largest episode: $(size_text "$SB_LARGEST") video"
+        if [[ -n "$SB_ISOLATED" ]]; then
+            echo "    isolated outlier: $(basename "${FILES[$SB_ISOLATED]:-episode $((SB_ISOLATED + 1))}") ($(size_text "${eb[SB_ISOLATED]}"), above median +${SERIES_CRF_OUTLIER_PCT}%)"
+        elif (( ${#SB_OUTLIERS[@]} > 1 )); then
+            echo "    ${#SB_OUTLIERS[@]} episodes above median +${SERIES_CRF_OUTLIER_PCT}% (season difficulty, not outliers)"
+        fi
         if (( ${CRF_CEILING_BYTES:-0} > 0 )); then
-            echo "    ceiling:         ${CRF_CEILING_GIB} GiB/episode (nominal)"
+            echo "    ceiling:         ${CRF_CEILING_GIB} GiB/episode"
             printf '    -> %s; %d of %d episode(s) above the ceiling\n' \
-                "$( (( SB_FITS == 1 )) && echo "median fits" || echo "median above the ceiling")" \
+                "$( (( SB_FITS == 1 )) && echo "regular episodes fit" || echo "regular episode above the ceiling")" \
                 "${#SB_ABOVE[@]}" "${#eb[@]}"
         fi
     done

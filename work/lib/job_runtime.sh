@@ -20,12 +20,16 @@
 # counted) above the ceiling reject the attempt and the encode is
 # repeated at CRF + 1, up to crf_max (item_crf_encode). A result that
 # fits with at least down_headroom_pct to spare tries CRF - 1 (down to
-# crf_min, at most down_max times); a lower attempt above the ceiling is
+# crf_min, at most down_max times; High / Base also only when CRF - 1 is
+# predicted to fit, down_fit_pct); a lower attempt above the ceiling is
 # discarded and the fitting one kept. Movie Quality uses the upper edge
 # of its acceptable band as the ceiling and tries CRF - 1 only while the
-# actual video is below the band (down_below_vbytes). Series
-# batches (job_crf_batch) keep one CRF for every episode: the MEDIAN
-# episode's actual video decides, and the whole season is re-encoded.
+# actual video is below the band (down_below_vbytes). Series episodes
+# are items of their own: each is checked and retried alone, at its own
+# CRF (the season CRF, or an isolated outlier's higher CRF). Job scripts
+# of earlier versions may still hold a season batch (job_crf_batch: one
+# CRF for every episode, the MEDIAN episode decides, the whole season is
+# re-encoded).
 # Retries write "<output>.retry-crf<N>.part"; a completed earlier
 # attempt is only deleted once a later one has completed, and is kept
 # (not deleted) when the job is interrupted. Custom CRF never retries.
@@ -822,7 +826,9 @@ record_crf_estimate() {
 #   2. down: from the attempt that fits, while its video is at least
 #            down_headroom_pct below the ceiling, try CRF - 1 (not below
 #            crf_min, at most down_max times, never a CRF already found
-#            above the ceiling). A lower attempt that fits replaces the
+#            above the ceiling; with down_fit_pct only when the actual
+#            video x the estimated CRF - 1 / CRF ratio (crf_est) stays
+#            down_fit_pct below the ceiling). A lower attempt that fits replaces the
 #            accepted one; one above the ceiling (or failing) is
 #            discarded and the accepted encode is kept. The accepted
 #            encode is renamed to "<output>.accepted-crf<N>.part" first
@@ -846,6 +852,26 @@ item_video_bytes() {
     read -r v a <<< "$(media_stream_totals "$1")"
     [[ "$v" =~ ^[0-9]+$ ]] || v=0
     printf '%s' "$v"
+}
+
+# Lower-CRF prediction (down_fit_pct): CRF - 1 is assumed this much
+# larger than CRF when the pre-encode estimates (crf_est) do not cover
+# both CRFs, and never less than CRF_STEP_RATIO_MIN (noisy estimates
+# must not make a lower CRF look free).
+CRF_STEP_RATIO_DEFAULT=1.15
+CRF_STEP_RATIO_MIN=1.08
+
+# _crf_step_ratio LOWER_CRF CRF  ->  expected video size ratio LOWER / CRF
+# from ITEM_EXP[crf_est] ("CRF=BYTES:..."), else CRF_STEP_RATIO_DEFAULT;
+# never below CRF_STEP_RATIO_MIN
+_crf_step_ratio() {
+    awk -v m="${ITEM_EXP[crf_est]:-}" -v lo="$1" -v c="$2" \
+        -v d="$CRF_STEP_RATIO_DEFAULT" -v f="$CRF_STEP_RATIO_MIN" 'BEGIN {
+        n = split(m, kv, ":")
+        for (i = 1; i <= n; i++) if (split(kv[i], p, "=") == 2) e[p[1] + 0] = p[2] + 0
+        r = ((lo + 0) in e && (c + 0) in e && e[lo + 0] > 0 && e[c + 0] > 0) ? e[lo + 0] / e[c + 0] : d
+        if (r < f) r = f
+        printf "%.4f", r }'
 }
 
 # _down_threshold CEILING_BYTES HEADROOM_PCT  ->  bytes at or below which
@@ -976,7 +1002,7 @@ _drop_attempt() {
 item_crf_encode() {
     local fn="$1"
     local planned="${ITEM_EXP[crf]:-}" ceil max min c act prev="" prev_crf="" ok
-    local thr down_max downs=0 nc a2 acc why="Headroom large"
+    local thr down_max downs=0 nc a2 acc why="Headroom large" fit pred lim
     local -A over=()
 
     ITEM_EXP[crf_planned]="$planned"
@@ -994,6 +1020,8 @@ item_crf_encode() {
     down_max="${ITEM_EXP[down_max]:-0}"
     [[ "$down_max" =~ ^[0-9]+$ ]] || down_max=0
     thr=$(_down_threshold "$ceil" "${ITEM_EXP[down_headroom_pct]:-}")
+    fit="${ITEM_EXP[down_fit_pct]:-}"
+    [[ "$fit" =~ ^[0-9]+([.][0-9]+)?$ ]] || fit=""
     # movie Quality: lower CRF only while the actual video is below the
     # acceptable band (inside the band nothing is re-encoded)
     if [[ "${ITEM_EXP[down_below_vbytes]:-}" =~ ^[0-9]+$ ]]; then
@@ -1077,6 +1105,17 @@ item_crf_encode() {
             break
         fi
         [[ -n "${over[$nc]:-}" ]] && break
+
+        # High / Base: only a lower CRF that is predicted to fit
+        if [[ -n "$fit" ]]; then
+            read -r pred lim < <(awk -v a="$act" -v r="$(_crf_step_ratio "$nc" "$c")" -v cl="$ceil" -v p="$fit" \
+                'BEGIN { printf "%.0f %.0f\n", a * r, cl * (100 - p) / 100 }')
+            if (( pred > lim )); then
+                echo "$why, but CRF $nc is predicted at $(_gib "$pred") GiB, above the $(_gib "$lim") GiB limit (${fit}% below the ceiling); keeping CRF $c"
+                break
+            fi
+            echo "CRF $nc predicted: $(_gib "$pred") GiB / $(_gib "$lim") GiB limit"
+        fi
 
         if ! _keep_accepted "$ITEM_PART" "$ITEM_OUTPUT" "$c"; then
             ITEM_PART="$KEPT_PART"
@@ -1228,6 +1267,11 @@ _batch_season() {
 
 # job_crf_batch  ->  encodes the series batch (job_batch_add) with ONE
 # CRF for every episode
+#
+# Only for job scripts generated by earlier versions (":batch" retry
+# field): series episodes are now items of their own (item_crf_encode),
+# so one episode above the ceiling is retried alone. Without a batch
+# this does nothing.
 #
 # Every episode is encoded at the planned CRF into its .part file. With
 # a ceiling (High / Base) the MEDIAN episode's actual main video bytes

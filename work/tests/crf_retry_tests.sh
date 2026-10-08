@@ -5,8 +5,10 @@
 #   bash ~/compress/work/tests/crf_retry_tests.sh
 #
 # Part 1 runs generated-style jobs with a stand-in encoder (sizes per
-# CRF, no ffmpeg): movie retry rules, series one-CRF batch on the median
-# episode, logging, temporary files, interruption, other sessions.
+# CRF, no ffmpeg): movie retry rules, series episodes retried one by one
+# (own CRF, predicted-fit check of a lower CRF), the season batch of job
+# scripts from earlier versions (median episode), logging, temporary
+# files, interruption, other sessions.
 # Part 2 (ffmpeg with libx265 needed) generates real jobs for a 2 s
 # synthetic source and checks that the output verification expects the
 # ACCEPTED CRF after retries.
@@ -232,7 +234,7 @@ check "Quality: CRF retry enabled"            "ITEM_EXP=([mode]=crf [crf]=9 [cei
 
 # ------------------------------------------------------------
 echo
-echo "== series (one CRF per season, median episode decides)"
+echo "== series season batch of earlier job scripts (one CRF per season, median episode decides)"
 
 # series_job SESSION N SIZES...  (High: ceiling 5 GiB/episode, CRF 18-21)
 series_job() {
@@ -365,7 +367,7 @@ rm -f "$T"/out/M.mkv*
 
 # ------------------------------------------------------------
 echo
-echo "== series: lower-CRF retry (one CRF per season, median decides)"
+echo "== series season batch of earlier job scripts: lower-CRF retry (median decides)"
 
 SERIES_EXTRA="$DOWN"
 series_job e12 3 "[1:18]='$(gib 3.0) 1' [2:18]='$(gib 3.2) 1' [3:18]='$(gib 3.4) 1'" \
@@ -401,6 +403,101 @@ series_job e8 3 "[1:18]='$(gib 3) 1' [2:18]='$(gib 3) 1' [3:18]='$(gib 3) 1' [1:
 check "season trial fails: CRF 18 kept"       "[[ '$(final_crfs)' == '18 18 18 ' && '$(verified e8)' == '1:18 2:18 3:18 ' ]] && grep -q 'season at CRF 17 failed (episode 2' '$T/e8.log'"
 eq    "season trial fails: no temp files"     "$(leftovers)" ""
 unset SERIES_EXTRA
+
+# ------------------------------------------------------------
+echo
+echo "== series: one item per episode (season CRF 18, ceiling 5 GiB, CRF 16-21,"
+echo "   20 % headroom, 1 lower CRF per episode, 5 % predicted-fit margin)"
+
+# ep_job SESSION SIZES...  ->  one item per episode as series_compress.sh
+# emits it: EP_CRFS[i] its CRF, EP_EXTRA[i] its retry settings (default EPX)
+EPX="ceiling_vbytes=$(gib 5) crf_min=16 crf_max=21 down_headroom_pct=20 down_max=1 down_fit_pct=5"
+ep_job() {
+    local s="$1" body="" e n
+    shift
+    rm -f "$T"/out/Show/* "$T/$s.encoded" "$T/$s.verified" "$T/$s.seen"
+    for e in "${!EP_CRFS[@]}"; do
+        n=$((e + 1))
+        body+="item_encode_$n() { fake_encode; }
+if item_begin $n '$T/in/Show/E0$n.mkv' '$T/out/Show/E0$n.mkv' High 0 '' &&
+   item_expect vidx=0 mode=crf crf=${EP_CRFS[$e]} kbps= est_vbytes=$(gib 4.5) atrans= ahash=1 ${EP_EXTRA[$e]:-$EPX} &&
+   item_crf_encode item_encode_$n
+then
+    item_succeeded
+else
+    item_failed
+fi
+"
+    done
+    job "$s" "SIZES=($*)
+$body" series "${#EP_CRFS[@]}"
+    run_job "$s"
+}
+EP_EXTRA=()
+
+EP_CRFS=(18 18 20)
+ep_job p1 "[1:18]='$(gib 4.5) 1' [2:18]='$(gib 4.6) 1' [3:20]='$(gib 4.7) 1'"
+eq    "p1 all fit: each episode once"         "$(encoded p1)" "1:18 2:18 3:20 "
+eq    "p1 outlier keeps its own CRF 20"       "$(final_crfs)" "18 18 20 "
+
+ep_job p2 "[1:18]='$(gib 4.5) 1' [2:18]='$(gib 5.3) 1' [2:19]='$(gib 4.7) 1' [3:20]='$(gib 4.6) 1'"
+eq    "p2 regular episode over: only it is retried" "$(encoded p2)" "1:18 2:18 2:19 3:20 "
+check "p2 E02 at 19, the season untouched"    "[[ '$(final_crfs)' == '18 19 20 ' && '$(verified p2)' == '1:18 2:19 3:20 ' ]] && grep -q '^CRF 18 actual: 5.30 GiB / 5.00 GiB ceiling\$' '$T/p2.log' && ! grep -q 'season' '$T/p2.log'"
+eq    "p2 no temp files"                      "$(leftovers)" ""
+
+ep_job p3 "[1:18]='$(gib 4.5) 1' [2:18]='$(gib 4.5) 1' [3:20]='$(gib 5.2) 1' [3:21]='$(gib 4.8) 1'"
+eq    "p3 outlier over: only the outlier retried" "$(encoded p3)" "1:18 2:18 3:20 3:21 "
+eq    "p3 outlier at 21"                      "$(final_crfs)" "18 18 21 "
+
+EP_CRFS=(18 18 21)
+ep_job p4 "[1:18]='$(gib 4.5) 1' [2:18]='$(gib 4.5) 1' [3:21]='$(gib 5.5) 1'"
+check "p4 outlier over at CRF_MAX: kept, warned, flagged" \
+    "[[ '$(encoded p4)' == '1:18 2:18 3:21 ' && '$(final_crfs)' == '18 18 21 ' ]] && grep -q '^Result: over ceiling; CRF 21 is the High limit\$' '$T/p4.log' && grep -A1 '^Above the video ceiling' '$T/p4.log' | grep -q 'E03'"
+
+# undershoot: E01 3.0 GiB (<= 4 GiB), estimates 17 / 18 = 1.10 -> CRF 17
+# predicted 3.30 GiB <= 4.75 GiB -> tried for E01 only, once
+EP_CRFS=(18 18 18)
+EP_EXTRA=("$EPX crf_est=17=$(gib 5.5):18=$(gib 5.0)")
+ep_job p5 "[1:18]='$(gib 3.0) 1' [1:17]='$(gib 3.4) 1' [2:18]='$(gib 4.5) 1' [3:18]='$(gib 4.6) 1'"
+eq    "p5 undershoot: only E01 tries CRF 17"  "$(encoded p5)" "1:18 1:17 2:18 3:18 "
+check "p5 prediction shown, E01 at 17, limit 1" \
+    "[[ '$(final_crfs)' == '17 18 18 ' ]] && grep -q '^CRF 17 predicted: 3.30 GiB / 4.75 GiB limit\$' '$T/p5.log' && grep -q 'lower-CRF retry limit (1) is reached' '$T/p5.log'"
+
+# estimates 17 / 18 = 1.30: 3.9 GiB -> 5.07 GiB predicted > 4.75 -> no trial
+EP_EXTRA=("$EPX crf_est=17=$(gib 6.5):18=$(gib 5.0)")
+ep_job p6 "[1:18]='$(gib 3.9) 1' [1:17]='$(gib 4.4) 1' [2:18]='$(gib 4.5) 1' [3:18]='$(gib 4.6) 1'"
+eq    "p6 predicted above the limit: no lower trial" "$(encoded p6)" "1:18 2:18 3:18 "
+check "p6 says why"                           "grep -q '^Headroom large, but CRF 17 is predicted at 5.07 GiB, above the 4.75 GiB limit (5% below the ceiling); keeping CRF 18\$' '$T/p6.log'"
+
+# noisy estimates (17 = 18) never look free: ratio at least 1.08
+EP_EXTRA=("$EPX crf_est=17=$(gib 5.0):18=$(gib 5.0)")
+ep_job p7 "[1:18]='$(gib 4.0) 1' [1:17]='$(gib 4.3) 1' [2:18]='$(gib 4.5) 1' [3:18]='$(gib 4.6) 1'"
+check "p7 ratio floor 1.08 (4.32 GiB predicted)" "grep -q '^CRF 17 predicted: 4.32 GiB / 4.75 GiB limit\$' '$T/p7.log' && [[ '$(final_crfs)' == '17 18 18 ' ]]"
+
+# no estimate at CRF 17: default ratio 1.15 (4.60 GiB predicted)
+EP_EXTRA=()
+ep_job p8 "[1:18]='$(gib 4.0) 1' [1:17]='$(gib 4.4) 1' [2:18]='$(gib 4.5) 1' [3:18]='$(gib 4.6) 1'"
+check "p8 default ratio 1.15"                 "grep -q '^CRF 17 predicted: 4.60 GiB / 4.75 GiB limit\$' '$T/p8.log' && [[ '$(encoded p8)' == '1:18 1:17 2:18 3:18 ' ]]"
+
+# the lower trial lands above the ceiling: discarded, CRF 18 kept
+EP_EXTRA=("$EPX crf_est=17=$(gib 5.5):18=$(gib 5.0)")
+ep_job p9 "[1:18]='$(gib 3.0) 1' [1:17]='$(gib 5.2) 1' [2:18]='$(gib 4.5) 1' [3:18]='$(gib 4.6) 1'"
+check "p9 lower over: E01 keeps CRF 18"       "[[ '$(final_crfs)' == '18 18 18 ' && '$(verified p9)' == '1:18 2:18 3:18 ' ]] && grep -q '^Result: over ceiling -> keeping CRF 18\$' '$T/p9.log'"
+eq    "p9 no temp files"                      "$(leftovers)" ""
+
+# a CRF already found above the ceiling is never tried again
+EP_EXTRA=("$EPX crf_est=18=$(gib 5.5):19=$(gib 5.0)")
+EP_CRFS=(18 18 18)
+ep_job p10 "[1:18]='$(gib 5.5) 1' [1:19]='$(gib 3.0) 1' [2:18]='$(gib 4.5) 1' [3:18]='$(gib 4.6) 1'"
+eq    "p10 up to 19, never back to 18"        "$(encoded p10)" "1:18 1:19 2:18 3:18 "
+
+# an outlier (CRF 20) never goes below the season CRF 18 (its crf_min),
+# even with retries left
+EP_CRFS=(18 18 20)
+EP_EXTRA=("" "" "ceiling_vbytes=$(gib 5) crf_min=18 crf_max=21 down_headroom_pct=20 down_max=3 down_fit_pct=5")
+ep_job p11 "[1:18]='$(gib 4.5) 1' [2:18]='$(gib 4.5) 1' [3:20]='$(gib 2.0) 1' [3:19]='$(gib 2.3) 1' [3:18]='$(gib 2.6) 1'"
+check "p11 outlier stops at the season CRF"   "[[ '$(encoded p11)' == '1:18 2:18 3:20 3:19 3:18 ' && '$(final_crfs)' == '18 18 18 ' ]] && grep -q 'CRF 18 is the High minimum' '$T/p11.log' && ! grep -q '3:17' '$T/p11.encoded'"
+EP_EXTRA=()
 
 # ------------------------------------------------------------
 echo
@@ -504,6 +601,21 @@ else
     bash -n "$W/r2.sh" && run_job r2
     check "real series: both verified at CRF 19" "[[ \$(grep -cE 'AS PLANNED .*CRF 19(\\.0)? \\(single pass\\)' '$T/r2.log') == 2 ]] && [[ -f '$R/out/E01.mkv' && -f '$R/out/E02.mkv' ]] && grep -q 'retrying season at CRF 19' '$T/r2.log'"
     check "real series: no temp files"          "[[ -z \$(find '$R/out' -name '*.part') ]]"
+
+    # series per episode (as series_compress.sh emits it now): ceiling 1
+    # byte, E01 at the season CRF 18, E02 (outlier) at 19: each retried
+    # alone up to CRF_MAX 19
+    rm -f "$R"/out/E0?.mkv
+    { emit_job_header r5 series 2
+      emit_encode_item 1 "$R/in/E01.mkv" "$R/out/E01.mkv" High crf:18 "" "" 0 1000 "1:19:16:20:1::5" "" "17=1100:18=1000"
+      emit_encode_item 2 "$R/in/E02.mkv" "$R/out/E02.mkv" High crf:19 "" "" 0 1000 "1:19:18:20:1::5" "" "18=1100:19=1000"
+      emit_job_footer; } > "$W/r5.sh"
+    check "generated: series episodes are items of their own" \
+        "! grep -q '^job_batch_add' '$W/r5.sh' && [[ \$(grep -c '^   item_crf_encode item_encode_' '$W/r5.sh') == 2 ]] && grep -q 'crf_min=16 crf_max=19 down_headroom_pct=20 down_max=1 down_fit_pct=5 crf_est=17=1100:18=1000' '$W/r5.sh'"
+    bash -n "$W/r5.sh" && run_job r5
+    check "real series per episode: E01 18 -> 19, E02 19 kept" \
+        "[[ \$(grep -cE 'AS PLANNED .*CRF 19(\\.0)? \\(single pass\\)' '$T/r5.log') == 2 ]] && [[ \$(grep -c 'ENCODING (single pass, CRF 19)' '$T/r5.log') == 2 ]] && ! grep -q 'season' '$T/r5.log' && [[ -f '$R/out/E01.mkv' && -f '$R/out/E02.mkv' ]]"
+    check "real series per episode: no temp files" "[[ -z \$(find '$R/out' -name '*.part') ]]"
 
     # Quality: single-pass CRF with the band retry; Custom: no retry
     { emit_job_header r3 movie 2

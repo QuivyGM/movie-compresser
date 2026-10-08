@@ -147,6 +147,9 @@ for e in 1 2 3; do src 320x180 2 "$H/compress/in/Show/Show.S01E0$e.mkv"; done
 src 320x180 2 "$H/compress/in/Mixed/Mixed.S01E01.mkv"
 src 640x360 2 "$H/compress/in/Mixed/Mixed.S01E02.mkv"
 
+# series High CRF_MIN of the project config (where every series sample starts)
+SHMIN=$(sed -n 's/^SERIES_HIGH_CRF_MIN=//p' "$H/compress/work/lib/compress.conf")
+
 menu() {   # SCRIPT INPUT LOG [CONF]
     printf "$2" | HOME="$H" PATH="$T/stub:$PATH" COMPRESS_CONF="${4:-$H/compress/work/lib/compress.conf}" \
         bash "$H/compress/work/$1" > "$3" 2>&1
@@ -161,17 +164,17 @@ check "no file names"                    "! grep -q 'Show\\.S01E0' '$L'"
 check "one analysis line"                "grep -qE '^Analyzing 3 episodes\\.\\.\\. OK    Source stats: (scanned|scanned \\+ refreshed)    Compatibility: OK\$' '$L'"
 check "header"                           "grep -qE '^Series: +Show +Episodes: 3\$' '$L' && grep -qE '^Video: +320x180 H264 8-bit\$' '$L' && grep -qE '^Dynamic range: +SDR\$' '$L' && grep -qE '^Audio: +1 track, copied unchanged\$' '$L'"
 check "avg video from stats"             "grep -qE '^Avg video: +[0-9]+\\.[0-9]{2} GiB/episode   [0-9]+\\.[0-9] Mb/s\$' '$L'"
-check "tier menu"                        "grep -qE '^1\\) Base    CRF [0-9]+-[0-9]+ +<=[0-9.]+ GiB/episode\$' '$L' && grep -qE '^2\\) High    CRF 15-21 +<=5 GiB/episode\$' '$L' && grep -q '^3) Custom  exact CRF' '$L'"
+check "tier menu"                        "grep -qE '^1\\) Base    CRF [0-9]+-[0-9]+ +<=[0-9.]+ GiB/episode\$' '$L' && grep -qE '^2\\) High    CRF $SHMIN-21 +<=5 GiB/episode\$' '$L' && grep -q '^3) Custom  exact CRF' '$L'"
 check "no repeated tier policy"          "! grep -q 'CRF range' '$L'"
 check "estimating line"                  "grep -q '^Estimating High at 320x180\\.\\.\\.\$' '$L'"
-check "per-episode samples"              "grep -q '^CRF 15\$' '$L' && [[ \$(grep -cE '^  S01E0[123]  ~[0-9]+\\.[0-9]{2} GiB\$' '$L') == 3 ]]"
-check "CRF result"                       "grep -qE '^Median: +[0-9.]+ GiB\$' '$L' && grep -qE '^Largest: +[0-9.]+ GiB\$' '$L' && grep -q '^Ceiling:  5.00 GiB\$' '$L' && grep -q '^Selected: CRF 15\$' '$L'"
+check "per-episode samples"              "grep -q '^CRF $SHMIN\$' '$L' && [[ \$(grep -cE '^  S01E0[123]  ~[0-9]+\\.[0-9]{2} GiB\$' '$L') == 3 ]]"
+check "CRF result"                       "grep -qE '^Median: +[0-9.]+ GiB\$' '$L' && grep -qE '^Largest: +[0-9.]+ GiB\$' '$L' && grep -q '^Ceiling:  5.00 GiB\$' '$L' && grep -q '^Selected: CRF $SHMIN\$' '$L'"
 check "no long blocks"                   "! grep -qE '^Tier:|Video encode:|Per-episode rules|Object audio|Season totals|^-----' '$L'"
 check "table header, no extra columns"   "grep -q '^Episode   Runtime   Video   Audio   Total\$' '$L' && ! grep -qE 'Estimate|Status|^ *CRF +Video' '$L'"
 check "table rows"                       "[[ \$(grep -cE '^S01E0[123]    0:02      [0-9.]+ +[0-9.]+ +[0-9.]+\$' '$L') == 3 ]]"
 check "season block"                     "grep -q '^Season:\$' '$L' && grep -qE '^  Video:   ~[0-9.]+ GiB\$' '$L' && grep -qE '^  Audio:   ~[0-9.]+ GiB\$' '$L' && grep -qE '^  Total:   ~[0-9.]+ GiB\$' '$L' && grep -qE '^  Average: ~[0-9.]+ GiB/episode\$' '$L'"
 check "no median/largest in season"      "! grep -qE '^  (Median|Largest|Above)' '$L'"
-check "confirmation line"                "grep -q '^High | CRF 15 | 320x180 | SDR | audio copied\$' '$L'"
+check "confirmation line"                "grep -q '^High | CRF $SHMIN | 320x180 | SDR | audio copied\$' '$L'"
 check "compact: no ANSI / tabs / long lines" "compact '$L'"
 
 L="$T/series_verbose.log"
@@ -179,7 +182,7 @@ COMPRESS_VERBOSE=1 menu series_compress.sh "2\n2\nn\n" "$L"
 check "verbose: policy"                  "grep -q '^Policy: ' '$L' && grep -q '^High video policy:' '$L'"
 check "verbose: per-file verification"   "grep -q '^OK        Show.S01E01.mkv\$' '$L' && grep -q '^All files match.\$' '$L'"
 check "verbose: stats source"            "grep -q 'stored MKV statistics tags: 3 files' '$L' || grep -q 'packet scan: 3 files' '$L'"
-check "verbose: sampling detail"         "grep -q 'sampling CRF 15, episode 1/3 (Show.S01E01.mkv)' '$L'"
+check "verbose: sampling detail"         "grep -q 'sampling CRF $SHMIN, episode 1/3 (Show.S01E01.mkv)' '$L'"
 check "verbose: long summary"            "grep -q '^Season totals' '$L' && grep -q 'Per-episode rules' '$L'"
 check "verbose: no ANSI when redirected" "! grep -q \"\$ESC\" '$L'"
 
@@ -191,7 +194,7 @@ fi
 
 L="$T/series_start.log"
 menu series_compress.sh "2\n2\ny\n" "$L"
-check "job: season batch with CRF retry" "grep -q '^job_batch_add 3\$' '$H/compress/work/series1.sh' && grep -q 'ceiling_vbytes=5368709120 crf_min=15 crf_max=21' '$H/compress/work/series1.sh' && grep -q '^job_crf_batch\$' '$H/compress/work/series1.sh'"
+check "job: one CRF retry item per episode" "! grep -q '^job_batch_add' '$H/compress/work/series1.sh' && [[ \$(grep -c '^   item_crf_encode item_encode_' '$H/compress/work/series1.sh') == 3 ]] && [[ \$(grep -c 'ceiling_vbytes=5368709120 crf_min=$SHMIN crf_max=21 down_headroom_pct=20 down_max=1 down_fit_pct=5 crf_est=$SHMIN=[0-9]' '$H/compress/work/series1.sh') == 3 ]]"
 rm -rf "$H/compress/out/Show"
 
 L="$T/series_mismatch.log"
@@ -207,7 +210,7 @@ menu series_compress.sh "2\n2\n1\nn\n" "$L" "$T/tiny.conf"
 sed -n '/^Estimating/,$p' "$L" | sed 's/^/  | /'
 check "ceiling: too large -> next CRF"   "grep -q '^Result:   too large -> trying CRF 19\$' '$L' && grep -q '^Result:   too large -> trying CRF 20\$' '$L'"
 check "ceiling: limit reached"           "grep -q '^Result:   too large (CRF 21 is the High limit)\$' '$L' && ! grep -q '^Selected:' '$L'"
-check "ceiling: warning kept"            "grep -q '^WARNING: the nominal 0.000001 GiB per-episode video ceiling cannot be met' '$L'"
+check "ceiling: warning kept"            "grep -q '^WARNING: the 0.000001 GiB per-episode video ceiling cannot be met' '$L' && grep -q 'gives a largest regular episode of' '$L'"
 check "ceiling: outliers listed"         "grep -q 'Warning: 3 episodes are estimated above' '$L' && grep -qE '^  S01E01 +~[0-9.]+ GiB video, \+' '$L'"
 check "ceiling: Status column"           "grep -q '^Episode   Runtime   Video   Audio   Total   Status\$' '$L' && [[ \$(grep -c ' ABOVE CEILING\$' '$L') == 3 ]]"
 check "ceiling: confirmation flags it"   "grep -q '^High | CRF 21 | 320x180 | SDR | audio copied | ceiling not met\$' '$L'"
@@ -216,7 +219,7 @@ check "ceiling: compact"                 "compact '$L'"
 if (( HAVE_SCRIPT == 1 )); then
     script -qec "printf '2\n2\nn\n' | HOME=$H PATH=$T/stub:\$PATH bash $H/compress/work/series_compress.sh" /dev/null \
         > "$T/series_tty.log" 2>&1
-    check "terminal: OK green, CRF bold"  "grep -qF \$'\\e[32mOK\\e[0m' '$T/series_tty.log' && grep -qF \$'\\e[1mCRF 15\\e[0m' '$T/series_tty.log'"
+    check "terminal: OK green, CRF bold"  "grep -qF \$'\\e[32mOK\\e[0m' '$T/series_tty.log' && grep -qF \$'\\e[1mCRF $SHMIN\\e[0m' '$T/series_tty.log'"
     # (no prompt check: read -p shows it only when stdin is a terminal)
     check "terminal: progress counter"    "grep -qF 'Analyzing 3 episodes... 1/3' '$T/series_tty.log'"
 fi
