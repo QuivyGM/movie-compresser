@@ -257,6 +257,8 @@ check "Quality: source guard before sampling" \
     "grep -q '^Quality source guard: the source video (0.00 GiB) is already at or' '$L' && grep -q '^1) (not available: keeping the source video needs an HEVC source,' '$L' && [[ \$(grep -n 'Quality source guard' '$L' | cut -d: -f1) -lt \$(grep -n '^Estimating Quality' '$L' | cut -d: -f1) ]]"
 check "Quality: source-limited estimate" \
     "grep -q '^Estimating Quality at 320x180\\.\\.\\.\$' '$L' && grep -q '^Target:   below the source video (0.00 GiB)\$' '$L' && grep -q '^Band:     not applied (source-limited)\$' '$L' && grep -qE '^Selected: CRF [0-9]+\$' '$L'"
+check "Quality (source-limited): search starts at CRF_START (8)" \
+    "[[ \"\$(grep -A1 '^Estimating Quality at 320x180\\.\\.\\.\$' '$L' | tail -n 1)\" =~ ^'  CRF 8    ~' ]]"
 check "Quality: never called two-pass"   "! grep -qi 'two-pass' '$L'"
 check "Quality: compact"                 "compact '$L'"
 QJ=$(ls "$H/compress/work"/c[0-9]*.sh 2>/dev/null | head -n 1)
@@ -265,13 +267,17 @@ check "Quality job (source-limited): CRF, below the source, no lower CRF" \
 
 # Quality with a band the source can reach: CRF search from CRF_MIN up
 cp "$H/compress/work/lib/compress.conf" "$T/qtiny.conf"
-sed -i 's/^MOVIE_QUALITY_TARGET_VIDEO_GIB=.*/MOVIE_QUALITY_TARGET_VIDEO_GIB=0.00012/; s/^MOVIE_QUALITY_ACCEPT_MIN_GIB=.*/MOVIE_QUALITY_ACCEPT_MIN_GIB=0.00001/; s/^MOVIE_QUALITY_ACCEPT_MAX_GIB=.*/MOVIE_QUALITY_ACCEPT_MAX_GIB=0.0002/; s/^MOVIE_QUALITY_CRF_MIN=.*/MOVIE_QUALITY_CRF_MIN=20/; s/^MOVIE_QUALITY_CRF_MAX=.*/MOVIE_QUALITY_CRF_MAX=45/' "$T/qtiny.conf"
+sed -i 's/^MOVIE_QUALITY_TARGET_VIDEO_GIB=.*/MOVIE_QUALITY_TARGET_VIDEO_GIB=0.00012/; s/^MOVIE_QUALITY_ACCEPT_MIN_GIB=.*/MOVIE_QUALITY_ACCEPT_MIN_GIB=0.00001/; s/^MOVIE_QUALITY_ACCEPT_MAX_GIB=.*/MOVIE_QUALITY_ACCEPT_MAX_GIB=0.0002/; s/^MOVIE_QUALITY_CRF_MIN=.*/MOVIE_QUALITY_CRF_MIN=20/; s/^MOVIE_QUALITY_CRF_START=.*/MOVIE_QUALITY_CRF_START=30/; s/^MOVIE_QUALITY_CRF_MAX=.*/MOVIE_QUALITY_CRF_MAX=45/' "$T/qtiny.conf"
 rm -f "$H/compress/work"/c[0-9]*.sh "$H/compress/work"/*.state "$H/compress/out"/*.mkv
 L="$T/movie_quality2.log"
 menu movie_compress.sh "1\n1\nn\n" "$L" "$T/qtiny.conf"
 sed -n '/^Compression tier:/,$p' "$L" | sed 's/^/  | /'
 check "Quality: CRF search menu line"    "grep -q '^1) Quality  CRF search  ~0.00012 GiB (0.00001-0.0002)\$' '$L'"
-check "Quality: search starts at CRF_MIN" "grep -q '^Estimating Quality at 320x180\\.\\.\\.\$' '$L' && grep -qE '^  CRF 20   ~[0-9.]+ GiB\$' '$L' && ! grep -q 'source guard' '$L'"
+check "Quality: search starts at CRF_START (30), not CRF_MIN (20)" \
+    "[[ \"\$(grep -A1 '^Estimating Quality at 320x180\\.\\.\\.\$' '$L' | tail -n 1)\" =~ ^'  CRF 30   ~'[0-9.]+' GiB'\$ ]] && ! grep -q 'source guard' '$L'"
+check "Quality: each CRF estimated once, in one direction" \
+    "awk '/^Estimating Quality/ { on = 1; next } on && /^  CRF / { print \$2 } on && /^\$/ { exit }' '$L' > '$T/qcrfs' && [[ \$(sort '$T/qcrfs' | uniq -d | wc -l) == 0 ]] && { sort -n '$T/qcrfs' | cmp -s - '$T/qcrfs' || sort -rn '$T/qcrfs' | cmp -s - '$T/qcrfs'; }"
+check "Quality: normal UI never shows START or 'minimum'" "! grep -qiE 'start|minimum' <(sed -n '/^Compression tier:/,/^Added:/p' '$L')"
 check "Quality: Video / Target / Band / Selected / Audio / Total" \
     "grep -qE '^Video:    ~[0-9.]+ GiB\$' '$L' && grep -q '^Target:   0.00 GiB\$' '$L' && grep -q '^Band:     0.00-0.00 GiB\$' '$L' && grep -qE '^Selected: CRF [0-9]+' '$L' && grep -qE '^Audio:    ~[0-9.]+ GiB copied\$' '$L' && grep -qE '^Total:    ~[0-9.]+ GiB\$' '$L'"
 check "Quality: queue summary says CRF"  "grep -qE '^  Quality \\| CRF [0-9]+ \\| 320x180 \\| SDR \\| audio copied\$' '$L'"
@@ -287,7 +293,7 @@ rm -f "$H/compress/work"/c[0-9]*.sh "$H/compress/work"/*.state "$H/compress/out"
 L="$T/movie_quality3.log"
 COMPRESS_VERBOSE=1 menu movie_compress.sh "1\n1\nn\n" "$L" "$T/qtiny.conf"
 check "Quality verbose: CRF policy, no two-pass" \
-    "grep -q '^Quality video policy:' '$L' && grep -q 'CRF range: 20-45 (searched from 20 upward)' '$L' && grep -q 'Video encode: *x265 CRF' '$L' && ! grep -qi 'two-pass' '$L'"
+    "grep -q '^Quality CRF search:$' '$L' && grep -q '^  Range: 20-45$' '$L' && grep -q '^  Start: 30 (first CRF sampled' '$L' && grep -q '^  Target: 0.00012 GiB$' '$L' && grep -q '^  Band: 0.00001-0.0002 GiB' '$L' && grep -q '^1) Quality     CRF search (start 30, range 20-45), video ~0.00012 GiB (0.00001-0.0002)$' '$L' && grep -q 'Video encode: *x265 CRF' '$L' && ! grep -qi 'two-pass' '$L'"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

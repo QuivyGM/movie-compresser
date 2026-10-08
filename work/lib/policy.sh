@@ -27,7 +27,7 @@ POLICY_KEYS_POSITIVE=(
 # x265 CRF values: whole numbers 0..CRF_LIMIT
 CRF_LIMIT=51
 POLICY_KEYS_CRF=(
-    MOVIE_QUALITY_CRF_MIN MOVIE_QUALITY_CRF_MAX
+    MOVIE_QUALITY_CRF_MIN MOVIE_QUALITY_CRF_START MOVIE_QUALITY_CRF_MAX
     MOVIE_HIGH_CRF_MIN MOVIE_HIGH_CRF_MAX MOVIE_BASE_CRF_MIN MOVIE_BASE_CRF_MAX
     SERIES_HIGH_CRF_MIN SERIES_HIGH_CRF_MAX SERIES_BASE_CRF_MIN SERIES_BASE_CRF_MAX
 )
@@ -131,6 +131,15 @@ validate_policy() {
             errs+=("$hi (${!hi}) is lower than $lo (${!lo})")
         fi
     done
+
+    # Quality search start: CRF_MIN <= CRF_START <= CRF_MAX
+    local qs="${MOVIE_QUALITY_CRF_START:-}" qlo="${MOVIE_QUALITY_CRF_MIN:-}" qhi="${MOVIE_QUALITY_CRF_MAX:-}"
+    if [[ "$qs" =~ ^[0-9]+$ && "$qlo" =~ ^[0-9]+$ ]] && (( 10#$qs < 10#$qlo )); then
+        errs+=("MOVIE_QUALITY_CRF_START ($qs) is lower than MOVIE_QUALITY_CRF_MIN ($qlo)")
+    fi
+    if [[ "$qs" =~ ^[0-9]+$ && "$qhi" =~ ^[0-9]+$ ]] && (( 10#$qs > 10#$qhi )); then
+        errs+=("MOVIE_QUALITY_CRF_START ($qs) is greater than MOVIE_QUALITY_CRF_MAX ($qhi)")
+    fi
 
     # Quality band: ACCEPT_MIN <= TARGET <= ACCEPT_MAX
     local qmin="${MOVIE_QUALITY_ACCEPT_MIN_GIB:-}" qt="${MOVIE_QUALITY_TARGET_VIDEO_GIB:-}" qmax="${MOVIE_QUALITY_ACCEPT_MAX_GIB:-}"
@@ -247,7 +256,7 @@ policy_retired_note() {
 
     if (( ${#set[@]} )); then
         echo "Note: $(policy_conf_path) still sets former Quality GiB/hour settings," >&2
-        echo "      which are ignored (Quality is a CRF tier: MOVIE_QUALITY_CRF_MIN / _MAX," >&2
+        echo "      which are ignored (Quality is a CRF tier: MOVIE_QUALITY_CRF_MIN / _START / _MAX," >&2
         echo "      TARGET_VIDEO_GIB and the ACCEPT_MIN_GIB / _MAX_GIB band):" >&2
         printf '        %s\n' "${set[@]}" >&2
     fi
@@ -284,8 +293,8 @@ quality_pick_text() {
 movie_policy_line() {
     case "$1" in
         Quality)
-            printf 'CRF %s-%s [lowest CRF with the video estimate in %s-%s GiB, else closest to %s GiB]' \
-                "$MOVIE_QUALITY_CRF_MIN" "$MOVIE_QUALITY_CRF_MAX" \
+            printf 'CRF %s-%s, search starts at %s [lowest CRF with the video estimate in %s-%s GiB, else closest to %s GiB]' \
+                "$MOVIE_QUALITY_CRF_MIN" "$MOVIE_QUALITY_CRF_MAX" "$MOVIE_QUALITY_CRF_START" \
                 "$MOVIE_QUALITY_ACCEPT_MIN_GIB" "$MOVIE_QUALITY_ACCEPT_MAX_GIB" "$MOVIE_QUALITY_TARGET_VIDEO_GIB"
             ;;
         High|Base)
@@ -373,7 +382,10 @@ crf_tier_load() {
                 echo "crf_tier_load: Quality is a movie tier" >&2
                 return 1
             fi
+            # CRF_MIN / CRF_MAX: absolute bounds; CRF_START: first CRF
+            # sampled (not a minimum)
             CRF_MIN="$MOVIE_QUALITY_CRF_MIN"
+            CRF_START="$MOVIE_QUALITY_CRF_START"
             CRF_MAX="$MOVIE_QUALITY_CRF_MAX"
             CRF_CEILING_GIB="$MOVIE_QUALITY_ACCEPT_MAX_GIB"
             CRF_CEILING_BYTES=$(_gib_bytes "$CRF_CEILING_GIB")
@@ -391,6 +403,19 @@ crf_policy_lines() {
 
     crf_tier_load "$scope" "$tier" "${3:-}" || return 1
 
+    if [[ "$tier" == "Quality" ]]; then
+        echo "Quality CRF search:"
+        echo "  Range: ${CRF_MIN}-${CRF_MAX}"
+        echo "  Start: ${CRF_START} (first CRF sampled; the search may go below or above it)"
+        echo "  Target: ${MOVIE_QUALITY_TARGET_VIDEO_GIB} GiB"
+        echo "  Band: ${MOVIE_QUALITY_ACCEPT_MIN_GIB}-${MOVIE_QUALITY_ACCEPT_MAX_GIB} GiB (copied audio not counted)"
+        echo "  lowest CRF estimated inside the band; none inside: closest to the target"
+        echo "  never a CRF estimated at or above the source video size"
+        echo "  encode: x265 CRF, single pass, preset slow, 10-bit"
+        echo "  audio: copied unchanged"
+        return 0
+    fi
+
     echo "$tier video policy:"
     if [[ "$tier" == "Custom" ]]; then
         if [[ "$scope" == series ]]; then
@@ -399,11 +424,6 @@ crf_policy_lines() {
         else
             echo "  CRF: ${CRF_MIN:-entered in the menu} (used exactly; no size ceiling)"
         fi
-    elif [[ "$tier" == "Quality" ]]; then
-        echo "  CRF range: ${CRF_MIN}-${CRF_MAX} (searched from ${CRF_MIN} upward)"
-        echo "  video target: ${MOVIE_QUALITY_TARGET_VIDEO_GIB} GiB, acceptable ${MOVIE_QUALITY_ACCEPT_MIN_GIB}-${MOVIE_QUALITY_ACCEPT_MAX_GIB} GiB (copied audio not counted)"
-        echo "  lowest CRF estimated inside the band; none inside: closest to the target"
-        echo "  never a CRF estimated at or above the source video size"
     elif [[ "$scope" == series ]]; then
         echo "  CRF range: ${CRF_MIN}-${CRF_MAX} (${CRF_MIN} preferred; raised only while the median episode is above the ceiling)"
         echo "  nominal video ceiling: ${CRF_CEILING_GIB} GiB/episode (episodes above it are listed, same CRF)"
@@ -457,30 +477,39 @@ crf_select() {
     return 0
 }
 
-# crf_select_quality CRF_MIN CRF_MAX TARGET_BYTES LO_BYTES HI_BYTES SOURCE_BYTES ESTIMATOR
+# crf_select_quality CRF_MIN CRF_START CRF_MAX TARGET_BYTES LO_BYTES HI_BYTES SOURCE_BYTES ESTIMATOR
 #
 # Movie Quality: the CRF for a VIDEO size band (audio never involved).
-# A CRF is "usable" when its estimate is below SOURCE_BYTES (unknown
-# source: always), so the band's upper edge is min(HI, source - 1).
-# CRFs are estimated from CRF_MIN upward:
-#   - the first CRF inside LO..upper edge is chosen (the lowest CRF in
-#     the band, as every lower CRF was estimated outside it); stop
-#   - above the band: next CRF
-#   - below LO: one more CRF is estimated (noisy, non-monotonic
-#     estimates); if that one is inside the band it is chosen, else the
-#     search stops
-# Without a CRF inside the band, the usable tested CRF whose estimate is
-# closest to TARGET is chosen (equal distance: the lower CRF). Nothing
-# usable (every estimate at or above the source): the last tested CRF
-# is selected (QUALITY_PICK=none) and the source guard
-# of the menu asks.
+# CRF_MIN / CRF_MAX are absolute bounds; CRF_START is only the first CRF
+# estimated (not a minimum). A CRF is "usable" when its estimate is below
+# SOURCE_BYTES (unknown source: always), so the band's upper edge is
+# min(HI, source - 1).
 #
-# Sets the crf_select globals (CRF_SELECTED CRF_TRIED CRF_EST
-# CRF_OVER_CEILING: 1 when no tested estimate reached the upper edge)
-# and QUALITY_PICK: band | closest | none.
+# Search (every CRF estimated at most once; CRF_EST is the tested map):
+#   1. estimate CRF_START
+#   2. above the upper edge: CRF + 1, + 2, ... while the estimate stays
+#      above it (stop at the first estimate at or below the edge, or at
+#      CRF_MAX)
+#   3. otherwise (inside the band or below it): CRF - 1, - 2, ... while
+#      the estimate stays at or below the edge (stop at the first
+#      estimate above it, or at CRF_MIN), so the lowest CRF still inside
+#      the band is found even when CRF_START already is inside
+# Each direction only moves one way, so the search always ends.
+# Selection over every CRF estimated (noisy, non-monotonic estimates
+# included):
+#   - the LOWEST CRF whose estimate is inside LO..upper edge
+#   - none: the usable CRF closest to TARGET (equal distance: lower CRF)
+#   - nothing usable (every estimate at or above the source): the
+#     highest CRF estimated (QUALITY_PICK=none); the menu's source guard
+#     asks
+#
+# Sets the crf_select globals (CRF_SELECTED, CRF_TRIED in estimation
+# order, CRF_EST, CRF_OVER_CEILING: 1 when no estimate reached the upper
+# edge) and QUALITY_PICK: band | closest | none. Returns 1 when an
+# estimate failed (CRF_SELECTED empty).
 crf_select_quality() {
-    local min="$1" max="$2" t="$3" lo="$4" hi="$5" src="$6" est="$7"
-    local c e cap below="" best="" bd d any_fit=0
+    local min="$1" start="$2" max="$3" t="$4" lo="$5" hi="$6" src="$7" est="$8"
+    local c e cap best="" bd d any_fit=0 low_in=""
 
     declare -gA CRF_EST=()
     CRF_TRIED=()
@@ -489,39 +518,53 @@ crf_select_quality() {
     QUALITY_PICK=""
 
     cap="$hi"
-    [[ "$src" =~ ^[0-9]+$ ]] && (( src > 0 && src - 1 < cap )) && cap=$((src - 1))
+    if [[ "$src" =~ ^[0-9]+$ ]] && (( src > 0 && src - 1 < cap )); then
+        cap=$((src - 1))
+    fi
+    if (( 10#$start < 10#$min )); then start="$min"; fi
+    if (( 10#$start > 10#$max )); then start="$max"; fi
 
-    for ((c = 10#$min; c <= 10#$max; c++)); do
-        CRF_EST_RESULT=""
-        if ! "$est" "$c" || [[ ! "$CRF_EST_RESULT" =~ ^[0-9]+$ ]]; then
-            CRF_SELECTED=""
-            return 1
-        fi
+    _crf_quality_try "$start" "$est" || return 1
 
-        CRF_TRIED+=("$c")
-        CRF_EST[$c]="$CRF_EST_RESULT"
-        e="$CRF_EST_RESULT"
-        (( e <= cap )) && any_fit=1
+    if (( QE > cap )); then
+        for ((c = 10#$start + 1; c <= 10#$max; c++)); do
+            _crf_quality_try "$c" "$est" || return 1
+            if (( QE <= cap )); then
+                break
+            fi
+        done
+    else
+        for ((c = 10#$start - 1; c >= 10#$min; c--)); do
+            _crf_quality_try "$c" "$est" || return 1
+            if (( QE > cap )); then
+                break
+            fi
+        done
+    fi
 
-        if (( e >= lo && e <= cap )); then
-            CRF_SELECTED="$c"
-            QUALITY_PICK=band
-            return 0
-        fi
-
-        if [[ -n "$below" ]]; then
-            break
-        fi
-        if (( e < lo )); then
-            below="$c"
+    for c in $(printf '%s\n' "${CRF_TRIED[@]}" | sort -n); do
+        e="${CRF_EST[$c]}"
+        if (( e <= cap )); then
+            any_fit=1
+            if [[ -z "$low_in" ]] && (( e >= lo )); then
+                low_in="$c"
+            fi
         fi
     done
 
+    if [[ -n "$low_in" ]]; then
+        CRF_SELECTED="$low_in"
+        QUALITY_PICK=band
+        return 0
+    fi
+
     (( any_fit == 1 )) || CRF_OVER_CEILING=1
 
-    for c in "${CRF_TRIED[@]}"; do
+    for c in $(printf '%s\n' "${CRF_TRIED[@]}" | sort -n); do
         e="${CRF_EST[$c]}"
-        [[ "$src" =~ ^[0-9]+$ ]] && (( src > 0 && e >= src )) && continue
+        if [[ "$src" =~ ^[0-9]+$ ]] && (( src > 0 && e >= src )); then
+            continue
+        fi
         d=$(( e > t ? e - t : t - e ))
         if [[ -z "$best" ]] || (( d < bd )); then
             best="$c"
@@ -533,10 +576,30 @@ crf_select_quality() {
         CRF_SELECTED="$best"
         QUALITY_PICK=closest
     else
-        CRF_SELECTED="${CRF_TRIED[-1]}"
+        CRF_SELECTED=$(printf '%s\n' "${CRF_TRIED[@]}" | sort -n | tail -n 1)
         QUALITY_PICK=none
     fi
     return 0
+}
+
+# _crf_quality_try CRF ESTIMATOR  ->  QE = estimated video bytes at CRF;
+# a CRF already in CRF_EST is not estimated again. 1 (CRF_SELECTED
+# empty) when the estimate failed.
+_crf_quality_try() {
+    if [[ -n "${CRF_EST[$1]+x}" ]]; then
+        QE="${CRF_EST[$1]}"
+        return 0
+    fi
+
+    CRF_EST_RESULT=""
+    if ! "$2" "$1" || [[ ! "$CRF_EST_RESULT" =~ ^[0-9]+$ ]]; then
+        CRF_SELECTED=""
+        return 1
+    fi
+
+    CRF_TRIED+=("$1")
+    CRF_EST[$1]="$CRF_EST_RESULT"
+    QE="$CRF_EST_RESULT"
 }
 
 # crf_select_exact CRF ESTIMATOR  ->  Custom: one estimate at exactly CRF

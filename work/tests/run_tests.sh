@@ -221,14 +221,14 @@ conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the default config
     # Quality: CRF chosen for the 18-22 GiB video band (stand-in
     # estimator; detailed cases: tests/quality_policy_tests.sh)
     COMPRESS_CONF=$(conf_with q MOVIE_QUALITY_TARGET_VIDEO_GIB=20 MOVIE_QUALITY_ACCEPT_MIN_GIB=18 \
-        MOVIE_QUALITY_ACCEPT_MAX_GIB=22 MOVIE_QUALITY_CRF_MIN=0 MOVIE_QUALITY_CRF_MAX=23)
+        MOVIE_QUALITY_ACCEPT_MAX_GIB=22 MOVIE_QUALITY_CRF_MIN=0 MOVIE_QUALITY_CRF_START=8 MOVIE_QUALITY_CRF_MAX=23)
     load_policy 2>/dev/null
     declare -A QEST=([7]=25.4 [8]=22.7 [9]=20.45 [10]=18.7)
     qest() { CRF_EST_RESULT=$(gib_bytes "${QEST[$1]:-40}"); }
-    crf_select_quality 0 23 "$(gib_bytes 20)" "$(gib_bytes 18)" "$(gib_bytes 22)" "$(gib_bytes 60)" qest
+    crf_select_quality 0 8 23 "$(gib_bytes 20)" "$(gib_bytes 18)" "$(gib_bytes 22)" "$(gib_bytes 60)" qest
     eq "Q1 lowest CRF inside the band"   "$CRF_SELECTED $QUALITY_PICK" "9 band"
-    eq "Q1 searched from CRF_MIN up"     "${CRF_TRIED[*]}" "0 1 2 3 4 5 6 7 8 9"
-    crf_select_quality 0 23 "$(gib_bytes 20)" "$(gib_bytes 18)" "$(gib_bytes 22)" "$(gib_bytes 20.4)" qest
+    eq "Q1 searched up from CRF_START"   "${CRF_TRIED[*]}" "8 9"
+    crf_select_quality 0 8 23 "$(gib_bytes 20)" "$(gib_bytes 18)" "$(gib_bytes 22)" "$(gib_bytes 20.4)" qest
     eq "Q3 never at or above the source" "$CRF_SELECTED" 10
 
     # edited CRF settings are used

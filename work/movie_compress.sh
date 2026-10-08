@@ -252,7 +252,7 @@ while true; do
     echo
     echo "Compression tier:"
     if ui_verbose; then
-        echo "1) Quality     CRF ${MOVIE_QUALITY_CRF_MIN}-${MOVIE_QUALITY_CRF_MAX} search, video $QUALITY_MENU_TEXT"
+        echo "1) Quality     CRF search (start ${MOVIE_QUALITY_CRF_START}, range ${MOVIE_QUALITY_CRF_MIN}-${MOVIE_QUALITY_CRF_MAX}), video $QUALITY_MENU_TEXT"
         crf_tier_load movie High
         echo "2) High        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_CEILING_GIB} GiB"
         crf_tier_load movie Base
@@ -365,8 +365,9 @@ while true; do
         # ====================================================
         # CRF TIERS: High / Base choose the lowest CRF of the tier whose
         # sampled video estimate fits the ceiling (crf_select); Quality
-        # the lowest CRF whose estimate is inside the acceptable band,
-        # else the one closest to the target (crf_select_quality);
+        # the lowest CRF whose estimate is inside the acceptable band, searched
+        # from CRF_START in both directions, else the one closest to the target
+        # (crf_select_quality);
         # Custom uses the entered CRF. Audio is not part of the decision.
         # ====================================================
 
@@ -401,9 +402,15 @@ while true; do
         if [[ "$TIER" == "Custom" ]]; then
             crf_select_exact "$CUSTOM_CRF" crf_title_estimate || CRF_SELECTED=""
         elif [[ "$QUALITY_STATUS" == "band" ]]; then
-            crf_select_quality "$CRF_MIN" "$CRF_MAX" \
+            crf_select_quality "$CRF_MIN" "$CRF_START" "$CRF_MAX" \
                 "$(_gib_bytes "$MOVIE_QUALITY_TARGET_VIDEO_GIB")" \
                 "$(_gib_bytes "$MOVIE_QUALITY_ACCEPT_MIN_GIB")" "$(_gib_bytes "$MOVIE_QUALITY_ACCEPT_MAX_GIB")" \
+                "$SOURCE_VIDEO_BYTES" crf_title_estimate || CRF_SELECTED=""
+        elif [[ "$QUALITY_STATUS" == "source-limited" ]]; then
+            # lowest CRF estimated below the source video: the same search
+            # from CRF_START with the band 0 .. source - 1
+            crf_select_quality "$CRF_MIN" "$CRF_START" "$CRF_MAX" \
+                "$CRF_CEILING_BYTES" 0 "$CRF_CEILING_BYTES" \
                 "$SOURCE_VIDEO_BYTES" crf_title_estimate || CRF_SELECTED=""
         else
             crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_title_estimate || CRF_SELECTED=""

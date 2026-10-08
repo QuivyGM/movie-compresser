@@ -214,7 +214,21 @@ movie_job q10 Quality 9 "$(qband)" "[9]='$(gib 23) 0' [10]='$(gib 17) 0'"
 eq    "Q10 up then below band: no CRF already over the band retried" "$(encoded q10)" "1:9 1:10 "
 check "Q10 CRF 10 kept"                        "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 10 ]]"
 
-check "Quality: CRF retry enabled"             "ITEM_EXP=([mode]=crf [crf]=9 [ceiling_vbytes]=$(gib 22) [crf_max]=23); item_retry_enabled"
+# CRF_START (8) is only where the pre-encode search begins: the job only
+# knows the absolute CRF_MIN / CRF_MAX
+movie_job q11 Quality 7 "$(qband 0)" "[7]='$(gib 16.9) 0' [6]='$(gib 19) 0'"
+eq    "Q11 selected 7 (below START 8), 16.9 GiB: CRF 6 tried" "$(encoded q11)" "1:7 1:6 "
+check "Q11 CRF 6 kept (START does not block it)" "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 6 ]]"
+check "Q11 runtime has no start setting"       "! grep -qi 'start' <(sed -n '/^item_crf_encode() {/,/^}/p' '$W/lib/job_runtime.sh')"
+
+movie_job q12 Quality 7 "$(qband 6)" "[7]='$(gib 16) 0' [6]='$(gib 17) 0' [5]='$(gib 19) 0'"
+eq    "Q12 never below the absolute CRF_MIN (6)" "$(encoded q12)" "1:7 1:6 "
+check "Q12 CRF 6 kept, minimum reached"        "[[ \$(awk '{print \$3}' '$T/out/M.mkv') == 6 ]] && grep -q '^Below the acceptable band, but CRF 6 is the Quality minimum\$' '$T/q12.log'"
+
+movie_job q13 Quality 22 "$(qband 0 23)" "[22]='$(gib 25) 0' [23]='$(gib 24) 0' [24]='$(gib 20) 0'"
+eq    "Q13 upward retry never exceeds CRF_MAX (23)" "$(encoded q13)" "1:22 1:23 "
+
+check "Quality: CRF retry enabled"            "ITEM_EXP=([mode]=crf [crf]=9 [ceiling_vbytes]=$(gib 22) [crf_max]=23); item_retry_enabled"
 
 # ------------------------------------------------------------
 echo
