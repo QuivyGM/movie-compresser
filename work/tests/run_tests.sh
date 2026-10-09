@@ -155,14 +155,15 @@ conf_set() {
 
 # the project's default policy file (work/lib/compress.conf) with the
 # CRF tiers pinned to the values this suite's expectations are written
-# for (movie High 19-23 / 7 GiB, Base 25-29 / 2 GiB; series High 18-21 /
-# 5 GiB, Base 24-27 / 1.5 GiB), so editing the production numbers does
-# not change what the suite checks. Every other setting is the project's.
-# All test configs below (conf_with, menus) start from this copy.
+# for (movie High 19-23 / 3.5 GiB per hour of runtime, Base 25-29 / 1.0
+# GiB per hour: 7 / 2 GiB for a 2 h movie; series High 18-21 / 5 GiB,
+# Base 24-27 / 1.5 GiB per episode), so editing the production numbers
+# does not change what the suite checks. Every other setting is the
+# project's. All test configs below (conf_with, menus) start from this copy.
 cp "$SRC_WORK/lib/compress.conf" "$T/compress.conf"
 conf_set "$T/compress.conf" \
-    MOVIE_HIGH_CRF_SEARCH_MIN=19 MOVIE_HIGH_CRF_START=19 MOVIE_HIGH_CRF_MAX=23 MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=7 \
-    MOVIE_BASE_CRF_SEARCH_MIN=25 MOVIE_BASE_CRF_START=25 MOVIE_BASE_CRF_MAX=29 MOVIE_BASE_VIDEO_SIZE_CEILING_GIB=2 \
+    MOVIE_HIGH_CRF_SEARCH_MIN=19 MOVIE_HIGH_CRF_START=19 MOVIE_HIGH_CRF_MAX=23 MOVIE_HIGH_VIDEO_GIB_PER_HOUR=3.5 \
+    MOVIE_BASE_CRF_SEARCH_MIN=25 MOVIE_BASE_CRF_START=25 MOVIE_BASE_CRF_MAX=29 MOVIE_BASE_VIDEO_GIB_PER_HOUR=1.0 \
     SERIES_HIGH_CRF_SEARCH_MIN=18 SERIES_HIGH_CRF_START=18 SERIES_HIGH_CRF_MAX=21 SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=5 \
     SERIES_BASE_CRF_SEARCH_MIN=24 SERIES_BASE_CRF_START=24 SERIES_BASE_CRF_MAX=27 SERIES_BASE_VIDEO_SIZE_CEILING_GIB=1.5
 export COMPRESS_CONF="$T/compress.conf"
@@ -194,8 +195,10 @@ check "default compress.conf loads"           "load_policy 2>'$T/pol.err'"
         "! declare -F series_video_plan series_plan series_episode_video_kbps series_gib_per_hour >/dev/null"
     check "no movie/series AAC settings in the config" \
         "! grep -qE '^(MOVIE|SERIES)_[A-Z_]*(AAC|AUDIO)' '$SRC_WORK/lib/compress.conf'"
-    check "no High/Base GiB/hour settings in the config" \
-        "! grep -qE '^(MOVIE|SERIES)_(HIGH|BASE)_VIDEO_(GIB_PER_HOUR|FLOOR_MBPS|MAX_MBPS)=' '$SRC_WORK/lib/compress.conf'"
+    check "no series GiB/hour or High/Base two-pass bitrate settings in the config" \
+        "! grep -qE '^(SERIES_(HIGH|BASE)_VIDEO_GIB_PER_HOUR|(MOVIE|SERIES)_(HIGH|BASE)_VIDEO_(FLOOR_MBPS|MAX_MBPS))=' '$SRC_WORK/lib/compress.conf'"
+    check "movie High/Base: GiB/hour of runtime, no fixed ceiling in the config" \
+        "grep -qE '^MOVIE_HIGH_VIDEO_GIB_PER_HOUR=' '$SRC_WORK/lib/compress.conf' && grep -qE '^MOVIE_BASE_VIDEO_GIB_PER_HOUR=' '$SRC_WORK/lib/compress.conf' && ! grep -qE '^MOVIE_(HIGH|BASE)_VIDEO_SIZE_CEILING_GIB=' '$SRC_WORK/lib/compress.conf'"
     check "audio menu settings still in the config" \
         "grep -q '^AUDIO_HIGH_KBPS_5TO6=' '$SRC_WORK/lib/compress.conf' && grep -q '^AUDIO_COMPACT_LIMIT_GIB=' '$SRC_WORK/lib/compress.conf'"
     eq "series reserve from config"       "$(series_size_factor)" \
@@ -203,14 +206,16 @@ check "default compress.conf loads"           "load_policy 2>'$T/pol.err'"
     eq "audio menu High 5.1 from config"  "$(audio_menu_high_kbps 6)" "$AUDIO_HIGH_KBPS_5TO6"
 
     # the CRF tier values come from compress.conf
-    eq "config: movie High 19-23 / 7 GiB"   "$MOVIE_HIGH_CRF_START $MOVIE_HIGH_CRF_MAX $MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB" "19 23 7"
-    eq "config: movie Base 25-29 / 2 GiB"   "$MOVIE_BASE_CRF_START $MOVIE_BASE_CRF_MAX $MOVIE_BASE_VIDEO_SIZE_CEILING_GIB" "25 29 2"
+    eq "config: movie High 19-23 / 3.5 GiB/h" "$MOVIE_HIGH_CRF_START $MOVIE_HIGH_CRF_MAX $MOVIE_HIGH_VIDEO_GIB_PER_HOUR" "19 23 3.5"
+    eq "config: movie Base 25-29 / 1.0 GiB/h" "$MOVIE_BASE_CRF_START $MOVIE_BASE_CRF_MAX $MOVIE_BASE_VIDEO_GIB_PER_HOUR" "25 29 1.0"
     eq "config: series High 18-21 / 5 GiB"  "$SERIES_HIGH_CRF_START $SERIES_HIGH_CRF_MAX $SERIES_HIGH_VIDEO_SIZE_CEILING_GIB" "18 21 5"
     eq "config: series Base 24-27 / 1.5 GiB" "$SERIES_BASE_CRF_START $SERIES_BASE_CRF_MAX $SERIES_BASE_VIDEO_SIZE_CEILING_GIB" "24 27 1.5"
-    crf_tier_load movie High
-    eq "crf_tier_load movie High"         "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB $CRF_CEILING_BYTES" "19 23 7 $(gib_bytes 7)"
-    crf_tier_load movie Base
-    eq "crf_tier_load movie Base"         "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB $CRF_CEILING_BYTES" "25 29 2 $(gib_bytes 2)"
+    crf_tier_load movie High "" 7200
+    eq "crf_tier_load movie High (2 h)"   "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB $CRF_CEILING_BYTES" "19 23 7.00 $(gib_bytes 7)"
+    crf_tier_load movie Base "" 7200
+    eq "crf_tier_load movie Base (2 h)"   "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB $CRF_CEILING_BYTES" "25 29 2.00 $(gib_bytes 2)"
+    crf_tier_load movie High "" 5400
+    eq "crf_tier_load movie High (90 min)" "$CRF_CEILING_GIB $CRF_CEILING_BYTES" "5.25 $(gib_bytes 5.25)"
     crf_tier_load series High
     eq "crf_tier_load series High"        "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB $CRF_CEILING_BYTES" "18 21 5 $(gib_bytes 5)"
     crf_tier_load series Base
@@ -226,9 +231,9 @@ check "default compress.conf loads"           "load_policy 2>'$T/pol.err'"
     eq    "series policy lines: audio copied for all 3" "$(grep -c '^  audio: copied unchanged' <<< "$spl")" 3
     crf_tier_load movie Custom 21.5
     eq "crf_tier_load Custom: exact, no ceiling" "$CRF_MIN $CRF_MAX $CRF_CEILING_BYTES" "21.5 21.5 0"
-    pl=$(crf_policy_lines movie High)
+    pl=$(crf_policy_lines movie High "" 7200)
     check "policy lines: CRF range + ceiling" \
-        "grep -q 'CRF range: 19-23, search starts at 19 (' <<< \"\$pl\" && grep -q 'video size ceiling: 7 GiB' <<< \"\$pl\" && grep -q 'audio: copied unchanged' <<< \"\$pl\""
+        "grep -q 'CRF range: 19-23, search starts at 19 (' <<< \"\$pl\" && grep -q 'video size ceiling: 3.5 GiB per hour of runtime' <<< \"\$pl\" && grep -q 'this movie: 02:00:00 -> 7.00 GiB video ceiling' <<< \"\$pl\" && grep -q 'audio: copied unchanged' <<< \"\$pl\""
     check "policy lines: no 'minimum quality' wording" \
         "! { crf_policy_lines movie High; crf_policy_lines series Base; movie_policy_line High; } | grep -qi 'minimum quality'"
 }
@@ -257,10 +262,10 @@ conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the (pinned) test conf
     eq "Q3 never at or above the source" "$CRF_SELECTED" 10
 
     # edited CRF settings are used
-    COMPRESS_CONF=$(conf_with crfedit MOVIE_HIGH_CRF_SEARCH_MIN=18 MOVIE_HIGH_CRF_START=18 MOVIE_HIGH_CRF_MAX=22 MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=9.5)
+    COMPRESS_CONF=$(conf_with crfedit MOVIE_HIGH_CRF_SEARCH_MIN=18 MOVIE_HIGH_CRF_START=18 MOVIE_HIGH_CRF_MAX=22 MOVIE_HIGH_VIDEO_GIB_PER_HOUR=4.75)
     load_policy 2>/dev/null
-    crf_tier_load movie High
-    eq "edited High CRF settings"         "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB" "18 22 9.5"
+    crf_tier_load movie High "" 7200
+    eq "edited High CRF settings"         "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB" "18 22 9.50"
 
     # a config still setting the former audio policy loads, with a note
     COMPRESS_CONF=$(conf_with retired MOVIE_HIGH_AUDIO_MAX_GIB=2 SERIES_HIGH_AAC_KBPS_6=640)
@@ -268,11 +273,18 @@ conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the (pinned) test conf
     check "retired audio settings: named as ignored" \
         "grep -q 'ignored' '$T/retired.err' && grep -q MOVIE_HIGH_AUDIO_MAX_GIB '$T/retired.err' && grep -q SERIES_HIGH_AAC_KBPS_6 '$T/retired.err'"
 
-    # ... and the former High/Base GiB/hour settings, with a note
-    COMPRESS_CONF=$(conf_with retiredv MOVIE_HIGH_VIDEO_GIB_PER_HOUR=3.0 SERIES_BASE_VIDEO_FLOOR_MBPS=2.5)
+    # ... and the former High/Base two-pass size-target settings, with a
+    # note (series GiB/hour; the movie GiB/hour keys are active again)
+    COMPRESS_CONF=$(conf_with retiredv SERIES_HIGH_VIDEO_GIB_PER_HOUR=3.0 MOVIE_HIGH_VIDEO_FLOOR_MBPS=6 SERIES_BASE_VIDEO_FLOOR_MBPS=2.5)
     check "retired GiB/hour settings: still loads" "load_policy 2>'$T/retiredv.err'"
     check "retired GiB/hour settings: named as ignored" \
-        "grep -q 'High/Base size-target' '$T/retiredv.err' && grep -q MOVIE_HIGH_VIDEO_GIB_PER_HOUR '$T/retiredv.err' && grep -q SERIES_BASE_VIDEO_FLOOR_MBPS '$T/retiredv.err'"
+        "grep -q 'High/Base size-target' '$T/retiredv.err' && grep -q SERIES_HIGH_VIDEO_GIB_PER_HOUR '$T/retiredv.err' && grep -q MOVIE_HIGH_VIDEO_FLOOR_MBPS '$T/retiredv.err' && grep -q SERIES_BASE_VIDEO_FLOOR_MBPS '$T/retiredv.err'"
+    check "movie GiB/hour keys not named as ignored" \
+        "! grep -qE '^ +MOVIE_(HIGH|BASE)_VIDEO_GIB_PER_HOUR\$' '$T/retiredv.err'"
+    # ... and the former fixed movie High/Base ceilings
+    COMPRESS_CONF=$(conf_with retiredc MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=7)
+    check "former fixed movie ceiling: loads, named as ignored" \
+        "load_policy 2>'$T/retiredc.err' && grep -q 'former fixed movie High/Base video' '$T/retiredc.err' && grep -q MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB '$T/retiredc.err'"
 }
 COMPRESS_CONF="$T/compress.conf"
 load_policy 2>/dev/null
@@ -289,7 +301,7 @@ echo "== CRF selection (estimates from a stand-in estimator)"
         local kv
         FAKE=(); CALLS=()
         for kv in $3; do FAKE[${kv%%=*}]="${kv#*=}"; done
-        crf_tier_load "$1" "$2"
+        crf_tier_load "$1" "$2" "" 7200   # movie: a 2 h runtime (High 7 / Base 2 GiB)
         crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" fake_est
     }
 
@@ -590,14 +602,16 @@ check "former MOVIE_HIGH_CRF_MIN alone: loads, noted" \
     "( COMPRESS_CONF='$f' load_policy ) 2>'$T/legacy.err' && grep -q 'former High/Base \*_CRF_MIN' '$T/legacy.err' && grep -q MOVIE_HIGH_CRF_MIN '$T/legacy.err'"
 eq "former MOVIE_HIGH_CRF_MIN alone: start = search floor = 17 (no search below)" \
     "$( COMPRESS_CONF="$f" load_policy 2>/dev/null; crf_tier_load movie High; echo "$CRF_START $CRF_MIN $CRF_MAX" )" "17 17 23"
-reject "zero High ceiling"        'MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB="0": must be greater than 0' MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=0
+reject "zero High GiB/hour"       'MOVIE_HIGH_VIDEO_GIB_PER_HOUR="0": must be greater than 0' MOVIE_HIGH_VIDEO_GIB_PER_HOUR=0
+reject "negative Base GiB/hour"   'MOVIE_BASE_VIDEO_GIB_PER_HOUR="-1": must not be negative' MOVIE_BASE_VIDEO_GIB_PER_HOUR=-1
+reject "zero series High ceiling" 'SERIES_HIGH_VIDEO_SIZE_CEILING_GIB="0": must be greater than 0' SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=0
 reject "negative Base ceiling"    'SERIES_BASE_VIDEO_SIZE_CEILING_GIB="-2": must not be negative' SERIES_BASE_VIDEO_SIZE_CEILING_GIB=-2
 reject "zero sample seconds"      'CRF_SAMPLE_SECONDS="0": must be greater than 0' CRF_SAMPLE_SECONDS=0
 reject "zero sample points"       'MOVIE_CRF_SAMPLE_POINTS="0": must be at least 1' MOVIE_CRF_SAMPLE_POINTS=0
 check "CRF_MIN = CRF_MAX allowed" "( COMPRESS_CONF=\$(conf_with crfeq MOVIE_HIGH_CRF_SEARCH_MIN=21 MOVIE_HIGH_CRF_START=21 MOVIE_HIGH_CRF_MAX=21) load_policy )"
 check "CRF 0 allowed"             "( COMPRESS_CONF=\$(conf_with crf0 MOVIE_HIGH_CRF_SEARCH_MIN=0 MOVIE_HIGH_CRF_START=0) load_policy )"
-for k in MOVIE_HIGH_CRF_START MOVIE_HIGH_CRF_SEARCH_MIN MOVIE_HIGH_CRF_MAX MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB \
-         MOVIE_BASE_CRF_START MOVIE_BASE_CRF_SEARCH_MIN MOVIE_BASE_CRF_MAX MOVIE_BASE_VIDEO_SIZE_CEILING_GIB \
+for k in MOVIE_HIGH_CRF_START MOVIE_HIGH_CRF_SEARCH_MIN MOVIE_HIGH_CRF_MAX MOVIE_HIGH_VIDEO_GIB_PER_HOUR \
+         MOVIE_BASE_CRF_START MOVIE_BASE_CRF_SEARCH_MIN MOVIE_BASE_CRF_MAX MOVIE_BASE_VIDEO_GIB_PER_HOUR \
          SERIES_HIGH_CRF_START SERIES_HIGH_CRF_SEARCH_MIN SERIES_HIGH_CRF_MAX SERIES_HIGH_VIDEO_SIZE_CEILING_GIB \
          SERIES_BASE_CRF_START SERIES_BASE_CRF_SEARCH_MIN SERIES_BASE_CRF_MAX SERIES_BASE_VIDEO_SIZE_CEILING_GIB \
          CRF_SAMPLE_SECONDS MOVIE_CRF_SAMPLE_POINTS SERIES_CRF_SAMPLE_EPISODES SERIES_CRF_SAMPLE_POINTS; do
@@ -1856,11 +1870,17 @@ av_source -c:v libx264 -preset ultrafast -qp 0 "$DH/compress/in/Demo.mkv"
 e19=$(WORK_DIR="$DH/compress/work" whole_title_estimate "$DH/compress/in/Demo.mkv" 19)
 e20=$(WORK_DIR="$DH/compress/work" whole_title_estimate "$DH/compress/in/Demo.mkv" 20)
 check "demo: CRF 20 estimate below CRF 19"      "(( e20 < e19 ))"
+# the High rate (GiB per hour of runtime) whose ceiling for this runtime
+# is midway between the CRF 19 and 20 estimates
+ddur=$(get_duration "$DH/compress/in/Demo.mkv" | tr -d '\r')
 ceil=$(awk -v a="$e19" -v b="$e20" 'BEGIN { printf "%.12f", (a + b) / 2 / 1073741824 }')
-DEMO_CONF=$(conf_with demo "MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")
+drate=$(awk -v a="$e19" -v b="$e20" -v d="$ddur" 'BEGIN { printf "%.12f", (a + b) / 2 / 1073741824 * 3600 / d }')
+dceil=$(movie_ceiling_bytes "$drate" "$ddur")
+DEMO_CONF=$(conf_with demo "MOVIE_HIGH_VIDEO_GIB_PER_HOUR=$drate")
+check "demo: calculated ceiling between the CRF 20 and 19 estimates" "(( e20 <= dceil && dceil < e19 ))"
 run_menu "$DH" "$DH/compress/work/movie_compress.sh" "1\n2\nn\n" "$T/demo_high.log" "$DEMO_CONF"
 djob=$(first_job "$DH" c)
-echo "  ---- menu excerpt (ceiling $ceil GiB = midway between the CRF 19 and 20 estimates)"
+echo "  ---- menu excerpt (ceiling $ceil GiB = $drate GiB/hour x $ddur s, midway between the CRF 19 and 20 estimates)"
 sed -n '/^CRF analysis:/,/estimated total/p' "$T/demo_high.log" | sed 's/^/  | /'
 check "demo: CRF 19 estimated too large"        "grep -q '^  CRF 19 -> estimated ' '$T/demo_high.log'"
 check "demo: CRF 20 estimated, fits"            "grep -q '^  CRF 20 -> estimated ' '$T/demo_high.log'"
@@ -1868,6 +1888,7 @@ check "demo: nothing above CRF 20 sampled"      "! grep -qE 'sampling CRF (2[1-9
 check "demo: selected CRF 20"                   "grep -A1 '^Selected:' '$T/demo_high.log' | grep -q 'CRF 20'"
 check "demo: job is single-pass CRF 20"         "grep -q -- '-crf:v:0 20 ' '$djob' && [[ \$(grep -c libx265 '$djob') == 1 ]] && ! grep -qE -- '-b:v|pass=' '$djob'"
 eq    "demo: job carries the CRF 20 estimate"   "$(grep -o 'est_vbytes=[0-9]*' "$djob" | cut -d= -f2)" "$e20"
+eq    "demo: job ceiling_vbytes = runtime x GiB/hour" "$(grep -o 'ceiling_vbytes=[0-9]*' "$djob" | cut -d= -f2)" "$dceil"
 bash "$djob" < /dev/null > "$T/demo_run.log" 2>&1
 echo "  ---- job excerpt"
 sed -n '/^Finished:/,/Audio: *copied/p' "$T/demo_run.log" | sed 's/^/  | /'
@@ -1876,6 +1897,7 @@ check "demo: audio copied (payload MATCH)"      "grep -q 'Audio track 1: *COPIED
 check "demo: actual vs estimate reported"       "grep -q 'Estimated video size: ' '$T/demo_run.log' && grep -qE 'Estimate error: +[-+][0-9.]+%' '$T/demo_run.log'"
 check "demo: job succeeded"                     "grep -q 'All encodes finished: 1 ok, 0 failed' '$T/demo_run.log'"
 check "demo: accuracy recorded"                 "awk -F'\\t' '\$2 == \"High\" && \$3 == \"20\" { f = 1 } END { exit !f }' '$DH/compress/work/logs/crf_estimates.tsv'"
+check "demo: post-encode check used the same ceiling" "awk -F'\\t' '\$2 == \"High\" && \$3 == \"20\" && \$11 == \"$dceil\" { f = 1 } END { exit !f }' '$DH/compress/work/logs/crf_estimates.tsv'"
 cp "$ROOT/verify.sh" "$DH/compress/"
 printf '2\n1\n' | HOME="$DH" bash "$DH/compress/verify.sh" > "$T/demo_verify.log" 2>&1
 check "demo: verify.sh shows x265 CRF 20"       "grep -q 'Video encode *x265 CRF 20.0 (single pass)' '$T/demo_verify.log' && grep -q 'Tier *High' '$T/demo_verify.log'"
@@ -1891,7 +1913,7 @@ check "demo Base: selected CRF 25"              "grep -A1 '^Selected:' '$T/demo_
 echo
 echo "== ceiling not reachable within the CRF range"
 rm -f "$DH/compress/work"/c[0-9]*.sh
-TINY_CONF=$(conf_with tiny MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=0.000000001 MOVIE_BASE_VIDEO_SIZE_CEILING_GIB=0.000000001)
+TINY_CONF=$(conf_with tiny MOVIE_HIGH_VIDEO_GIB_PER_HOUR=0.00001 MOVIE_BASE_VIDEO_GIB_PER_HOUR=0.00001)
 run_menu "$DH" "$DH/compress/work/movie_compress.sh" "1\n2\n1\nn\n" "$T/over_high.log" "$TINY_CONF"
 check "5 High: every CRF 19..23 sampled"        "[[ \$(grep -cE 'sampling CRF (19|2[0-3]) ' '$T/over_high.log') == 5 ]] && ! grep -q 'sampling CRF 24' '$T/over_high.log'"
 check "5 High: warning names the range"         "grep -q 'cannot be met within the' '$T/over_high.log' && grep -q 'High CRF range: even CRF 23' '$T/over_high.log'"
@@ -2135,6 +2157,13 @@ bash "$SRC_WORK/tests/verify_preserve_tests.sh" > "$T/verify_preserve.out" 2>&1
 grep -E '^  (ok|FAIL) ' "$T/verify_preserve.out"
 PASS=$((PASS + $(grep -c '^  ok ' "$T/verify_preserve.out")))
 FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/verify_preserve.out")))
+
+echo
+echo "== movie High / Base runtime-scaled video ceiling (movie_ceiling_tests.sh)"
+bash "$SRC_WORK/tests/movie_ceiling_tests.sh" > "$T/movie_ceiling.out" 2>&1
+grep -E '^  (ok|FAIL) ' "$T/movie_ceiling.out"
+PASS=$((PASS + $(grep -c '^  ok ' "$T/movie_ceiling.out")))
+FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/movie_ceiling.out")))
 
 echo
 echo "== HDR tool initialization under set -u (hdr_init_tests.sh)"

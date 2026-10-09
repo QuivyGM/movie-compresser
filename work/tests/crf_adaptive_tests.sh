@@ -67,8 +67,8 @@ conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the project config
 COMPRESS_CONF=$(conf_with base \
     MOVIE_QUALITY_TARGET_VIDEO_GIB=20 MOVIE_QUALITY_ACCEPT_MIN_GIB=18 MOVIE_QUALITY_ACCEPT_MAX_GIB=22 \
     MOVIE_QUALITY_CRF_MIN=0 MOVIE_QUALITY_CRF_START=8 MOVIE_QUALITY_CRF_MAX=23 \
-    MOVIE_HIGH_CRF_SEARCH_MIN=12 MOVIE_HIGH_CRF_START=12 MOVIE_HIGH_CRF_MAX=23 MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=7 \
-    MOVIE_BASE_CRF_SEARCH_MIN=20 MOVIE_BASE_CRF_START=20 MOVIE_BASE_CRF_MAX=29 MOVIE_BASE_VIDEO_SIZE_CEILING_GIB=2 \
+    MOVIE_HIGH_CRF_SEARCH_MIN=12 MOVIE_HIGH_CRF_START=12 MOVIE_HIGH_CRF_MAX=23 MOVIE_HIGH_VIDEO_GIB_PER_HOUR=3.5 \
+    MOVIE_BASE_CRF_SEARCH_MIN=20 MOVIE_BASE_CRF_START=20 MOVIE_BASE_CRF_MAX=29 MOVIE_BASE_VIDEO_GIB_PER_HOUR=1.0 \
     SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=21 SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=5 \
     SERIES_BASE_CRF_SEARCH_MIN=13 SERIES_BASE_CRF_START=13 SERIES_BASE_CRF_MAX=27 SERIES_BASE_VIDEO_SIZE_CEILING_GIB=1.5 \
     SERIES_CRF_OUTLIER_PCT=25 SERIES_CRF_SAMPLE_EPISODES=4 CRF_ADAPTIVE_STEP_THRESHOLD_PCT=150)
@@ -334,7 +334,7 @@ echo
 echo "== 5. movie High / Base / Quality"
 
 for tier in High Base; do
-    crf_tier_load movie "$tier"
+    crf_tier_load movie "$tier" "" 7200   # 2 h: High 7 / Base 2 GiB
     g=$(awk -v c="$CRF_CEILING_GIB" 'BEGIN { print c * 2.5 }')
     EST=()
     for ((c = CRF_MIN; c <= CRF_MAX; c++)); do
@@ -346,7 +346,7 @@ for tier in High Base; do
     eq "movie $tier 2.5 x: starts with a jump" "${CRF_TRIED[0]} ${CRF_TRIED[1]}" "$CRF_MIN $((CRF_MIN + 2))"
     check "movie $tier: boundary below the chosen CRF estimated over" "low_ok $CRF_CEILING_BYTES"
     # a jump that lands on a fit: the boundary CRF is checked
-    EST=([$CRF_MIN]="$g" [$((CRF_MIN + 1))]="$CRF_CEILING_GIB.5" [$((CRF_MIN + 2))]="$CRF_CEILING_GIB")
+    EST=([$CRF_MIN]="$g" [$((CRF_MIN + 1))]="$(awk -v x="$CRF_CEILING_GIB" 'BEGIN { print x + 0.5 }')" [$((CRF_MIN + 2))]="$CRF_CEILING_GIB")
     run "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_GIB"
     eq "movie $tier boundary: $((CRF_MIN + 1)) over, $((CRF_MIN + 2)) fits" "$CRF_SELECTED/$CRF_BOUNDARY_LOW/${CRF_TRIED[*]}" \
         "$((CRF_MIN + 2))/$((CRF_MIN + 1))/$CRF_MIN $((CRF_MIN + 2)) $((CRF_MIN + 1))"
@@ -366,7 +366,7 @@ crf_sample_title() {   # FILE VIDX FILTER CRF DURATION POINTS
 }
 CRF_TITLE_FILE=/m/Film.mkv CRF_TITLE_VIDX=0 CRF_TITLE_FILTER="" CRF_TITLE_DURATION=100 CRF_TITLE_POINTS=5
 TGIB=([12]=17.5 [13]=7.4 [14]=6.9 [15]=6.0)
-crf_tier_load movie High
+crf_tier_load movie High "" 7200
 TIER=High
 crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_title_estimate crf_title_step_report > "$T/movie.out"
 sed 's/^/  | /' "$T/movie.out"

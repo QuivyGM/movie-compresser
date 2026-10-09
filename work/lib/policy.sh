@@ -14,7 +14,7 @@
 
 POLICY_KEYS_POSITIVE=(
     MOVIE_QUALITY_TARGET_VIDEO_GIB MOVIE_QUALITY_ACCEPT_MIN_GIB MOVIE_QUALITY_ACCEPT_MAX_GIB
-    MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB MOVIE_BASE_VIDEO_SIZE_CEILING_GIB
+    MOVIE_HIGH_VIDEO_GIB_PER_HOUR MOVIE_BASE_VIDEO_GIB_PER_HOUR
     SERIES_HIGH_VIDEO_SIZE_CEILING_GIB SERIES_BASE_VIDEO_SIZE_CEILING_GIB
     SERIES_CRF_OUTLIER_PCT
     CRF_SAMPLE_SECONDS
@@ -76,12 +76,21 @@ POLICY_KEYS_RETIRED_QUALITY=(
 
 # Settings of the former High / Base size-target (GiB/hour, two-pass)
 # video policy, replaced by the CRF tiers; a config that still sets
-# them gets a note.
+# them gets a note. (MOVIE_HIGH / MOVIE_BASE_VIDEO_GIB_PER_HOUR are not
+# among them: they are active again, as the rate of the movie High /
+# Base video ceiling, POLICY_KEYS_POSITIVE.)
 POLICY_KEYS_RETIRED_VIDEO=(
-    MOVIE_HIGH_VIDEO_GIB_PER_HOUR MOVIE_HIGH_VIDEO_FLOOR_MBPS MOVIE_HIGH_VIDEO_MAX_MBPS
-    MOVIE_BASE_VIDEO_GIB_PER_HOUR MOVIE_BASE_VIDEO_FLOOR_MBPS MOVIE_BASE_VIDEO_MAX_MBPS
+    MOVIE_HIGH_VIDEO_FLOOR_MBPS MOVIE_HIGH_VIDEO_MAX_MBPS
+    MOVIE_BASE_VIDEO_FLOOR_MBPS MOVIE_BASE_VIDEO_MAX_MBPS
     SERIES_HIGH_VIDEO_GIB_PER_HOUR SERIES_HIGH_VIDEO_FLOOR_MBPS SERIES_HIGH_VIDEO_MAX_MBPS
     SERIES_BASE_VIDEO_GIB_PER_HOUR SERIES_BASE_VIDEO_FLOOR_MBPS SERIES_BASE_VIDEO_MAX_MBPS
+)
+
+# Former fixed per-movie High / Base video ceilings, replaced by the
+# runtime-scaled MOVIE_*_VIDEO_GIB_PER_HOUR; a config that still sets
+# them gets a note (series keep their fixed SERIES_*_VIDEO_SIZE_CEILING_GIB).
+POLICY_KEYS_RETIRED_MOVIE_CEILING=(
+    MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB MOVIE_BASE_VIDEO_SIZE_CEILING_GIB
 )
 
 policy_conf_path() {
@@ -250,6 +259,7 @@ load_policy() {
         "${POLICY_KEYS_CRF[@]}" "${POLICY_KEYS_COUNT[@]}" \
         "${POLICY_KEYS_RETIRED[@]}" "${POLICY_KEYS_RETIRED_VIDEO[@]}" \
         "${POLICY_KEYS_RETIRED_QUALITY[@]}" "${POLICY_KEYS_LEGACY_CRF_MIN[@]}" \
+        "${POLICY_KEYS_RETIRED_MOVIE_CEILING[@]}" \
         SERIES_CONTAINER_RESERVE_PCT CRF_DOWN_RETRY_HEADROOM_PCT CRF_DOWN_RETRY_MAX \
         CRF_DOWN_RETRY_FIT_MARGIN_PCT SERIES_CRF_DOWN_RETRY_MAX \
         CRF_ADAPTIVE_STEP_THRESHOLD_PCT
@@ -321,7 +331,20 @@ policy_retired_note() {
     if (( ${#set[@]} )); then
         echo "Note: $(policy_conf_path) still sets former High/Base size-target" >&2
         echo "      settings, which are ignored (High and Base are CRF tiers now:" >&2
-        echo "      *_CRF_START / *_CRF_SEARCH_MIN / *_CRF_MAX / *_VIDEO_SIZE_CEILING_GIB):" >&2
+        echo "      *_CRF_START / *_CRF_SEARCH_MIN / *_CRF_MAX, MOVIE_*_VIDEO_GIB_PER_HOUR," >&2
+        echo "      SERIES_*_VIDEO_SIZE_CEILING_GIB):" >&2
+        printf '        %s\n' "${set[@]}" >&2
+    fi
+
+    set=()
+    for k in "${POLICY_KEYS_RETIRED_MOVIE_CEILING[@]}"; do
+        [[ -n "${!k+x}" ]] && set+=("$k")
+    done
+
+    if (( ${#set[@]} )); then
+        echo "Note: $(policy_conf_path) still sets former fixed movie High/Base video" >&2
+        echo "      ceilings, which are ignored (the movie ceiling is the runtime x" >&2
+        echo "      MOVIE_HIGH_VIDEO_GIB_PER_HOUR / MOVIE_BASE_VIDEO_GIB_PER_HOUR):" >&2
         printf '        %s\n' "${set[@]}" >&2
     fi
 
@@ -365,8 +388,11 @@ quality_pick_text() {
     esac
 }
 
-# movie_policy_line TIER  ->  one-line description of the effective values
-movie_policy_line() {
+# movie_policy_line TIER [DURATION]  ->  one-line description of the
+# effective values (High / Base: with DURATION, the movie's ceiling too).
+# Output only: runs in a subshell like crf_policy_lines, so the caller's
+# tier / search state is never changed.
+movie_policy_line() (
     case "$1" in
         Quality)
             printf 'CRF %s-%s, search starts at %s [lowest CRF with the video estimate in %s-%s GiB, else closest to %s GiB]' \
@@ -374,9 +400,10 @@ movie_policy_line() {
                 "$MOVIE_QUALITY_ACCEPT_MIN_GIB" "$MOVIE_QUALITY_ACCEPT_MAX_GIB" "$MOVIE_QUALITY_TARGET_VIDEO_GIB"
             ;;
         High|Base)
-            crf_tier_load movie "$1"
-            printf 'CRF %s-%s, search starts at %s [lowest CRF with the video estimate at or below %s GiB]' \
-                "$CRF_MIN" "$CRF_MAX" "$CRF_START" "$CRF_CEILING_GIB"
+            crf_tier_load movie "$1" "" "${2:-}" || return 1
+            printf 'CRF %s-%s, search starts at %s [lowest CRF with the video estimate at or below %s GiB per hour of runtime%s]' \
+                "$CRF_MIN" "$CRF_MAX" "$CRF_START" "$CRF_GIB_PER_HOUR" \
+                "${CRF_CEILING_GIB:+: $CRF_CEILING_GIB GiB for this movie}"
             ;;
         Custom)
             printf 'CRF entered in the menu, used exactly'
@@ -384,7 +411,7 @@ movie_policy_line() {
     esac
 
     printf '; audio copied'
-}
+)
 
 # audio_copy_policy_lines  ->  the audio rule of the movie / series menus
 audio_copy_policy_lines() {
@@ -393,9 +420,10 @@ audio_copy_policy_lines() {
     echo "  use audio_compress_menu.sh for optional audio compression"
 }
 
-# movie_video_policy_lines TIER  ->  the tier's video settings, one per line
+# movie_video_policy_lines TIER [CUSTOM_CRF [DURATION]]  ->  the tier's
+# video settings, one per line
 movie_video_policy_lines() {
-    crf_policy_lines movie "$1" "${2:-}"
+    crf_policy_lines movie "$1" "${2:-}" "${3:-}"
 }
 
 # ------------------------------------------------------------
@@ -406,8 +434,12 @@ movie_video_policy_lines() {
 #   CRF_MIN    the lowest CRF the search may choose (*_CRF_SEARCH_MIN),
 #              also the floor of the post-encode lower-CRF retry
 #   CRF_MAX    the lowest quality allowed; never exceeded automatically
-# Per title the adjacent boundary around the VIDEO size ceiling is found
-# (crf_search_boundary):
+# The VIDEO size ceiling: movie High / Base the movie's exact runtime x
+# MOVIE_*_VIDEO_GIB_PER_HOUR (movie_ceiling_bytes, computed once the
+# runtime is known); series High / Base a fixed SERIES_*_VIDEO_SIZE_CEILING_GIB
+# per episode. Either way it is one number of bytes for the search and
+# the post-encode retry. Per title the adjacent boundary around it is
+# found (crf_search_boundary):
 #
 #   CRF N over the ceiling, CRF N + 1 fits  ->  N + 1
 #
@@ -435,27 +467,69 @@ crf_valid() {
         awk -v c="$1" -v l="$CRF_LIMIT" 'BEGIN { exit !(c >= 0 && c <= l) }'
 }
 
-# crf_tier_load SCOPE TIER [CUSTOM_CRF]
+# movie_ceiling_bytes GIB_PER_HOUR DURATION_SECONDS  ->  whole bytes
 #
-# SCOPE: movie | series. TIER: High | Base | Custom.
+# The movie High / Base video ceiling:
+#   DURATION_SECONDS / 3600 x GIB_PER_HOUR x 1073741824
+# from the exact runtime (not rounded hours / minutes); rounded to a
+# whole byte only at the end, and never below 1 byte (a ceiling of 0
+# would mean "no ceiling"). Video only (audio, subtitles, attachments
+# and container overhead are not part of it). Returns 1 (nothing
+# printed) when either value is not a positive number.
+movie_ceiling_bytes() {
+    [[ "${1:-}" =~ ^[0-9]+([.][0-9]+)?$ && "${2:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    awk -v r="$1" -v d="$2" 'BEGIN {
+        if (r <= 0 || d <= 0) exit 1
+        b = r * 1073741824 * d / 3600
+        printf "%.0f", (b < 1 ? 1 : b) }'
+}
+
+# crf_tier_load SCOPE TIER [CUSTOM_CRF [DURATION]]
+#
+# SCOPE: movie | series. TIER: High | Base | Custom (| Quality, movie).
 # Sets CRF_START (first CRF estimated) CRF_MIN (absolute lowest CRF:
 # search and post-encode retry floor) CRF_MAX CRF_CEILING_GIB
-# CRF_CEILING_BYTES.
+# CRF_CEILING_BYTES CRF_GIB_PER_HOUR.
+# Movie High / Base: the ceiling scales with the runtime:
+# CRF_GIB_PER_HOUR = MOVIE_*_VIDEO_GIB_PER_HOUR and, with DURATION (the
+# movie's runtime in seconds), CRF_CEILING_BYTES = movie_ceiling_bytes
+# and CRF_CEILING_GIB its GiB ("7.00"). Without DURATION (menu text)
+# both ceiling values are empty; an unusable DURATION returns 1.
+# Series High / Base: the fixed SERIES_*_VIDEO_SIZE_CEILING_GIB per
+# episode (CRF_GIB_PER_HOUR empty).
 # Custom: CRF_START = CRF_MIN = CRF_MAX = CUSTOM_CRF, no ceiling
 # (CRF_CEILING_BYTES=0).
 crf_tier_load() {
     local scope="${1^^}" tier="$2" u
 
+    CRF_GIB_PER_HOUR=""
+
     case "$tier" in
         High|Base)
             u="${tier^^}"
             local a="${scope}_${u}_CRF_SEARCH_MIN" s="${scope}_${u}_CRF_START"
-            local b="${scope}_${u}_CRF_MAX" c="${scope}_${u}_VIDEO_SIZE_CEILING_GIB"
+            local b="${scope}_${u}_CRF_MAX"
             CRF_MIN="${!a}"
             CRF_START="${!s}"
             CRF_MAX="${!b}"
-            CRF_CEILING_GIB="${!c}"
-            CRF_CEILING_BYTES=$(_gib_bytes "$CRF_CEILING_GIB")
+            if [[ "$scope" == MOVIE ]]; then
+                local r="MOVIE_${u}_VIDEO_GIB_PER_HOUR"
+                CRF_GIB_PER_HOUR="${!r}"
+                CRF_CEILING_GIB=""
+                CRF_CEILING_BYTES=""
+                if [[ -n "${4:-}" ]]; then
+                    if ! CRF_CEILING_BYTES=$(movie_ceiling_bytes "$CRF_GIB_PER_HOUR" "$4"); then
+                        CRF_CEILING_BYTES=""
+                        echo "crf_tier_load: runtime \"$4\" cannot give the movie $tier video ceiling" >&2
+                        return 1
+                    fi
+                    CRF_CEILING_GIB=$(bytes_to_gib "$CRF_CEILING_BYTES")
+                fi
+            else
+                local c="${scope}_${u}_VIDEO_SIZE_CEILING_GIB"
+                CRF_CEILING_GIB="${!c}"
+                CRF_CEILING_BYTES=$(_gib_bytes "$CRF_CEILING_GIB")
+            fi
             ;;
         Custom)
             CRF_MIN="${3:-}"
@@ -486,16 +560,25 @@ crf_tier_load() {
     esac
 }
 
-# crf_policy_lines SCOPE TIER [CUSTOM_CRF]  ->  the tier's video policy
-crf_policy_lines() {
+# crf_policy_lines SCOPE TIER [CUSTOM_CRF [DURATION]]  ->  the tier's
+# video policy (movie High / Base with DURATION: the movie's ceiling)
+#
+# Output only: the body runs in a subshell, so the crf_tier_load below
+# never touches the caller's tier / search state (CRF_MIN, CRF_START,
+# CRF_MAX, CRF_CEILING_BYTES, CRF_CEILING_GIB, CRF_GIB_PER_HOUR). The
+# menus call it (COMPRESS_VERBOSE=1) after they loaded and adjusted that
+# state, e.g. the source-limited Quality ceiling (source video - 1).
+crf_policy_lines() (
     local scope="$1" tier="$2"
 
-    crf_tier_load "$scope" "$tier" "${3:-}" || return 1
-
     if [[ "$tier" == "Quality" ]]; then
+        if [[ "${scope^^}" != MOVIE ]]; then
+            echo "crf_policy_lines: Quality is a movie tier" >&2
+            return 1
+        fi
         echo "Quality CRF search:"
-        echo "  Range: ${CRF_MIN}-${CRF_MAX}"
-        echo "  Start: ${CRF_START} (first CRF sampled; the search may go below or above it)"
+        echo "  Range: ${MOVIE_QUALITY_CRF_MIN}-${MOVIE_QUALITY_CRF_MAX}"
+        echo "  Start: ${MOVIE_QUALITY_CRF_START} (first CRF sampled; the search may go below or above it)"
         echo "  Target: ${MOVIE_QUALITY_TARGET_VIDEO_GIB} GiB"
         echo "  Band: ${MOVIE_QUALITY_ACCEPT_MIN_GIB}-${MOVIE_QUALITY_ACCEPT_MAX_GIB} GiB (copied audio not counted)"
         echo "  lowest CRF estimated inside the band; none inside: closest to the target"
@@ -504,6 +587,8 @@ crf_policy_lines() {
         echo "  audio: copied unchanged"
         return 0
     fi
+
+    crf_tier_load "$scope" "$tier" "${3:-}" "${4:-}" || return 1
 
     echo "$tier video policy:"
     if [[ "$tier" == "Custom" ]]; then
@@ -519,11 +604,13 @@ crf_policy_lines() {
         echo "  one season CRF; only an isolated outlier (> median +${SERIES_CRF_OUTLIER_PCT}%) gets its own higher CRF"
     else
         echo "  CRF range: ${CRF_MIN}-${CRF_MAX}, search starts at ${CRF_START} (lowest CRF that fits the ceiling)"
-        echo "  video size ceiling: ${CRF_CEILING_GIB} GiB"
+        echo "  video size ceiling: ${CRF_GIB_PER_HOUR} GiB per hour of runtime (runtime hours x ${CRF_GIB_PER_HOUR} GiB)"
+        [[ -n "$CRF_CEILING_GIB" ]] &&
+            echo "  this movie: $(format_hms "$4") -> ${CRF_CEILING_GIB} GiB video ceiling"
     fi
     echo "  encode: x265 CRF, single pass, preset slow, 10-bit"
     echo "  audio: copied unchanged"
-}
+)
 
 # crf_adaptive_step EST_BYTES CEILING_BYTES  ->  1 or 2: how far the
 # ascending search moves past a CRF estimated above the ceiling. 2 when

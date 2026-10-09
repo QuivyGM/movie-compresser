@@ -64,8 +64,8 @@ conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the project config
 
 # fixed tier values, independent of the project's current numbers
 COMPRESS_CONF=$(conf_with base \
-    MOVIE_HIGH_CRF_SEARCH_MIN=10 MOVIE_HIGH_CRF_START=12 MOVIE_HIGH_CRF_MAX=23 MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB=7 \
-    MOVIE_BASE_CRF_SEARCH_MIN=18 MOVIE_BASE_CRF_START=20 MOVIE_BASE_CRF_MAX=29 MOVIE_BASE_VIDEO_SIZE_CEILING_GIB=2 \
+    MOVIE_HIGH_CRF_SEARCH_MIN=10 MOVIE_HIGH_CRF_START=12 MOVIE_HIGH_CRF_MAX=23 MOVIE_HIGH_VIDEO_GIB_PER_HOUR=3.5 \
+    MOVIE_BASE_CRF_SEARCH_MIN=18 MOVIE_BASE_CRF_START=20 MOVIE_BASE_CRF_MAX=29 MOVIE_BASE_VIDEO_GIB_PER_HOUR=1.0 \
     SERIES_HIGH_CRF_SEARCH_MIN=8 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=21 SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=5 \
     SERIES_BASE_CRF_SEARCH_MIN=11 SERIES_BASE_CRF_START=13 SERIES_BASE_CRF_MAX=27 SERIES_BASE_VIDEO_SIZE_CEILING_GIB=1.5 \
     SERIES_CRF_OUTLIER_PCT=25 CRF_ADAPTIVE_STEP_THRESHOLD_PCT=150)
@@ -83,7 +83,7 @@ done
 check "project config: no former High/Base *_CRF_MIN" \
     "! grep -qE '^(MOVIE|SERIES)_(HIGH|BASE)_CRF_MIN=' '$SRC_WORK/lib/compress.conf'"
 check "project config loads" "COMPRESS_CONF='$SRC_WORK/lib/compress.conf' load_policy 2>/dev/null"
-crf_tier_load movie High
+crf_tier_load movie High "" 7200
 eq "crf_tier_load: start / floor / max are separate" "$CRF_START $CRF_MIN $CRF_MAX" "12 10 23"
 crf_tier_load series Base
 eq "crf_tier_load series Base"            "$CRF_START $CRF_MIN $CRF_MAX" "13 11 27"
@@ -165,7 +165,7 @@ eq "START clamped into MIN..MAX"           "${CALLS[0]}" 21
 
 # every tier: START over / START under / floor, through crf_tier_load
 for scope_tier in "movie High" "movie Base" "series High" "series Base"; do
-    crf_tier_load $scope_tier
+    crf_tier_load $scope_tier "" 7200   # movie: 2 h (High 7 / Base 2 GiB); series: fixed
     s=$CRF_START m=$CRF_MIN x=$CRF_MAX c=$CRF_CEILING_GIB
     est "$s=$(awk -v c="$c" 'BEGIN { print c * 1.02 }')" "$((s + 1))=$(awk -v c="$c" 'BEGIN { print c * 0.95 }')"
     bsel "$s" "$m" "$x" "$c"
@@ -245,7 +245,7 @@ crf_sample_title() {   # FILE VIDX FILTER CRF DURATION POINTS
     CRF_SAMPLE_BYTES=$(gib "${TGIB[$4]}")
 }
 CRF_TITLE_FILE=/m/Film.mkv CRF_TITLE_VIDX=0 CRF_TITLE_FILTER="" CRF_TITLE_DURATION=100 CRF_TITLE_POINTS=5
-crf_tier_load movie High
+crf_tier_load movie High "" 7200
 TIER=High
 TGIB=([12]=6.1 [11]=6.6 [10]=7.3)
 crf_select_boundary "$CRF_START" "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_title_estimate crf_title_step_report > "$T/m1.out"

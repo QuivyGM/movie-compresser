@@ -315,13 +315,15 @@ source "$SRC_WORK/lib/media_stats.sh"
 # ------------------------------------------------------------
 echo
 echo "== 6. High / Base / Custom / series (start, search floor, max)"
-crf_tier_load movie High
-eq "movie High from config"   "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB" "$MOVIE_HIGH_CRF_SEARCH_MIN $MOVIE_HIGH_CRF_MAX $MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB"
+crf_tier_load movie High "" 7200
+eq "movie High from config (2 h)" "$CRF_MIN $CRF_MAX $CRF_GIB_PER_HOUR $CRF_CEILING_BYTES" \
+    "$MOVIE_HIGH_CRF_SEARCH_MIN $MOVIE_HIGH_CRF_MAX $MOVIE_HIGH_VIDEO_GIB_PER_HOUR $(gib_bytes "$(awk -v r="$MOVIE_HIGH_VIDEO_GIB_PER_HOUR" 'BEGIN { print r * 2 }')")"
 eq "movie High policy line"   "$(movie_policy_line High)" \
-    "CRF $MOVIE_HIGH_CRF_SEARCH_MIN-$MOVIE_HIGH_CRF_MAX, search starts at $MOVIE_HIGH_CRF_START [lowest CRF with the video estimate at or below $MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB GiB]; audio copied"
+    "CRF $MOVIE_HIGH_CRF_SEARCH_MIN-$MOVIE_HIGH_CRF_MAX, search starts at $MOVIE_HIGH_CRF_START [lowest CRF with the video estimate at or below $MOVIE_HIGH_VIDEO_GIB_PER_HOUR GiB per hour of runtime]; audio copied"
 eq "movie High start / floor"  "$CRF_START $CRF_MIN" "$MOVIE_HIGH_CRF_START $MOVIE_HIGH_CRF_SEARCH_MIN"
-crf_tier_load movie Base
-eq "movie Base from config"   "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB" "$MOVIE_BASE_CRF_SEARCH_MIN $MOVIE_BASE_CRF_MAX $MOVIE_BASE_VIDEO_SIZE_CEILING_GIB"
+crf_tier_load movie Base "" 7200
+eq "movie Base from config (2 h)" "$CRF_MIN $CRF_MAX $CRF_GIB_PER_HOUR $CRF_CEILING_BYTES" \
+    "$MOVIE_BASE_CRF_SEARCH_MIN $MOVIE_BASE_CRF_MAX $MOVIE_BASE_VIDEO_GIB_PER_HOUR $(gib_bytes "$(awk -v r="$MOVIE_BASE_VIDEO_GIB_PER_HOUR" 'BEGIN { print r * 2 }')")"
 crf_tier_load movie Custom 21.5
 eq "Custom exact, no ceiling" "$CRF_MIN $CRF_MAX $CRF_CEILING_BYTES" "21.5 21.5 0"
 eq "Custom policy line"       "$(movie_policy_line Custom)" "CRF entered in the menu, used exactly; audio copied"

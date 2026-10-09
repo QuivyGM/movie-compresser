@@ -236,19 +236,30 @@ echo "== movie menu"
 
 src 320x180 2 "$H/compress/in/Film.mkv"
 
+# movie High / Base: the video ceiling is the exact runtime x the
+# project's MOVIE_*_VIDEO_GIB_PER_HOUR
+MHRATE=$(sed -n 's/^MOVIE_HIGH_VIDEO_GIB_PER_HOUR=//p' "$H/compress/work/lib/compress.conf")
+MBRATE=$(sed -n 's/^MOVIE_BASE_VIDEO_GIB_PER_HOUR=//p' "$H/compress/work/lib/compress.conf")
+FDUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$H/compress/in/Film.mkv" | tr -d '\r')
+FCEIL=$(awk -v r="$MHRATE" -v d="$FDUR" 'BEGIN { printf "%.0f", r * 1073741824 * d / 3600 }')
+FCEILGIB=$(awk -v b="$FCEIL" 'BEGIN { printf "%.2f", b / 1073741824 }')
+FBCEILGIB=$(awk -v r="$MBRATE" -v d="$FDUR" 'BEGIN { printf "%.2f", r * d / 3600 }')
+
 L="$T/movie1.log"
 menu movie_compress.sh "1\n2\nn\n" "$L"
 sed 's/^/  | /' "$L"
 check "no policy dump"                   "! grep -qE 'Policy:|video policy|^Audio:\$' '$L'"
 check "analysis line"                    "grep -qE '^Analyzing source\\.\\.\\. OK    Source stats: (scanned|scanned \\+ refreshed)\$' '$L'"
 check "header"                           "grep -qE '^Source: +Film.mkv\$' '$L' && grep -qE '^Runtime: +00:00:02\$' '$L' && grep -qE '^Video: +320x180 H264 8-bit +[0-9.]+ Mb/s   [0-9.]+ GiB\$' '$L' && grep -qE '^Dynamic range: +SDR\$' '$L' && grep -qE '^Audio: +1 track, [0-9.]+ GiB, copied unchanged\$' '$L'"
-check "tier menu"                        "grep -qE '^1\\) Quality  CRF search  <=[0-9.]+ GiB \\(source-limited\\)\$' '$L' && grep -qE '^2\\) High     CRF 10-23 +<=7 GiB\$' '$L' && grep -q '^4) Custom   exact CRF' '$L'"
+check "tier menu"                        "grep -qE '^1\\) Quality  CRF search  <=[0-9.]+ GiB \\(source-limited\\)\$' '$L' && grep -qE '^2\\) High     CRF 10-23 +<=$MHRATE GiB/h  \\($FCEILGIB GiB\\)\$' '$L' && grep -qE '^3\\) Base     CRF 18-29 +<=$MBRATE GiB/h  \\($FBCEILGIB GiB\\)\$' '$L' && grep -q '^4) Custom   exact CRF' '$L'"
+check "estimating: runtime, rate, ceiling" \
+    "[[ \"\$(grep -A3 '^Estimating High at 320x180' '$L' | tail -n 3 | tr '\\n' '|')\" == 'Runtime:        00:00:02|Size rate:      $MHRATE GiB/hour|Video ceiling:  $FCEILGIB GiB|' ]]"
 check "estimating + samples"             "grep -q '^Estimating High at 320x180\\.\\.\\.\$' '$L' && grep -qE '^  CRF 12   ~[0-9.]+ GiB\$' '$L' && grep -q '^           fits -> trying CRF 11\$' '$L' && ! grep -q 'sampling CRF' '$L'"
-check "CRF result"                       "grep -qE '^Video: +~[0-9.]+ GiB\$' '$L' && grep -q '^Ceiling:  7.00 GiB\$' '$L' && grep -q '^Selected: CRF 10\$' '$L' && grep -qE '^Total: +~[0-9.]+ GiB\$' '$L'"
-check "compact summary"                  "grep -q '^Added: Film.mkv\$' '$L' && grep -q '^  High | CRF 10 | 320x180 | SDR | audio copied\$' '$L' && grep -q '^  Output: Film HEVC High.mkv\$' '$L'"
+check "CRF result"                       "grep -qE '^Video: +~[0-9.]+ GiB\$' '$L' && grep -q '^Ceiling:  $FCEILGIB GiB  ($MHRATE GiB/h x 00:00:02)\$' '$L' && grep -q '^Selected: CRF 10\$' '$L' && grep -qE '^Total: +~[0-9.]+ GiB\$' '$L'"
+check "compact summary"                  "grep -q '^Added: Film.mkv\$' '$L' && grep -q '^  High | CRF 10 | 320x180 | SDR | audio copied\$' '$L' && grep -q '^  Ceiling: $FCEILGIB GiB video  ($MHRATE GiB/h x 00:00:02)\$' '$L' && grep -q '^  Output: Film HEVC High.mkv\$' '$L'"
 check "no long summary"                  "! grep -qE 'Video encode:|Compression tier: +High|^-----|Object audio' '$L'"
 check "compact: no ANSI / tabs / long lines" "compact '$L'"
-check "job: High CRF retry planned"      "grep -q 'mode=crf crf=10 .* ceiling_vbytes=7516192768 crf_min=10 crf_max=23' '$H/compress/work/c1.sh' && grep -q '^   item_crf_encode item_encode_1\$' '$H/compress/work/c1.sh'"
+check "job: High CRF retry planned"      "grep -q 'mode=crf crf=10 .* ceiling_vbytes=$FCEIL crf_min=10 crf_max=23' '$H/compress/work/c1.sh' && grep -q '^   item_crf_encode item_encode_1\$' '$H/compress/work/c1.sh'"
 
 rm -f "$H/compress/work"/c[0-9]*.sh "$H/compress/work"/*.state
 L="$T/movie_verbose.log"
