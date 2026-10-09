@@ -37,6 +37,12 @@
 # Outputs are written to "<output>.part" and only renamed to the final
 # name after ffmpeg succeeded and the result passed a duration check, so
 # an interrupted or failed encode is never left under the final name.
+# An incomplete or failed encode is deleted. A complete encode is never
+# deleted by a later failure (item_keep_completed): one that fails only
+# the output verification (metadata / chapters / HDR / DV) is kept as
+# "<output>.verify-failed", a verified one whose rename to the final
+# name fails as "<final>.finalize-failed", so it can be inspected,
+# repaired or renamed without encoding again.
 #
 # State for progress-check.sh is written to work/<session>.state
 # (key=value lines) and ffmpeg progress to work/<session>.progress.
@@ -77,6 +83,8 @@ job_init() {
     ITEM_OVERWRITE=0
     ITEM_LOG=""
     ITEM_FAIL_REASON=""
+    ITEM_KEPT=""              # complete encode kept after a post-encode failure
+    ITEM_KEPT_KIND=""         # verify-failed | finalize-failed
     ITEM_CHILD=""
     ITEM_TMP=""
     declare -gA ITEM_EXP=()
@@ -205,6 +213,8 @@ item_begin() {
     ITEM_FAIL_REASON=""
     ITEM_DURATION=""
     ITEM_FINAL=""
+    ITEM_KEPT=""
+    ITEM_KEPT_KIND=""
     ITEM_TMP="$JOB_LOG_DIR/item-$ITEM_INDEX.tmp"
     ITEM_EXP=()
     ITEM_CRF_RUN=""
@@ -546,9 +556,12 @@ item_succeeded() {
 
     # Metadata verification before the output gets its final name: a
     # Dolby Vision / HDR10+ preservation that did not survive, or lost
-    # colour signalling, fails the item.
+    # colour signalling, fails the item. The encode itself is complete
+    # (checked above), so it is kept for inspection / repair instead of
+    # being deleted with the failed item.
     if ! item_step verify item_verify_output; then
         [[ -s "$ITEM_TMP/report.txt" ]] && cat "$ITEM_TMP/report.txt"
+        item_keep_completed verify-failed "$ITEM_OUTPUT"
         item_failed
         return 1
     fi
@@ -566,9 +579,12 @@ item_succeeded() {
 
     # Rename only: an existing entry (also a symlink) is replaced, never
     # written through. -T: a symlink to a directory is replaced too,
-    # instead of moving the file into that directory.
+    # instead of moving the file into that directory. The encode is
+    # complete and verified: a failed rename keeps it, never deletes it.
     if ! mv -fT -- "$ITEM_PART" "$final"; then
-        item_failed "could not rename the finished .part file"
+        [[ -s "$ITEM_TMP/report.txt" ]] && cat "$ITEM_TMP/report.txt"
+        item_keep_completed finalize-failed "$final"
+        item_failed "could not rename the finished .part file to $(basename "$final")"
         return 1
     fi
 
@@ -601,6 +617,49 @@ item_succeeded() {
     job_write_state
 }
 
+# item_keep_completed KIND BASE  ->  the complete encode in "$ITEM_PART"
+# is kept after a post-encode failure instead of being deleted with the
+# failed item. KIND:
+#   verify-failed    it failed the output verification (BASE = the
+#                    planned output name)
+#   finalize-failed  it passed the verification, only the rename to its
+#                    final name failed (BASE = that final name)
+# It is renamed to "BASE.KIND", no-clobber (".KIND.2", ".KIND.3", ...
+# when taken; an existing file or symlink there is never replaced), and
+# recorded in ITEM_KEPT / ITEM_KEPT_KIND and logs/<job>/kept_unverified.txt
+# (verify-failed) or kept_finalize_failed.txt; item_failed adds it to
+# failed.tsv and the failure banner. Afterwards it is no longer a job
+# file (ITEM_PART empty, not in JOB_DONE_PARTS), so item_failed and an
+# interruption leave it alone. When this rename fails too, the file
+# stays under its encode name, also kept.
+item_keep_completed() {
+    local kind="$1" base="$2" dst n=2 list
+
+    [[ -n "$ITEM_PART" && -f "$ITEM_PART" && ! -L "$ITEM_PART" ]] || return 0
+    [[ -n "$base" ]] || base="$ITEM_OUTPUT"
+
+    dst="$base.$kind"
+    while [[ -e "$dst" || -L "$dst" ]]; do
+        dst="$base.$kind.$n"
+        ((n++))
+    done
+
+    if mv -nT -- "$ITEM_PART" "$dst" 2>/dev/null && [[ -e "$dst" && ! -e "$ITEM_PART" ]]; then
+        ITEM_KEPT="$dst"
+    else
+        ITEM_KEPT="$ITEM_PART"
+    fi
+    ITEM_KEPT_KIND="$kind"
+
+    unset 'JOB_DONE_PARTS[$ITEM_PART]'
+    ITEM_PART=""
+
+    list=kept_unverified.txt
+    [[ "$kind" == finalize-failed ]] && list=kept_finalize_failed.txt
+    printf '%s\n' "$ITEM_KEPT" >> "$JOB_LOG_DIR/$list" 2>/dev/null
+    echo "Completed encode kept ($kind): $ITEM_KEPT" >> "$ITEM_LOG"
+}
+
 # item_failed [REASON]
 item_failed() {
     local reason="${1:-${ITEM_FAIL_REASON:-encode failed}}"
@@ -630,7 +689,7 @@ item_failed() {
     if [[ -n "${ITEM_TMP:-}" ]]; then
         rmdir -- "$ITEM_TMP" 2>/dev/null || true
     fi
-    printf '%s\t%s\n' "$ITEM_NAME" "$reason" >> "$JOB_LOG_DIR/failed.tsv"
+    printf '%s\t%s\n' "$ITEM_NAME" "$reason${ITEM_KEPT:+ (encode kept: $ITEM_KEPT)}" >> "$JOB_LOG_DIR/failed.tsv"
 
     ((JOB_FAILED += 1))
     JOB_FAILED_NAMES+=("$ITEM_NAME")
@@ -644,7 +703,19 @@ item_failed() {
     if [[ -n "${ITEM_TMP:-}" && -d "$ITEM_TMP" ]]; then
         echo "  Files:  $ITEM_TMP"
     fi
-    echo "  No output was kept for this item. Continuing with the queue."
+    if [[ -n "${ITEM_KEPT:-}" && "${ITEM_KEPT_KIND:-}" == finalize-failed ]]; then
+        echo "  The encode completed and passed the verification; only the"
+        echo "  rename to its final name failed. Kept (rename it to use it):"
+        echo "    $ITEM_KEPT"
+        echo "  Continuing with the queue."
+    elif [[ -n "${ITEM_KEPT:-}" ]]; then
+        echo "  The encode completed; only the verification failed. Kept for"
+        echo "  inspection (NOT a verified output; rename or delete it):"
+        echo "    $ITEM_KEPT"
+        echo "  Continuing with the queue."
+    else
+        echo "  No output was kept for this item. Continuing with the queue."
+    fi
     echo "############################################################"
 }
 

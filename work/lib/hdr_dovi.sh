@@ -1201,16 +1201,21 @@ item_verify_output() {
     fi
 
     # ... and the full Matroska structure (editions, flags, nesting,
-    # UIDs, names + languages)
+    # UIDs, names + languages): the semantic comparison of
+    # chapter_xml_canon, against the XML that was written
     case "$state" in
         restored)
-            local oxml="$ITEM_TMP/chapters_output.xml"
-            if mkv_chapters_xml "$out" "$oxml" &&
-               diff -q <(chapter_xml_canon "$ITEM_TMP/chapters_restore.xml" "$ITEM_TMP/chapters_restore.xml") \
-                       <(chapter_xml_canon "$oxml" "$ITEM_TMP/chapters_restore.xml") >/dev/null; then
+            local oxml="$ITEM_TMP/chapters_output.xml" ref="$ITEM_TMP/chapters_restore.xml"
+            if ! mkv_chapters_xml "$out" "$oxml"; then
+                _rep "Editions" "CHANGED: $(chapter_xml_describe "$ref") -> no chapters read from the output" >&3
+                fails+=("edition/chapter structure differs from the source (no chapters read from the output)")
+            elif chapter_xml_same "$ref" "$oxml" "$ITEM_TMP/chapters_diff.txt"; then
+                rm -f -- "$ITEM_TMP/chapters_diff.txt"
                 _rep "Editions" "MATCH ($(chapter_xml_describe "$oxml"); UIDs + flags identical)" >&3
             else
-                _rep "Editions" "CHANGED: $(chapter_xml_describe "$ITEM_TMP/chapters_restore.xml") -> $( [[ -s "$oxml" ]] && chapter_xml_describe "$oxml" || echo none)" >&3
+                _rep "Editions" "CHANGED: $(chapter_xml_describe "$ref") -> $(chapter_xml_describe "$oxml")" >&3
+                grep -m 6 '^[<>]' "$ITEM_TMP/chapters_diff.txt" |
+                    sed 's/^</    source:/; s/^>/    output:/' >&3
                 fails+=("edition/chapter structure differs from the source")
             fi
             ;;

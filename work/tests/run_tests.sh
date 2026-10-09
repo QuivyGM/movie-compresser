@@ -37,6 +37,10 @@
 #     estimate vs actual reported; progress-check shows one encode step
 # 12. HDR10 / HDR10+ (needs hdr10plus_tool) / Dolby Vision on the CRF path
 # 13. HDR tool initialization in the menus under set -u (hdr_init_tests.sh)
+# 14. a complete encode that fails only the output verification is kept
+#     as <output>.verify-failed; semantic chapter comparison; the
+#     accepted CRF retry attempt is verified with its full chapter
+#     structure (verify_preserve_tests.sh)
 #
 # Runs in a temporary copy of work/ so real logs/jobs are untouched.
 # Everything here is synthetic: it proves the mechanics, not behaviour
@@ -2124,6 +2128,13 @@ bash "$SRC_WORK/tests/job_cleanup_tests.sh" > "$T/job_cleanup.out" 2>&1
 grep -E '^  (ok|FAIL) ' "$T/job_cleanup.out"
 PASS=$((PASS + $(grep -c '^  ok ' "$T/job_cleanup.out")))
 FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/job_cleanup.out")))
+
+echo
+echo "== completed-encode preservation / chapter verification (verify_preserve_tests.sh)"
+bash "$SRC_WORK/tests/verify_preserve_tests.sh" > "$T/verify_preserve.out" 2>&1
+grep -E '^  (ok|FAIL) ' "$T/verify_preserve.out"
+PASS=$((PASS + $(grep -c '^  ok ' "$T/verify_preserve.out")))
+FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/verify_preserve.out")))
 
 echo
 echo "== HDR tool initialization under set -u (hdr_init_tests.sh)"

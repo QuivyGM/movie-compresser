@@ -522,9 +522,16 @@ chapter_meta() {
         }'
 }
 
-# is_matroska FILE  ->  0 for MKV/MKA/MK3D (also "*.mkv.part")
+# is_matroska FILE  ->  0 for MKV/MKA/MK3D, also the job's encode files
+# of an MKV output: "<output>.part" and the CRF attempts
+# "<output>.retry-crf<N>.part" / "<output>.accepted-crf<N>.part"
+# (job_runtime.sh). The attempt names must match too: the output
+# verification reads the accepted attempt's chapters through this check.
 is_matroska() {
-    case "${1,,}" in
+    local n="${1,,}"
+
+    [[ "$n" =~ ^(.*)\.(retry|accepted)-crf[0-9]+\.part$ ]] && n="${BASH_REMATCH[1]}.part"
+    case "$n" in
         *.mkv|*.mka|*.mk3d|*.mkv.part) return 0 ;;
     esac
     return 1
@@ -578,34 +585,63 @@ chapter_xml_summary() {
 
 # chapter_xml_canon XML REFERENCE_XML
 #
-# Canonical form for comparing chapter structures: one line per
-# element, prefixed with its position (edition / chapter path), flags at
-# their default value dropped. Elements that mkvtoolnix generates when
-# they are missing (EditionUID, ChapLanguageIETF mirrored from the
-# legacy language) are only compared when REFERENCE_XML has them.
+# Canonical form for comparing chapter structures (mkvextract XML, one
+# element per line): one line per value, prefixed with its position
+# (edition / chapter path, plus the number of each sub-element such as
+# the n-th ChapterDisplay, so a name stays paired with its languages),
+# flags at their default value dropped, sorted. Sorting makes the order
+# of sibling values within one element irrelevant (writers serialise
+# them differently); the order of editions and chapters still counts,
+# it is part of every path. Elements that mkvtoolnix generates when they
+# are missing (EditionUID, ChapterUID, ChapLanguageIETF / ChapterLanguage
+# derived from each other, ChapterTimeEnd) are only compared when
+# REFERENCE_XML has them: when the source has them they must be kept
+# exactly (UIDs can be referenced by ordered chapters and tags).
 chapter_xml_canon() {
-    local euid=0 ietf=0
+    local gen
 
-    grep -q '<EditionUID>' "$2" && euid=1
-    grep -q '<ChapLanguageIETF>' "$2" && ietf=1
+    gen=$(grep -oE '<(EditionUID|ChapterUID|ChapLanguageIETF|ChapterLanguage|ChapterTimeEnd)>' "$2" |
+        sort -u | tr -d '<>' | tr '\n' ' ')
 
-    awk -v euid="$euid" -v ietf="$ietf" '
+    awk -v gen=" $gen" '
         function val(s) { sub(/^[^>]*>/, "", s); sub(/<[^<]*$/, "", s); return s }
-        function path(   p, i) { p = "E" ed; for (i = 1; i <= depth; i++) p = p "/" cnt[i]; return p }
-        /<EditionEntry>/ { ed++; depth = 0; delete cnt; next }
-        /<ChapterAtom>/  { depth++; cnt[depth]++; cnt[depth + 1] = 0; next }
-        /<\/ChapterAtom>/ { depth--; next }
-        /<ChapterDisplay>/ { disp++; next }
+        function path(   p, i) {
+            p = "E" ed
+            for (i = 1; i <= depth; i++) p = p "/" cnt[i]
+            for (i = 1; i <= sd; i++) p = p "/" st[i]
+            return p
+        }
+        /<EditionEntry>/  { ed++; depth = 0; sd = 0; delete cnt; next }
+        /<ChapterAtom>/   { depth++; cnt[depth]++; cnt[depth + 1] = 0; sd = 0; next }
+        /<\/ChapterAtom>/ { depth--; sd = 0; next }
+        /<\/(EditionEntry|Chapters)>/ { next }
+        # other master elements (ChapterDisplay, ChapterProcess, ...):
+        # numbered per chapter, so their values stay grouped
+        /^[ \t]*<[A-Za-z]+>[ \t]*$/ {
+            tag = $0; gsub(/[ \t<>]/, "", tag)
+            if (tag == "Chapters") next
+            k = path() "/" tag
+            st[++sd] = tag (++mc[k])
+            next
+        }
+        /^[ \t]*<\/[A-Za-z]+>[ \t]*$/ { if (sd > 0) sd--; next }
         match($0, /<[A-Za-z]+/) {
             tag = substr($0, RSTART + 1, RLENGTH - 1)
-            if (tag ~ /^(Chapters|EditionEntry|ChapterAtom|ChapterDisplay)$/) next
             v = val($0)
-            if (tag == "EditionUID" && !euid) next
-            if (tag == "ChapLanguageIETF" && !ietf) next
+            if (tag ~ /^(EditionUID|ChapterUID|ChapLanguageIETF|ChapterLanguage|ChapterTimeEnd)$/ &&
+                index(gen, " " tag " ") == 0) next
             if (tag ~ /^(EditionFlagOrdered|EditionFlagHidden|EditionFlagDefault|ChapterFlagHidden)$/ && v == "0") next
             if (tag == "ChapterFlagEnabled" && v == "1") next
             print path() "\t" tag "\t" v
-        }' "$1"
+        }' "$1" | LC_ALL=C sort
+}
+
+# chapter_xml_same REFERENCE_XML XML [DIFF_OUT]  ->  0 when XML has the
+# same chapter structure as REFERENCE_XML (chapter_xml_canon: editions,
+# chapters, start / stored end times exactly, names, languages, flags,
+# UIDs); the canonical differences go to DIFF_OUT
+chapter_xml_same() {
+    diff <(chapter_xml_canon "$1" "$1") <(chapter_xml_canon "$2" "$1") > "${3:-/dev/null}"
 }
 
 # chapter_xml_describe XML  ->  "2 editions (1 ordered), 4 chapters (1 nested, 1 hidden), ..."
