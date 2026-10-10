@@ -22,7 +22,8 @@
 # fits with at least down_headroom_pct to spare tries CRF - 1 (down to
 # crf_min, at most down_max times; High / Base also only when CRF - 1 is
 # predicted to fit, down_fit_pct); a lower attempt above the ceiling is
-# discarded and the fitting one kept. Movie High / Base
+# discarded and the fitting one kept. Movie High / Base also save every
+# completed attempt's actual video bytes (item_actual_save). Movie High / Base
 # (down_mode=boundary) instead test CRF - 1 exactly once after the first
 # fit, without headroom or prediction gate (the actual encode corrects
 # the estimate). Movie Quality uses the upper edge
@@ -954,6 +955,29 @@ _crf_step_ratio() {
         printf "%.4f", r }'
 }
 
+# item_actual_save CRF VIDEO_BYTES  ->  movie High / Base (item_expect
+# actual_sig=): the measured video bytes of a COMPLETED attempt (fitting
+# or over the ceiling) go to the actual-result cache (encode_common.sh
+# crf_actual_save) for later searches of the same movie and settings.
+# Not when the source changed since the search (size / mtime of the
+# fingerprint). A cache problem is only a warning; always returns 0.
+item_actual_save() {
+    local sig="${ITEM_EXP[actual_sig]:-}" st
+
+    [[ -n "$sig" && "$2" =~ ^[1-9][0-9]*$ ]] || return 0
+    st=$(stat -L -c '%s %Y' -- "$ITEM_INPUT" 2>/dev/null)
+    if [[ -z "$st" || "$sig" != "$CRF_ACTUAL_SCHEMA|stat=$st|"* ]]; then
+        echo "Actual CRF $1 result not cached: the source changed since the CRF search"
+        return 0
+    fi
+    if crf_actual_save "$sig" "$1" "$2"; then
+        echo "Saved actual CRF result: CRF $1 = $(_gib "$2") GiB"
+    else
+        echo "WARNING: could not save the actual CRF $1 result to the cache (encode not affected)"
+    fi
+    return 0
+}
+
 # _down_threshold CEILING_BYTES HEADROOM_PCT  ->  bytes at or below which
 # a fitting result may try CRF - 1 ("" = downward retry off)
 _down_threshold() {
@@ -1149,6 +1173,7 @@ item_crf_encode() {
 
         JOB_DONE_PARTS[$ITEM_PART]=1
         act=$(item_video_bytes "$ITEM_PART")
+        item_actual_save "$c" "$act"
 
         echo
         echo "CRF $c actual: $(_gib "$act") GiB / $(_gib "$ceil") GiB ceiling"
@@ -1246,6 +1271,7 @@ item_crf_encode() {
 
         JOB_DONE_PARTS[$ITEM_PART]=1
         a2=$(item_video_bytes "$ITEM_PART")
+        item_actual_save "$nc" "$a2"
 
         echo
         if (( boundary )); then

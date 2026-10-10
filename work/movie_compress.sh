@@ -21,7 +21,7 @@ source "$WORK_DIR/lib/policy.sh"
 # (assigned empty: "set -u" rejects ${#INPUTS[@]} of a never-assigned
 # array when every movie was skipped)
 declare -a INPUTS=() OUTPUTS=() VIDEOS=() EST_VBYTES=() RETRIES=() FILTERS=() TIERS=() OVERWRITES=()
-declare -a DV_POLICIES=() DV_MODES=() HDR10P_POLICIES=() QUALITY_SPECS=() CRF_EST_MAPS=()
+declare -a DV_POLICIES=() DV_MODES=() HDR10P_POLICIES=() QUALITY_SPECS=() CRF_EST_MAPS=() ACTUAL_SIGS=()
 
 # Compression policy: ~/compress/work/lib/compress.conf (loaded and validated
 # by work/lib/policy.sh). The policy math lives there as well
@@ -405,6 +405,18 @@ while true; do
         CRF_TITLE_DURATION="$DURATION"
         CRF_TITLE_POINTS="$MOVIE_CRF_SAMPLE_POINTS"
 
+        # High / Base: actual results of earlier encodes of this movie with
+        # the same encode settings (encode_common.sh crf_actual_sig) replace
+        # the sample estimate of exactly their CRF; the job saves every
+        # completed attempt under this fingerprint ("" = not cached).
+        # Quality / Custom never use it.
+        CRF_ACTUAL_SIG=""
+        declare -gA CRF_ACTUAL_HIT=()
+        if [[ ( "$TIER" == High || "$TIER" == Base ) && -z "$QUALITY_STATUS" ]]; then
+            CRF_ACTUAL_SIG=$(crf_actual_sig "$IN" "$VIDX" "$FILTER" "$OUT_WIDTH" "$OUT_HEIGHT" "$DURATION" \
+                "${DV_POLICY:-none}" "${DV_MODE:-}" "${HDR10P_POLICY:-none}") || CRF_ACTUAL_SIG=""
+        fi
+
         echo
         if ui_verbose; then
             printf "Estimating video size from sample encodes (%sx%s output%s):\n" \
@@ -433,7 +445,7 @@ while true; do
                 "$CRF_CEILING_BYTES" 0 "$CRF_CEILING_BYTES" \
                 "$SOURCE_VIDEO_BYTES" crf_title_estimate crf_title_step_report || CRF_SELECTED=""
         else
-            crf_select_boundary "$CRF_START" "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_title_estimate \
+            crf_select_boundary "$CRF_START" "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_title_estimate_actual \
                 crf_title_step_report || CRF_SELECTED=""
         fi
 
@@ -645,6 +657,9 @@ while true; do
     EST_MAP=""
     [[ "$VIDEO_SPEC" == crf:* ]] && EST_MAP=$(crf_est_map)
     CRF_EST_MAPS+=("$EST_MAP")
+    ACTUAL_SIG=""
+    [[ "$VIDEO_SPEC" == crf:* ]] && ACTUAL_SIG="${CRF_ACTUAL_SIG:-}"
+    ACTUAL_SIGS+=("$ACTUAL_SIG")
     FILTERS+=("$FILTER")
     TIERS+=("$TIER")
     OVERWRITES+=("$RESOLVED_OVERWRITE")
@@ -814,7 +829,8 @@ JOB_FILE="$WORK_DIR/$SESSION.sh"
             "${EST_VBYTES[$i]}" \
             "${RETRIES[$i]}" \
             "${QUALITY_SPECS[$i]}" \
-            "${CRF_EST_MAPS[$i]}"
+            "${CRF_EST_MAPS[$i]}" \
+            "${ACTUAL_SIGS[$i]}"
     done
 
     emit_job_footer

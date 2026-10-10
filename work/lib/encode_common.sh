@@ -461,6 +461,146 @@ crf_title_estimate() {
     fi
 }
 
+# ------------------------------------------------------------
+# Actual CRF results (movie High / Base)
+#
+# The measured main video bytes of every completed movie High / Base
+# CRF attempt (job_runtime.sh item_crf_encode: fitting or over the
+# ceiling) are kept under WORK_DIR/cache/crf_actual, one file per encode
+# fingerprint (crf_actual_sig; md5 of it as the name):
+#   line 1   "# SIGNATURE"   (checked on every read: a hash collision or
+#                             foreign file is never used)
+#   then     "CRF<TAB>VIDEO_BYTES<TAB>SAVED_AT" per CRF, one line per
+#            CRF (a newer measurement replaces it)
+# Written to a temporary file in the same directory and renamed (an
+# interrupted write never leaves a broken file). A later search of the
+# same movie and settings uses the actual bytes of exactly that CRF
+# instead of sampling it (crf_title_estimate_actual); other CRFs are
+# sampled as usual. Any cache problem only means "not cached".
+# CRF_ACTUAL_CACHE=0 turns it off.
+# ------------------------------------------------------------
+
+CRF_ACTUAL_SCHEMA=v1
+
+# _crf_actual_dir  ->  cache directory ("" = off)
+_crf_actual_dir() {
+    [[ "${CRF_ACTUAL_CACHE:-1}" == "0" ]] && return 0
+    printf '%s' "${WORK_DIR:-$HOME/compress/work}/cache/crf_actual"
+}
+
+# crf_actual_encoder_id  ->  the ffmpeg build ("ffmpeg version ..."; its
+# libx265 decides the size); 1 when unknown
+crf_actual_encoder_id() {
+    if [[ -z "${CRF_ACTUAL_ENCODER_ID:-}" ]]; then
+        CRF_ACTUAL_ENCODER_ID=$(ffmpeg -hide_banner -version 2>/dev/null | head -n 1 | tr -d '\r')
+    fi
+    [[ -n "$CRF_ACTUAL_ENCODER_ID" ]] && printf '%s' "$CRF_ACTUAL_ENCODER_ID"
+}
+
+# crf_actual_sig FILE VIDX FILTER OUT_WIDTH OUT_HEIGHT DURATION DV_POLICY DV_MODE HDR10P_POLICY
+#   ->  the encode fingerprint (every CRF-independent setting that
+#       decides the video size of the final encode, emit_encode_item);
+#       1 (nothing printed) when any part cannot be determined
+#
+# "v1|stat=SIZE MTIME|dur=..|vidx=..|out=WxH|filter=..|enc=libx265 <ffmpeg>
+#  |preset=..|pix=yuv420p10le|range=<HDR kind>|x265=<colour/HDR10 params>
+#  |dv=<policy>/<mode>|hdr10p=<policy>|src=<resolved path>"
+# (stat first so job_runtime.sh can re-check the source before saving;
+# the path last: it may contain "|")
+crf_actual_sig() {
+    local file="$1" vidx="$2" filter="$3" w="$4" h="$5" dur="$6" dv="$7" dvm="$8" h10p="$9"
+    local real st enc hdr sig
+
+    [[ "$vidx" =~ ^[0-9]+$ && "$w" =~ ^[1-9][0-9]*$ && "$h" =~ ^[1-9][0-9]*$ &&
+       "$dur" =~ ^[0-9]+([.][0-9]+)?$ && -n "$dv" && -n "$h10p" && -n "${X265_PRESET:-}" ]] || return 1
+    real=$(readlink -f -- "$file" 2>/dev/null) && [[ -n "$real" ]] || return 1
+    st=$(stat -L -c '%s %Y' -- "$file" 2>/dev/null) && [[ "$st" =~ ^[0-9]+\ [0-9]+$ ]] || return 1
+    enc=$(crf_actual_encoder_id) || return 1
+    # dynamic range kind + the x265 colour / HDR10 parameters, as the
+    # final encode probes them (subshell: the caller's HDR_* stay)
+    hdr=$(probe_hdr "$file" "$vidx" > /dev/null 2>&1 && printf '%s|x265=%s' "$HDR_KIND" "$(x265_color_params)") || return 1
+    [[ "$hdr" == ?*"|x265="* ]] || return 1
+
+    sig="$CRF_ACTUAL_SCHEMA|stat=$st|dur=$dur|vidx=$vidx|out=${w}x$h|filter=$filter|enc=libx265 $enc"
+    sig+="|preset=$X265_PRESET|pix=yuv420p10le|range=$hdr|dv=$dv/$dvm|hdr10p=$h10p|src=$real"
+    [[ "$sig" == *$'\n'* || "$sig" == *$'\t'* ]] && return 1
+    printf '%s' "$sig"
+}
+
+# _crf_actual_file SIG  ->  the cache file of SIG ("" / 1 when off)
+_crf_actual_file() {
+    local dir key
+
+    dir=$(_crf_actual_dir)
+    [[ -n "$dir" && -n "$1" ]] || return 1
+    key=$(printf '%s' "$1" | md5sum 2>/dev/null | cut -c1-32)
+    [[ "$key" =~ ^[0-9a-f]{32}$ ]] || return 1
+    printf '%s/%s.tsv' "$dir" "$key"
+}
+
+# crf_actual_lookup SIG CRF  ->  actual video bytes of exactly CRF under
+# SIG; 1 when none (missing, other signature, unreadable, invalid)
+crf_actual_lookup() {
+    local sig="$1" crf="$2" f first b
+
+    [[ -n "$sig" && "$crf" =~ ^[0-9]+$ ]] || return 1
+    f=$(_crf_actual_file "$sig") || return 1
+    [[ -f "$f" && -r "$f" ]] || return 1
+    IFS= read -r first < "$f" 2>/dev/null || return 1
+    [[ "$first" == "# $sig" ]] || return 1
+    b=$(awk -F'\t' -v c="$crf" 'NR > 1 && $1 == c + 0 && $1 ~ /^[0-9]+$/ { b = $2 } END { print b }' "$f" 2>/dev/null)
+    [[ "$b" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s' "$b"
+}
+
+# crf_actual_save SIG CRF BYTES  ->  stores (replaces) the actual result
+# of CRF; 1 when it could not be written (nothing else is affected)
+crf_actual_save() {
+    local sig="$1" crf="$2" bytes="$3" f dir tmp first=""
+
+    [[ -n "$sig" && "$crf" =~ ^[0-9]+$ && "$bytes" =~ ^[1-9][0-9]*$ ]] || return 1
+    f=$(_crf_actual_file "$sig") || return 1
+    dir="${f%/*}"
+    mkdir -p -- "$dir" 2>/dev/null || return 1
+    tmp=$(mktemp "$dir/.save.XXXXXX" 2>/dev/null) || return 1
+
+    [[ -f "$f" ]] && IFS= read -r first < "$f" 2>/dev/null
+    if {
+        printf '# %s\n' "$sig"
+        {
+            # other CRFs of the same signature are kept (a file of another
+            # signature is replaced as a whole)
+            [[ "$first" == "# $sig" ]] &&
+                awk -F'\t' -v c="$((10#$crf))" 'NR > 1 && $1 ~ /^[0-9]+$/ && $1 != c && $2 ~ /^[0-9]+$/' "$f"
+            printf '%s\t%s\t%s\n' "$((10#$crf))" "$bytes" "$(date '+%F %T')"
+        } | sort -t $'\t' -k1,1n
+    } > "$tmp" 2>/dev/null && mv -f -- "$tmp" "$f" 2>/dev/null; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
+# crf_title_estimate_actual CRF  (ESTIMATOR for crf_select_boundary,
+# movie High / Base): the cached actual video bytes of exactly CRF
+# (CRF_ACTUAL_SIG, crf_actual_lookup) when there are any, else
+# crf_title_estimate. CRF_ACTUAL_HIT[CRF]=1 for a cached actual result.
+crf_title_estimate_actual() {
+    local b
+
+    if b=$(crf_actual_lookup "${CRF_ACTUAL_SIG:-}" "$1"); then
+        CRF_ACTUAL_HIT[$1]=1
+        CRF_EST_RESULT="$b"
+        if ui_verbose; then
+            printf '  CRF %s: %s video actual (cached, not sampled)\n' "$1" "$(size_text "$b")"
+        else
+            printf '  CRF %-4s %s GiB actual (cached)\n' "$1" "$(bytes_to_gib "$b")"
+        fi
+        return 0
+    fi
+    crf_title_estimate "$1"
+}
+
 # crf_series_estimate CRF  (ESTIMATOR for crf_select / crf_select_exact)
 #
 # A series batch: samples the episodes in CRF_SERIES_SAMPLED (indexes
@@ -1373,7 +1513,7 @@ emit_failed_item() {
     printf 'fi\n\n'
 }
 
-# emit_encode_item INDEX IN OUT TIER VIDEO FILTER PASSLOG OVERWRITE [EST_VIDEO_BYTES [RETRY [QUALITY [CRF_EST]]]]
+# emit_encode_item INDEX IN OUT TIER VIDEO FILTER PASSLOG OVERWRITE [EST_VIDEO_BYTES [RETRY [QUALITY [CRF_EST [ACTUAL_SIG]]]]]
 #
 # VIDEO selects the video encode of the main video stream:
 #   crf:N   single-pass libx265 CRF encode (movie Quality, High, Base, Custom;
@@ -1396,6 +1536,9 @@ emit_failed_item() {
 #           (Custom).
 #           CRF_EST "CRF=BYTES:..." the pre-encode estimates per CRF (for
 #           the FIT_PCT prediction).
+#           ACTUAL_SIG (movie High / Base): the encode fingerprint
+#           (crf_actual_sig); every completed attempt's actual video
+#           bytes are saved under it (job_runtime.sh item_actual_save).
 #           The encode commands are a function (item_encode_INDEX) so a
 #           retry can run them again; they carry the planned CRF, which
 #           item_run replaces for a retry attempt.
@@ -1433,6 +1576,7 @@ emit_encode_item() {
     local retry="${10:-}"
     local quality="${11:-}"
     local crf_est="${12:-}"
+    local actual_sig="${13:-}"
 
     local mode kbps="" crf="" rceil="" rmax="" rmin="" rdpct="" rdmax="" rbatch="" rfit="" rdmode=""
     local qtarget="" qmin="" qmax="" qstatus=""
@@ -1568,6 +1712,8 @@ emit_encode_item() {
     # movie High / Base: one CRF - 1 test after the first fit (job_runtime.sh)
     [[ "$mode" == "crf" && "$rdmode" == boundary ]] &&
         expect+=' down_mode=boundary'
+    [[ "$mode" == "crf" && -n "$actual_sig" ]] &&
+        expect+=$(printf ' actual_sig=%q' "$actual_sig")
     [[ "$mode" == "crf" && "$crf_est" =~ ^[0-9.]+=[0-9]+(:[0-9.]+=[0-9]+)*$ ]] &&
         expect+=$(printf ' crf_est=%q' "$crf_est")
 

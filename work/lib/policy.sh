@@ -1098,7 +1098,11 @@ crf_analysis_lines() {
     local c
 
     for c in "${CRF_TRIED[@]}"; do
-        printf '  CRF %s -> estimated %s video\n' "$c" "$(size_text "${CRF_EST[$c]}")"
+        if [[ -n "${CRF_ACTUAL_HIT[$c]:-}" ]]; then
+            printf '  CRF %s -> actual %s video (cached)\n' "$c" "$(size_text "${CRF_EST[$c]}")"
+        else
+            printf '  CRF %s -> estimated %s video\n' "$c" "$(size_text "${CRF_EST[$c]}")"
+        fi
     done
 }
 
