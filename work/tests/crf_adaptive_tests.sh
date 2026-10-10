@@ -24,7 +24,9 @@
 #   6. series High / Base season CRF: certification, outlier
 #      reclassification (non-monotonic season), randomized seasons,
 #      isolated outlier, two or more difficult episodes, late ceiling
-#      check, compact output
+#      check, compact output (library run with SERIES_CRF_SHARED unset:
+#      the earlier rules; the series menu shares one season CRF, see
+#      series_shared_crf_tests.sh)
 #   7. sample cache: nothing encoded twice, refinement reuses the cache
 #   8. estimate rounds before / after
 #   9. set -euo pipefail
@@ -448,7 +450,7 @@ echo "  (Quality randomized: $qn titles, $((SECONDS - t0)) s)"
 
 # ------------------------------------------------------------
 echo
-echo "== 6. series High / Base"
+echo "== 6. series High / Base (library, earlier rules: SERIES_CRF_SHARED unset)"
 
 # Stand-in sample encodes: episode En has SEP[n] GiB video at the tier's
 # CRF_MIN, x F[crf] (default 0.88 per CRF step), or exactly EPG[n:crf]
@@ -611,7 +613,7 @@ eq "... easier ones sampled by the guard, fit below their source" "${GUARD_SAMPL
 epg 2 10 20; epg 3 10 18
 fboth High -k 2 1 1 1 1
 eq "not sampled much harder: = sequential"  "$FRES" "$FRES0"
-check "... harder ones sampled by the guard, own higher CRFs" "[[ '${GUARD_SAMPLED[*]}' == '1 2' && '${LATE[*]}' == '1 2' ]] && (( EP_CRF[1] > EP_CRF[0] ))"
+check "... harder ones sampled by the guard, higher CRFs found (the menu raises the season to the highest)" "[[ '${GUARD_SAMPLED[*]}' == '1 2' && '${LATE[*]}' == '1 2' ]] && (( EP_CRF[1] > EP_CRF[0] ))"
 EPG=()
 
 # 1- and 2-episode batches

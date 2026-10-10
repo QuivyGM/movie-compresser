@@ -605,10 +605,11 @@ crf_title_estimate_actual() {
 #
 # A series batch: samples the episodes in CRF_SERIES_SAMPLED (indexes
 # into FILES / EP_VIDX / EP_DUR) with CRF_SERIES_FILTER, spreads the
-# result over every episode (series_crf_spread) and leaves the LARGEST
-# REGULAR episode estimate in CRF_EST_RESULT (series_batch_stats
-# SB_DECIDE against CRF_CEILING_BYTES: an isolated outlier does not
-# decide the season CRF). Per-episode estimates are kept in
+# result over every episode (series_crf_spread) and leaves the deciding
+# estimate in CRF_EST_RESULT (series_batch_stats SB_DECIDE against
+# CRF_CEILING_BYTES: with SERIES_CRF_SHARED=1, the series menu, the
+# LARGEST episode, outliers included; earlier rules: the largest regular
+# one). Per-episode estimates are kept in
 # CRF_SERIES_EP_BYTES[crf] ("b0 b1 ...") and CRF_SERIES_EP_FROM[crf],
 # the sampled bytes/s per episode in CRF_SERIES_RATES[crf] ("r0 - r2 ...",
 # "-" = not sampled; policy.sh series_crf_certify_over); those of the
@@ -1501,6 +1502,26 @@ source_video_tag_args() {
     fi
 
     printf '%q ' "${a[@]}"
+}
+
+# crf_attempt_leftovers OUTPUT  ->  CRF attempt files an earlier
+# (interrupted) job left for OUTPUT, one path per line:
+# "<OUTPUT>.retry-crf<N>.part" and "<OUTPUT>.accepted-crf<N>.part"
+# (job_runtime.sh item_attempt_part / _keep_accepted), symlinks included.
+# Only lists them: one may be the only copy of a completed encode.
+crf_attempt_leftovers() {
+    local out="$1" dir base f b
+
+    dir=$(dirname -- "$out")
+    base="${out##*/}"
+    for f in "$dir"/*; do
+        [[ -e "$f" || -L "$f" ]] || continue
+        b="${f##*/}"
+        case "$b" in
+            "$base".retry-crf*.part|"$base".accepted-crf*.part) printf '%s\n' "$f" ;;
+        esac
+    done
+    return 0
 }
 
 # emit_failed_item INDEX IN OUT TIER OVERWRITE REASON

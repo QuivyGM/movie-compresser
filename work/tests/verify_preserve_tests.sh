@@ -203,7 +203,8 @@ rm -f "$T"/out/M.mkv*
 echo
 echo "== series: same semantics"
 
-# series_compress.sh: one item per episode
+# series items of earlier job scripts: one item per episode (compatibility;
+# new series High / Base jobs: series_shared_crf_tests.sh)
 rm -f "$T"/out/Show/* "$T/j1.encoded" "$T/j1.verified"
 body=""
 for n in 1 2 3; do

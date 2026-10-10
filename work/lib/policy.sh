@@ -599,9 +599,9 @@ crf_policy_lines() (
             echo "  CRF: ${CRF_MIN:-entered in the menu} (used exactly; no size ceiling)"
         fi
     elif [[ "$scope" == series ]]; then
-        echo "  CRF range: ${CRF_MIN}-${CRF_MAX}, search starts at ${CRF_START} (lowest CRF at which every regular episode fits)"
+        echo "  CRF range: ${CRF_MIN}-${CRF_MAX}, search starts at ${CRF_START} (lowest CRF at which every episode fits)"
         echo "  video ceiling: ${CRF_CEILING_GIB} GiB/episode"
-        echo "  one season CRF; only an isolated outlier (> median +${SERIES_CRF_OUTLIER_PCT}%) gets its own higher CRF"
+        echo "  one shared season CRF for every encoded episode; an outlier (> median +${SERIES_CRF_OUTLIER_PCT}%) can raise it, never gets a CRF of its own"
     else
         echo "  CRF range: ${CRF_MIN}-${CRF_MAX}, search starts at ${CRF_START} (lowest CRF that fits the ceiling)"
         echo "  video size ceiling: ${CRF_GIB_PER_HOUR} GiB per hour of runtime (runtime hours x ${CRF_GIB_PER_HOUR} GiB)"
@@ -1121,9 +1121,9 @@ crf_est_map() {
 # ------------------------------------------------------------
 # Series CRF
 #
-# One SEASON CRF for the batch (season / folder), so episodes look the
-# same; only an isolated outlier episode gets its own, higher CRF.
-# Episodes are sampled (SERIES_CRF_SAMPLE_EPISODES of them spread over
+# One SEASON CRF for the batch (season / folder), shared by every
+# encoded episode (series_compress.sh sets SERIES_CRF_SHARED=1): no
+# episode gets a CRF of its own. Episodes are sampled (SERIES_CRF_SAMPLE_EPISODES of them spread over
 # the batch, plus the longest episode; SERIES_CRF_SAMPLE_POINTS sections
 # each); an episode that is not sampled is estimated conservatively from
 # the highest sampled bitrate (series_crf_spread: inferred). An inferred
@@ -1135,10 +1135,15 @@ crf_est_map() {
 #   outlier   estimate above median episode x (1 + SERIES_CRF_OUTLIER_PCT/100)
 #   isolated  the ONLY outlier of a batch of 3+ episodes; two or more
 #             outliers are the season's difficulty and count as regular
-#   regular   every other episode: ALL of them must fit the ceiling
-# The season CRF is the first CRF whose largest regular episode fits;
-# the isolated outlier then gets the lowest CRF from the season CRF up
-# whose own estimate fits (series_episode_crf). Never above CRF_MAX.
+#   regular   every other episode
+# Shared (SERIES_CRF_SHARED=1, every series menu run): the season CRF is
+# the first CRF at which EVERY episode, outliers included, fits; an
+# outlier only shapes the estimate of the episodes not sampled
+# (series_crf_spread) and is reported. Never above CRF_MAX.
+# Earlier rules (SERIES_CRF_SHARED unset; library tests only, no menu
+# uses them): the season CRF is the first CRF whose largest regular
+# episode fits, and the isolated outlier gets its own CRF from there up
+# (series_episode_crf).
 # ------------------------------------------------------------
 
 # series_sample_episodes COUNT WANTED [ALSO]  ->  episode indexes to
@@ -1228,7 +1233,9 @@ series_crf_spread() {
 # (SERIES_CRF_SHARED=1, set by series_compress.sh): no isolated-outlier
 # own CRF; every episode's estimate, the outlier's too, must fit the
 # season CRF. Unset / 0: the earlier rules (an isolated outlier does not
-# decide the season CRF and gets its own CRF).
+# decide the season CRF and gets its own CRF); no menu uses them any more
+# (job scripts of earlier versions never run the estimator), only the
+# library tests.
 series_crf_shared() {
     [[ "${SERIES_CRF_SHARED:-0}" == 1 ]]
 }
@@ -1402,9 +1409,11 @@ series_crf_certify_over() {
 
 # series_episode_crf INDEX FROM_CRF CRF_MAX CEILING_BYTES ESTIMATOR [REPORT]
 #
-# Own CRF of the isolated outlier: from FROM_CRF (the season CRF) up,
-# the lowest CRF whose estimate for episode INDEX fits the ceiling, never
-# above CRF_MAX (crf_search_up: +1 / +2 steps, the CRF just below the
+# The lowest CRF from FROM_CRF (the season CRF) up whose estimate for
+# episode INDEX alone fits the ceiling, never above CRF_MAX: the CRF the
+# whole season must rise to for that episode (series_late_ceiling; the
+# series menu raises the shared season CRF to it, never one episode
+# alone). crf_search_up: +1 / +2 steps, the CRF just below the
 # chosen one sampled above the ceiling; one episode's samples shrink as
 # the CRF rises, so a CRF skipped before a too-large one is too large).
 # ESTIMATOR INDEX CRF leaves that episode's video bytes in
@@ -1521,12 +1530,14 @@ series_guard_episodes() {
 #
 # After series_guard_episodes: an episode whose not-sampled estimate was
 # replaced by its own sample there (GUARD_SAMPLED) and is now above the
-# per-episode ceiling gets its own CRF before the encode: from its
-# current CRF up (series_episode_crf with ESTIMATOR, e.g.
-# crf_episode_estimate, and REPORT; its own sample at the current CRF is
-# reused from the cache), never above CRF_MAX. The season CRF and every other
-# episode stay as they are. Updates EP_CRF / EP_EST / EP_OVER (1: still
-# above the ceiling at CRF_MAX). LATE = the episodes changed. Reads
+# per-episode ceiling: the CRF it needs is searched from its current CRF
+# up (series_episode_crf with ESTIMATOR, e.g. crf_episode_estimate, and
+# REPORT; its own sample at the current CRF is reused from the cache),
+# never above CRF_MAX. Updates that episode's EP_CRF / EP_EST / EP_OVER
+# (1: still above the ceiling at CRF_MAX) only as the CRF the shared
+# season has to rise to: series_compress.sh (season_raise) then moves
+# EVERY episode to the highest such CRF, so no episode keeps a CRF of its
+# own. LATE = the episodes found. Reads
 # CRF_CEILING_BYTES (0, Custom: nothing to do) and CRF_MAX. Prints a
 # header line before the first one. Returns 1 when an estimate failed.
 series_late_ceiling() {

@@ -929,11 +929,30 @@ item_retry_enabled() {
 }
 
 # item_video_bytes FILE  ->  actual main video bytes (packet scan; audio,
-# subtitles, attachments and container overhead are not counted)
+# subtitles, attachments and container overhead are not counted). 0
+# when nothing could be read; the status is not checked by its callers
+# (item_crf_encode: movie High / Base / Quality, series Custom and the
+# per-episode series items of earlier job scripts, unchanged).
 item_video_bytes() {
     local v a
     read -r v a <<< "$(media_stream_totals "$1")"
     [[ "$v" =~ ^[0-9]+$ ]] || v=0
+    printf '%s' "$v"
+}
+
+# item_video_bytes_checked FILE  ->  actual main video bytes of a
+# completed encode, ONLY when the measurement is valid: the stream probe
+# and the packet scan succeeded without any ffprobe error (a partial
+# scan could undercount), the result is a whole number and above 0 (an
+# encoded video stream is never empty). Otherwise 1 and nothing printed:
+# the size is UNKNOWN, which is neither "fits" nor "over the ceiling"
+# (series season batch, job_crf_batch).
+item_video_bytes_checked() {
+    local t v a
+
+    t=$(media_stream_totals "$1" strict) || return 1
+    read -r v a <<< "$t"
+    [[ "$v" =~ ^[0-9]+$ ]] && (( v > 0 )) || return 1
     printf '%s' "$v"
 }
 
@@ -1380,9 +1399,18 @@ _batch_season() {
             break
         fi
 
+        # an unknown size is an attempt failure (never "fits")
+        if ! nvb[$id]=$(item_video_bytes_checked "$ITEM_PART"); then
+            fail_id="$id"
+            why="video-size measurement failed"
+            echo
+            echo "${lbl[$id]:-Episode $id}: video-size measurement failed"
+            rm -f -- "$ITEM_PART"
+            break
+        fi
+
         JOB_DONE_PARTS[$ITEM_PART]=1
         npart[$id]="$ITEM_PART"
-        nvb[$id]=$(item_video_bytes "$ITEM_PART")
         ITEM_PART=""
     done
 
@@ -1458,6 +1486,12 @@ _season_notes() {
 #   ceiling) and kept only when every episode fits there too; otherwise
 #   the season stays at CRF. Never CRF - 2, never a per-episode CRF.
 #
+# Sizes are measured with item_video_bytes_checked (both modes): a
+# failed or invalid measurement is an attempt failure, never a fit (or an
+# over-ceiling result). In the first attempt that episode fails and is
+# left out of the season; in a retry / CRF - 1 attempt the whole attempt
+# is discarded and the previous season kept, like a failed encode.
+#
 # legacy (":batch", job scripts of earlier versions): the MEDIAN
 #   episode's actual video decides, in the two phases of item_crf_encode
 #   (up while the median is above the ceiling, then down while it has
@@ -1506,10 +1540,20 @@ job_crf_batch() {
             continue
         fi
 
+        # an unknown size cannot be validated against the ceiling: the
+        # episode fails (it never counts as fitting, nor as over)
+        if [[ -n "$BATCH_CEIL" ]] && ! vb[$id]=$(item_video_bytes_checked "$ITEM_PART"); then
+            echo
+            echo "${lbl[$id]}: video-size measurement failed"
+            echo "Season CRF $c cannot be validated for ${lbl[$id]}: the episode fails and is not part of the season."
+            unset 'vb[$id]'
+            item_failed "video-size measurement failed (CRF $c)"
+            continue
+        fi
+
         JOB_DONE_PARTS[$ITEM_PART]=1
         part[$id]="$ITEM_PART"
         outp[$id]="$ITEM_OUTPUT"
-        [[ -n "$BATCH_CEIL" ]] && vb[$id]=$(item_video_bytes "$ITEM_PART")
         active+=("$id")
         ITEM_PART=""
     done
@@ -1552,6 +1596,8 @@ job_crf_batch() {
         # the previous season attempt is kept until every episode completed
         if ! _batch_season "$nc"; then
             _batch_note "$fail_id" "$nc" 0 FAILED "$why; season kept at CRF $c"
+            [[ "$why" == "video-size measurement failed" ]] &&
+                echo "Season CRF $nc cannot be validated."
             echo
             echo "WARNING: season retry at CRF $nc failed (episode $fail_id: $why)."
             echo "         Keeping the completed CRF $c encodes for every episode ($SEASON_OVER above the ceiling)."
@@ -1590,7 +1636,11 @@ job_crf_batch() {
                 if ! _batch_season "$nc"; then
                     _batch_note "$fail_id" "$nc" 0 FAILED "$why; keep season CRF $c"
                     echo
-                    echo "CRF $nc season failed (episode $fail_id: $why)."
+                    if [[ "$why" == "video-size measurement failed" ]]; then
+                        echo "CRF $nc season cannot be validated."
+                    else
+                        echo "CRF $nc season failed (episode $fail_id: $why)."
+                    fi
                     echo "Keeping entire season at CRF $c."
                 else
                     _season_lines "$nc" nvb

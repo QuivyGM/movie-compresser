@@ -8,7 +8,7 @@
 # Seconds, no ffmpeg: series jobs are generated with emit_encode_item
 # (stand-in probes) and run with a stand-in encoder (video / audio
 # bytes per episode and CRF); the season estimator runs with stand-in
-# sample encodes.
+# sample encodes. Measurement failures use a stand-in packet scan / ffprobe.
 set -uo pipefail
 
 SRC_WORK="$(cd "$(dirname "$0")/.." && pwd)"
@@ -67,7 +67,15 @@ matroska_mux_args()  { :; }
 # verification records the CRF it was asked to verify.
 STUBS='
 get_duration() { echo 100; }
-media_stream_totals() { local v a c; read -r v a c < "$1"; echo "$v $a"; }
+media_stream_totals() {
+    local v a c
+    read -r v a c < "$1"
+    case "$v" in
+        unmeasurable) echo "0 0"; return 1 ;;              # probe / scan failed
+        partial:*)    echo "${v#partial:} $a"; return 1 ;; # scan failed half way: low but positive
+    esac
+    echo "$v $a"
+}
 item_verify_output() { echo "$ITEM_INDEX:${ITEM_EXP[crf]}" >> "'"$T"'/$JOB_SESSION.verified"; }
 item_restore_mkv_chapters() { return 0; }
 item_step() { shift; "$@"; }
@@ -182,6 +190,96 @@ eq    "N-1 retry fails: partial attempt removed" "$(leftovers)" ""
 
 # ------------------------------------------------------------
 echo
+echo "== video-size measurement failure (never \"fits\")"
+
+# um EPISODE:CRF  ->  a SIZES entry whose size cannot be measured;
+# pl EPISODE:CRF GIB  ->  one whose scan fails half way (low, positive)
+um() { printf "[%s]='unmeasurable 0'" "$1"; }
+pl() { printf "[%s]='partial:%s 0'" "$1" "$(gib "$2")"; }
+
+# m1 first attempt: E02 at N cannot be measured -> E02 fails, it is not
+#    accepted as fitting; the others are the season (N-1 over: stay at N)
+season m1 16 15 18 3 "$(sz 1:16 4) $(um 2:16) $(sz 3:16 4) $(sz 1:15 5.2) $(sz 3:15 5.2)"
+eq    "m1 initial: E02 not finalised, the others at N" "$(final_crfs)/$(verified m1)" "16 16 /1:16 3:16 "
+check "m1 initial: reported, E02 failed"         "logged m1 'S01E02: video-size measurement failed' && logged m1 'Season CRF 16 cannot be validated for S01E02: the episode fails and is not part of the season.' && grep -q 'All encodes finished: 2 ok, 1 failed' '$T/m1.log' && [[ ! -e '$T/out/Show/E02.mkv' ]]"
+eq    "m1 initial: E02 never retried"           "$(encoded m1)" "1:16 2:16 3:16 1:15 3:15 "
+eq    "m1 no temporary files left"              "$(leftovers)" ""
+
+# m2 upward: E02 over at N; the N+1 retry of E01 completes but its scan
+#    fails half way (a low positive size) -> N+1 not accepted, the
+#    completed N season kept, no further escalation
+season m2 16 15 18 3 "$(sz 1:16 4) $(sz 2:16 5.3) $(sz 3:16 4) $(pl 1:17 1) $(sz 2:17 4.7) $(sz 3:17 3.5)"
+eq    "m2 upward: N+1 rejected, N kept for all" "$(final_crfs)/$(encoded m2)" "16 16 16 /1:16 2:16 3:16 1:17 "
+check "m2 upward: reported"                     "logged m2 'S01E01: video-size measurement failed' && logged m2 'Season CRF 17 cannot be validated.' && logged m2 'Episodes: 3/3 at CRF 16'"
+check "m2 upward: only E02 above the ceiling"   "[[ \$(sed -n '/^Above the video ceiling/,/^CRF attempts/p' '$T/m2.log' | grep -c 'Show.S01E0') == 1 ]] && sed -n '/^Above the video ceiling/,/^CRF attempts/p' '$T/m2.log' | grep -q 'Show.S01E02.mkv'"
+eq    "m2 no temporary files left"              "$(leftovers)" ""
+
+# m3 N-1: every encode completes, E02 cannot be measured -> the whole
+#    N-1 attempt rejected at once, the N season kept
+season m3 16 15 18 3 "$(sz 1:16 4) $(sz 2:16 4) $(sz 3:16 4) $(sz 1:15 4.5) $(um 2:15) $(sz 3:15 4.5)"
+eq    "m3 N-1 unmeasurable: season kept at N"   "$(final_crfs)/$(verified m3)" "16 16 16 /1:16 2:16 3:16 "
+check "m3 N-1: reported"                        "logged m3 'S01E02: video-size measurement failed' && logged m3 'CRF 15 season cannot be validated.' && logged m3 'Keeping entire season at CRF 16.' && logged m3 'Final season CRF: 16'"
+eq    "m3 N-1 attempts removed"                 "$(leftovers)" ""
+
+# m4 N-1: the last episode's scan fails half way (low positive size)
+season m4 16 15 18 3 "$(sz 1:16 4) $(sz 2:16 4) $(sz 3:16 4) $(sz 1:15 4.5) $(sz 2:15 4.5) $(pl 3:15 0.5)"
+eq    "m4 N-1 partial scan: season kept at N"   "$(final_crfs)/$(encoded m4)" "16 16 16 /1:16 2:16 3:16 1:15 2:15 3:15 "
+eq    "m4 no temporary files left"              "$(leftovers)" ""
+
+# the measurement itself (media_stats.sh / job_runtime.sh) with a
+# stand-in ffprobe: MODE ok | exit (non-zero after part of the packets)
+# | stderr (an error reported, exit 0) | malformed | empty | novideo
+meas() {   # FUNCTION MODE  ->  "STATUS:OUTPUT"
+    ( FFP_MODE="$2"
+      ffprobe() {
+          case "$*" in
+              *packet=*)
+                  case "$FFP_MODE" in
+                      ok|novideo) printf '0,1000\n1,500\n0,2000\n' ;;
+                      exit)       printf '0,1000\n1,500\n'; return 1 ;;
+                      stderr)     printf '0,1000\n1,500\n'; echo "[matroska @ 0x1] Read error" >&2 ;;
+                      malformed)  printf '0,1000\n0,12x\n1,500\n' ;;
+                      empty)      ;;
+                  esac ;;
+              *)
+                  if [[ "$FFP_MODE" == novideo ]]; then
+                      printf 'index=1|codec_type=audio|codec_name=aac|disposition:attached_pic=0\n'
+                  else
+                      printf 'index=0|codec_type=video|codec_name=hevc|disposition:attached_pic=0\n'
+                      printf 'index=1|codec_type=audio|codec_name=aac|disposition:attached_pic=0\n'
+                  fi ;;
+          esac
+      }
+      out=$("$1" /x/E01.mkv 2>/dev/null)
+      echo "$?:$out" )
+}
+eq    "measure ok: video bytes"                 "$(meas item_video_bytes_checked ok)" "0:3000"
+for m in exit stderr malformed empty novideo; do
+    eq "measure $m: failure, no size"           "$(meas item_video_bytes_checked "$m")" "1:"
+done
+eq    "media_stream_totals: failed scan reported" "$(meas media_stream_totals exit)" "1:1000 500"
+eq    "media_stream_totals: report-only stderr" "$(meas media_stream_totals stderr)" "0:1000 500"
+eq    "item_video_bytes (item_crf_encode) unchanged" "$(meas item_video_bytes exit)" "0:1000"
+
+# ------------------------------------------------------------
+echo
+echo "== leftover CRF attempt files of an earlier job"
+
+L="$T/left"
+mkdir -p "$L"
+touch "$L/Show [x] E01.mkv.retry-crf17.part" "$L/Show [x] E01.mkv.accepted-crf16.part" "$L/Show [x] E01.mkv.part" \
+    "$L/Show [x] E011.mkv.retry-crf17.part" "$L/Show [x] E01.mkv"
+ln -s /nonexistent "$L/Show [x] E01.mkv.retry-crf18.part" 2>/dev/null
+eq    "listed: only this output's attempt files" "$(crf_attempt_leftovers "$L/Show [x] E01.mkv" | sed 's|.*/||' | sort | tr '\n' '|')" \
+    "$(printf '%s\n' 'Show [x] E01.mkv.accepted-crf16.part' 'Show [x] E01.mkv.retry-crf17.part' \
+        "$( [[ -L "$L/Show [x] E01.mkv.retry-crf18.part" ]] && echo 'Show [x] E01.mkv.retry-crf18.part')" | grep . | sort | tr '\n' '|')"
+eq    "none for another output"                 "$(crf_attempt_leftovers "$L/Show [x] E02.mkv")" ""
+check "menu refuses before the job is built (High / Base)" \
+    "awk '/crf_attempt_leftovers/ { a = NR } /Compression cancelled/ && a && !b { b = NR } /^start_job / { s = NR } END { exit !(a && b > a && s > b) }' '$SRC_WORK/series_compress.sh'"
+check "the files are never deleted by the menu" "[[ -e '$L/Show [x] E01.mkv.retry-crf17.part' && -e '$L/Show [x] E01.mkv.accepted-crf16.part' ]]"
+
+# ------------------------------------------------------------
+echo
 echo "== estimator: isolated outlier raises the shared season CRF (item 8)"
 
 # SEP[n]: video GiB of episode En per 45 min at CRF 18; -12 % per step
@@ -218,7 +316,7 @@ select_season() {   # GIB...  ->  SEL "CRF/OUTLIER"
 SERIES_CRF_SHARED=1 select_season 3.7 4.2 6.0 3.9 4.0 4.1
 eq    "8 shared: outlier raises the season to CRF 20" "$SEL" "20/2/1"
 SERIES_CRF_SHARED=0 select_season 3.7 4.2 6.0 3.9 4.0 4.1
-eq    "8 (earlier rules, old-job compatibility: season 18 without the outlier)" "$SEL" "18/2/1"
+eq    "8 (earlier rules, library only - no menu uses them: season 18 without the outlier)" "$SEL" "18/2/1"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

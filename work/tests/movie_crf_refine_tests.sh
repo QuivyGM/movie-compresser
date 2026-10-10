@@ -120,7 +120,8 @@ check "4 log"                                     "logs b4 'CRF 10 is the High m
 check "4 menu floor is the search min: spec carries CRF_MIN" \
     "grep -qF '[[ \"\$TIER\" != \"Custom\" ]] && RETRY_SPEC=\"\$CRF_CEILING_BYTES:\$CRF_MAX:\$CRF_MIN:0:1:::boundary\"' '$SRC_WORK/movie_compress.sh'"
 
-echo "== series unchanged (no down_mode: headroom + predicted-fit gate)"
+echo "== per-episode headroom retry unchanged (no down_mode: headroom + predicted-fit gate;"
+echo "   the series items of earlier job scripts, compatibility)"
 
 S="ceiling_vbytes=$(gib 5) crf_min=16 crf_max=21 down_headroom_pct=20 down_max=1 down_fit_pct=5"
 movie_job s1 High 18 "$S" "[18]='$(gib 4.5) 0' [17]='$(gib 4.6) 0'"
@@ -128,8 +129,8 @@ eq    "5 fits without 20 % headroom: no lower CRF" "$(encoded s1)/$(final)" "18 
 movie_job s2 High 18 "$S" "[18]='$(gib 3) 0' [17]='$(gib 3.4) 0' [16]='$(gib 3.8) 0'"
 eq    "5 headroom: one lower CRF (down_max 1)"    "$(encoded s2)/$(final)" "18 17 /17"
 check "5 old log wording"                         "logs s2 'Headroom large -> trying CRF 17' && logs s2 'Result: accepted'"
-check "5 series menu spec has no boundary mode" \
-    "grep -qF '\"\$CRF_DOWN_RETRY_HEADROOM_PCT\" \"\$SERIES_CRF_DOWN_RETRY_MAX\" \"\$CRF_DOWN_RETRY_FIT_MARGIN_PCT\"' '$SRC_WORK/series_compress.sh' && ! grep -q boundary <(sed -n '/^ep_retry_spec() {/,/^}/p' '$SRC_WORK/series_compress.sh')"
+check "5 series menu spec: shared season batch, no boundary mode" \
+    "grep -qF 'series_season_retry_spec \"\$TIER\" \"\$CRF_CEILING_BYTES\" \"\$CRF_MAX\" \"\$CRF_MIN\"' '$SRC_WORK/series_compress.sh' && ! grep -q boundary <(sed -n '/^ep_retry_spec() {/,/^}/p' '$SRC_WORK/series_compress.sh') && ! grep -q boundary <(sed -n '/^series_season_retry_spec() {/,/^}/p' '$SRC_WORK/lib/policy.sh')"
 
 echo "== movie Quality unchanged (band)"
 

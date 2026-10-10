@@ -216,7 +216,7 @@ sed -n '/^Estimating/,$p' "$L" | sed 's/^/  | /'
 check "ceiling: too large -> jumping 2 CRFs" "grep -q '^Result:   too large -> jumping to CRF $((SHSTART + 2))\$' '$L' && ! grep -q '^CRF $((SHSTART + 1))\$' '$L'"
 check "ceiling: last step clamped to 21"     "grep -qE '^Result:   too large -> (trying|jumping to) CRF 21\$' '$L' && grep -q '^CRF 21\$' '$L' && ! grep -q '^CRF 22\$' '$L'"
 check "ceiling: limit reached"           "grep -q '^Result:   too large (CRF 21 is the High limit)\$' '$L' && ! grep -q '^Selected:' '$L'"
-check "ceiling: warning kept"            "grep -q '^WARNING: the 0.000001 GiB per-episode video ceiling cannot be met' '$L' && grep -q 'gives a largest regular episode of' '$L'"
+check "ceiling: warning kept"            "grep -q '^WARNING: the 0.000001 GiB per-episode video ceiling cannot be met' '$L' && grep -q 'gives a largest episode of' '$L'"
 check "ceiling: outliers listed"         "grep -q 'Warning: 3 episodes are estimated above' '$L' && grep -qE '^  S01E01 +~[0-9.]+ GiB video, \+' '$L'"
 check "ceiling: Status column"           "grep -q '^Episode   Runtime   Video   Audio   Total   Status\$' '$L' && [[ \$(grep -c ' ABOVE CEILING\$' '$L') == 3 ]]"
 check "ceiling: confirmation flags it"   "grep -q '^High | CRF 21 | 320x180 | SDR | audio copied | ceiling not met\$' '$L'"

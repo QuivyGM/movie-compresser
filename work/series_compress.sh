@@ -21,9 +21,9 @@ source "$WORK_DIR/lib/naming.sh"
 # series_episode_crf / series_crf_plan; sample encodes: encode_common.sh
 # crf_series_estimate / crf_episode_estimate)
 #
-# Base / High: x265 CRF, ONE season CRF for every regular episode: the
-#              lowest CRF of SERIES_*_CRF_SEARCH_MIN..MAX at which every
-#              regular episode's video estimate fits the per-episode
+# Base / High: x265 CRF, ONE shared season CRF for every encoded
+#              episode: the lowest CRF of SERIES_*_CRF_SEARCH_MIN..MAX at
+#              which every episode's video estimate fits the per-episode
 #              SERIES_*_VIDEO_SIZE_CEILING_GIB, searched from
 #              SERIES_*_CRF_START up or down (the adjacent boundary:
 #              CRF N too large, N + 1 fits). Strictly shared
@@ -485,8 +485,8 @@ fi
 # series_batch_stats, series_episode_crf; encode_common.sh:
 # crf_series_estimate, crf_episode_estimate)
 #
-# One season CRF for every regular episode: the lowest CRF of
-# CRF_MIN..CRF_MAX at which every regular episode's estimate fits the
+# One shared season CRF for every episode: the lowest CRF of
+# CRF_MIN..CRF_MAX at which every episode's estimate fits the
 # per-episode ceiling, searched from CRF_START (crf_select_boundary).
 # CRF_START too large: upward (bracket-and-refine: +1 / +2 steps, a
 # skipped CRF is sampled unless the own samples of sampled episodes at
@@ -665,30 +665,14 @@ episode_over_ceiling_prompt() {
     return 0
 }
 
-# final_figures  ->  ABOVE, EST_LARGEST, OWN_CRF at each episode's own CRF
+# final_figures  ->  ABOVE, EST_LARGEST at the shared season CRF
 final_figures() {
-    local i
-
     series_batch_stats "$CRF_CEILING_BYTES" "${EP_EST[@]}"
     ABOVE=("${SB_ABOVE[@]+"${SB_ABOVE[@]}"}")
     EST_LARGEST="$SB_LARGEST"
-
-    OWN_CRF=()
-    for i in "${!FILES[@]}"; do
-        [[ "${EP_CRF[$i]}" != "$CRF" ]] && OWN_CRF+=("$i")
-    done
     return 0
 }
 final_figures
-
-# "S01E05 CRF 20" per episode with its own CRF
-own_crf_text() {
-    local i out=""
-    for i in "${OWN_CRF[@]+"${OWN_CRF[@]}"}"; do
-        out+="${out:+, }$(ep_name "$i") CRF ${EP_CRF[$i]}"
-    done
-    printf '%s' "$out"
-}
 
 if ui_verbose; then
     echo
@@ -873,7 +857,7 @@ if (( ${#GUARD[@]} )); then
         echo "1) (not available: keeping the source video needs HEVC sources,"
         echo "   no downscaling and no dropped Dolby Vision / HDR10+)"
     fi
-    echo "2) Encode them anyway at $( (( ${#OWN_CRF[@]} )) && echo "their CRF" || echo "CRF ${CRF}")"
+    echo "2) Encode them anyway at CRF ${CRF}"
     echo "3) Skip these episodes"
 
     while true; do
@@ -911,11 +895,7 @@ if ui_verbose; then
     if [[ "$TIER" == "Custom" ]]; then
         echo "Video encode:         x265 CRF ${CRF}, single pass, every episode (entered CRF)"
     else
-        if (( ${#OWN_CRF[@]} )); then
-            echo "Video encode:         x265 CRF ${CRF}, single pass, every episode but $(own_crf_text) (own CRF)"
-        else
-            echo "Video encode:         x265 CRF ${CRF}, single pass, every episode"
-        fi
+        echo "Video encode:         x265 CRF ${CRF}, single pass, every episode"
         echo "                      (${TIER}: CRF ${CRF_MIN}-${CRF_MAX}, ${CRF_CEILING_GIB} GiB/episode video ceiling$( (( CRF_OVER_CEILING == 1 || ${#ABOVE[@]} > 0 )) && echo "; ceiling NOT met"))"
     fi
     echo "Resolution:           ${WIDTH}x${HEIGHT} -> ${OUT_WIDTH}x${OUT_HEIGHT}"
@@ -1018,11 +998,7 @@ if ui_verbose; then
 
     echo
     echo "Season totals (${FILE_COUNT} files):"
-    if (( ${#OWN_CRF[@]} )); then
-        printf "  Season CRF:                 %s (every episode but %s)\n" "$CRF" "$(own_crf_text)"
-    else
-        printf "  Shared CRF:                 %s (every episode)\n" "$CRF"
-    fi
+    printf "  Shared CRF:                 %s (every episode)\n" "$CRF"
     printf "  Total runtime:              %s hours (%s min)\n" \
         "$(awk -v s="$P_TOTAL_SECONDS" 'BEGIN { printf "%.2f", s / 3600 }')" \
         "$(awk -v s="$P_TOTAL_SECONDS" 'BEGIN { printf "%.0f", s / 60 }')"
@@ -1082,22 +1058,15 @@ else
     ROW_FMT="%-*s   %-7s   %-6s  %-6s  %s%s\n"
     (( SHOW_STATUS == 1 )) && ROW_FMT="%-*s   %-7s   %-6s  %-6s  %-6s%s\n"
 
-    # CRF column only when an episode has its own CRF (isolated outlier)
-    vcol() {
-        if (( ${#OWN_CRF[@]} )); then printf '%-4s  %-6s' "$1" "$2"; else printf '%s' "$2"; fi
-    }
-
+    # no CRF column: one shared CRF (shown in the confirmation line)
     echo
     echo "Expected sizes:"
-    printf "$ROW_FMT" "$LABEL_W" "Episode" "Runtime" "$(vcol CRF Video)" "Audio" "Total" \
+    printf "$ROW_FMT" "$LABEL_W" "Episode" "Runtime" "Video" "Audio" "Total" \
         "$( (( SHOW_STATUS == 1 )) && echo "  Status")"
     for i in "${!FILES[@]}"; do
-        ccol="${EP_CRF[$i]}"
-        (( EP_CEIL_SKIP[$i] == 1 || EP_GUARD_SKIP[$i] == 1 )) && ccol="-"
-        [[ "${EP_VIDEO[$i]}" == "copy" ]] && ccol="copy"
         printf "$ROW_FMT" "$LABEL_W" "${EP_LABEL[$i]}" \
             "$(awk -v d="${EP_DUR[$i]}" 'BEGIN { printf "%d:%02d", int(d / 60), int(d % 60) }')" \
-            "$(vcol "$ccol" "${P_EP_VGIB[$i]}")" "${P_EP_AGIB[$i]}" "${P_EP_GIB[$i]}" \
+            "${P_EP_VGIB[$i]}" "${P_EP_AGIB[$i]}" "${P_EP_GIB[$i]}" \
             "$( (( SHOW_STATUS == 1 )) && printf '  %s' "${STATUS[$i]}")"
     done
 
@@ -1213,6 +1182,28 @@ if (( EXISTING > 0 )); then
     echo
 fi
 
+# ---- CRF attempt files an earlier, interrupted High / Base job left for
+# these outputs (".retry-crf<N>.part" / ".accepted-crf<N>.part") would
+# make the season retries of this job fail or be skipped (job_runtime.sh
+# item_attempt_part / _keep_accepted never write over them). Never
+# deleted here (one may be the only copy of a completed encode): the job
+# is not started until they are moved or deleted.
+if [[ "$TIER" != "Custom" ]]; then
+    LEFTOVERS=()
+    for i in "${!FILES[@]}"; do
+        (( EP_SKIP[$i] == 1 )) && continue
+        mapfile -t -O "${#LEFTOVERS[@]}" LEFTOVERS < <(crf_attempt_leftovers "${EP_OUT[$i]}")
+    done
+    if (( ${#LEFTOVERS[@]} )); then
+        echo "$(ui_err "Leftover CRF attempt files") of an earlier, interrupted job for these outputs:"
+        printf '  %s\n' "${LEFTOVERS[@]}"
+        echo "They are not deleted automatically (one may be the only copy of an encode)."
+        echo "Rename or delete them, then run the menu again."
+        echo "Compression cancelled."
+        exit 1
+    fi
+fi
+
 QUEUED=0
 for i in "${!FILES[@]}"; do
     (( EP_SKIP[$i] == 1 )) || ((QUEUED += 1))
@@ -1227,8 +1218,7 @@ if ui_verbose; then
     read -rp "Start compression of $QUEUED episode(s)? [y/N]: " confirm
 else
     # one-line confirmation of the encode settings
-    printf '%s | %s%s | %sx%s | %s | audio copied%s\n' "$TIER" "$(ui_bold "CRF $CRF")" \
-        "$( (( ${#OWN_CRF[@]} )) && echo " ($(own_crf_text))")" \
+    printf '%s | %s | %sx%s | %s | audio copied%s\n' "$TIER" "$(ui_bold "CRF $CRF")" \
         "$OUT_WIDTH" "$OUT_HEIGHT" "$(hdr_policy_short)" \
         "$( (( CRF_OVER_CEILING == 1 || ${#ABOVE[@]} > 0 )) && echo " | $(ui_warn "ceiling not met")")"
     read -rp "Start compression of $(ui_plural "$QUEUED" episode)? [y/N]: " confirm

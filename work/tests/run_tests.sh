@@ -28,10 +28,12 @@
 #     sampled video estimate is above the ceiling (bracket-and-refine:
 #     checked by the CRF chosen, the CRF just below it estimated above the
 #     ceiling and over-ceiling flag, not by the order CRFs were estimated;
-#     stand-in estimator and real sample encodes); Custom CRF; series use one season CRF
-#     chosen on the regular episodes (S1-S23: High 18-21 / 5 GiB, Base
-#     24-27 / 1.5 GiB pinned in the test config; an isolated outlier
-#     gets its own CRF; Custom any CRF);
+#     stand-in estimator and real sample encodes); Custom CRF; series
+#     library rules S1-S23 (High 18-21 / 5 GiB, Base 24-27 / 1.5 GiB
+#     pinned in the test config) run with SERIES_CRF_SHARED unset, the
+#     earlier rules (season CRF on the regular episodes, own CRF for an
+#     isolated outlier; library only); the series menu smoke tests use
+#     ONE shared season CRF that an outlier raises; Custom any CRF;
 #     samples follow the output resolution / HDR signalling; ceiling
 #     warning; source-quality guard (keep source video / encode / skip);
 #     estimate vs actual reported; progress-check shows one encode step
@@ -228,6 +230,8 @@ check "default compress.conf loads"           "load_policy 2>'$T/pol.err'"
     check "series policy lines: Base 24-27, 1.5 GiB/episode" \
         "grep -q 'CRF range: 24-27' <<< \"\$spl\" && grep -q 'video ceiling: 1.5 GiB/episode' <<< \"\$spl\""
     check "series policy lines: Custom exact user CRF" "grep -q 'CRF: exact user CRF' <<< \"\$spl\""
+    check "series policy lines: one shared season CRF, no own CRF" \
+        "grep -q 'one shared season CRF for every encoded episode; an outlier' <<< \"\$spl\" && ! grep -qiE 'regular episode|own higher CRF|gets its own' <<< \"\$spl\""
     eq    "series policy lines: audio copied for all 3" "$(grep -c '^  audio: copied unchanged' <<< "$spl")" 3
     crf_tier_load movie Custom 21.5
     eq "crf_tier_load Custom: exact, no ceiling" "$CRF_MIN $CRF_MAX $CRF_CEILING_BYTES" "21.5 21.5 0"
@@ -394,7 +398,7 @@ echo "== CRF selection (estimates from a stand-in estimator)"
 
 # ------------------------------------------------------------
 echo
-echo "== series CRF: season CRF from the regular episodes"
+echo "== series CRF library, earlier rules (SERIES_CRF_SHARED unset): season CRF from the regular episodes"
 {
     eq "sample episodes: 10 -> 4 spread"         "$(series_sample_episodes 10 4 | tr '\n' ' ')" "0 3 6 9 "
     eq "sample episodes: 3 of 4 -> all"          "$(series_sample_episodes 3 4 | tr '\n' ' ')" "0 1 2 "
@@ -1956,17 +1960,27 @@ check "smoke series High: estimate vs actual logged" "[[ \$(grep -c 'Estimated v
 check "smoke series High: all 3 ok"            "grep -q 'All encodes finished: 3 ok, 0 failed' '$T/ss_high18_run.log'"
 eq    "smoke series High: outputs HEVC 10-bit" "$(for f in "$SH/compress/out"/Show*/*.mkv; do ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,pix_fmt -of csv=p=0 "$f"; done | sort -u)" "hevc,yuv420p10le"
 
-# High, ceiling between the CRF 18 and 19 estimates of the regular
-# episodes: 18 fails, 19 fits (the noisy E03, an isolated outlier, gets
-# its own CRF; CRF_MAX 51 so that it always finds one)
+# High, ceiling between the CRF 18 and 19 estimates of E01 / E02: 18 is
+# too large; the noisy E03 (an outlier) must fit the shared season CRF
+# too, so the season CRF is the lowest CRF from 19 up at which E03 fits
+# (CRF_MAX 51 so that one always exists), for every episode
 sclean
 ceil=$(awk -v a="$s18" -v b="$s19" 'BEGIN { printf "%.12f", (a + b) / 2 / 1073741824 }')
 run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n2\nn\n" "$T/ss_high19.log" "$(conf_with ssh19 "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil" SERIES_HIGH_CRF_MAX=51)"
-check "smoke series High: 18 too large, 19 fits" "grep -q 'sampling CRF 19, episode 3/3' '$T/ss_high19.log' && ! grep -q 'sampling CRF 20, episode [0-9]/3' '$T/ss_high19.log' && grep -q '^  CRF 19 for 2 of 3 episodes (season CRF)' '$T/ss_high19.log'"
-check "smoke series High: analysis shows 18 regular episode above" "grep -A5 '^  CRF 18:' '$T/ss_high19.log' | grep -q 'regular episode above the ceiling'"
+x=$(sed -n 's/^  CRF \([0-9]*\) for all 3 episodes (shared season CRF)$/\1/p' "$T/ss_high19.log")
+ok_x=0
+if [[ "$x" =~ ^[0-9]+$ ]] && (( x >= 19 )); then
+    cb=$(awk -v g="$ceil" 'BEGIN { printf "%.0f", g * 1073741824 }')
+    nx=$(WORK_DIR="$SH/compress/work" whole_title_estimate "$SH/compress/in/Show/E03.mkv" "$x")
+    nb=0
+    (( x > 19 )) && nb=$(WORK_DIR="$SH/compress/work" whole_title_estimate "$SH/compress/in/Show/E03.mkv" "$((x - 1))")
+    (( nx <= cb && (x == 19 || nb > cb) )) && ok_x=1
+fi
+check "smoke series High: 18 too large, one shared CRF where E03 fits too ($x)" "(( ok_x == 1 )) && grep -q 'sampling CRF 19, episode 3/3' '$T/ss_high19.log'"
+check "smoke series High: analysis shows 18 with an episode above" "grep -A5 '^  CRF 18:' '$T/ss_high19.log' | grep -q 'an episode is above the ceiling'"
 
-# High, ceiling between the noisy E03's CRF 19 and 20 estimates: the
-# regular episodes fit at 18 (season CRF), E03 (isolated outlier) -> 20
+# High, ceiling between the noisy E03's CRF 19 and 20 estimates: E01 / E02
+# fit at 18, but E03 (the outlier) raises the shared season CRF to 20
 sclean
 n19=$(WORK_DIR="$SH/compress/work" whole_title_estimate "$SH/compress/in/Show/E03.mkv" 19)
 n20=$(WORK_DIR="$SH/compress/work" whole_title_estimate "$SH/compress/in/Show/E03.mkv" 20)
@@ -1974,11 +1988,11 @@ check "series smoke: E03 at 20 still above E01 at 18" "(( n20 > s18 && n19 > n20
 ceil=$(awk -v a="$n19" -v b="$n20" 'BEGIN { printf "%.12f", (a + b) / 2 / 1073741824 }')
 run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n2\ny\n" "$T/ss_outlier.log" "$(conf_with ssout "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")"
 sed -n '/^Expected sizes:/,/^  ABOVE CEILING/p' "$T/ss_outlier.log" | sed 's/^/  | /'
-check "smoke series outlier: season stays at 18" "grep -q '^  CRF 18 for 2 of 3 episodes (season CRF)' '$T/ss_outlier.log' && ! grep -q 'sampling CRF 19, episode [0-9]/3' '$T/ss_outlier.log'"
-check "smoke series outlier: own CRF 20 for E03" "grep -q '^  CRF 20 for E03.mkv (isolated outlier' '$T/ss_outlier.log' && grep -q 'sampling CRF 20, episode 3 (E03.mkv)' '$T/ss_outlier.log'"
-check "smoke series outlier: table marks only E03" "grep -qE '^  E03\\.mkv .* 20 .* OUTLIER: OWN CRF\$' '$T/ss_outlier.log' && [[ \$(grep -c ' OUTLIER: OWN CRF\$' '$T/ss_outlier.log') == 1 ]]"
+check "smoke series outlier: season raised to 20 for all" "grep -q '^  CRF 20 for all 3 episodes (shared season CRF)\$' '$T/ss_outlier.log' && grep -q 'sampling CRF 19, episode 3/3' '$T/ss_outlier.log' && grep -q 'sampling CRF 20, episode 3/3 (E03.mkv)' '$T/ss_outlier.log' && ! grep -q 'sampling CRF 21' '$T/ss_outlier.log'"
+check "smoke series outlier: analysis, the outlier decides" "grep -q '^    outlier: E03.mkv (.*decides the shared season CRF)\$' '$T/ss_outlier.log'"
+check "smoke series outlier: no own CRF in the table" "grep -qE '^  E03\.mkv .* 20 .* OK\$' '$T/ss_outlier.log' && ! grep -q 'OWN CRF' '$T/ss_outlier.log'"
 check "smoke series outlier: nothing above the ceiling" "grep -q 'Above ceiling: *0 of 3 episode(s)' '$T/ss_outlier.log' && ! grep -q 'cannot be met' '$T/ss_outlier.log'"
-eq    "smoke series outlier: E03 at CRF 20"      "$(crfs_in "$(sjobs)")" "18x2 20x1 "
+eq    "smoke series outlier: every episode at CRF 20" "$(crfs_in "$(sjobs)")" "20x3 "
 
 # Base, default 1.5 GiB ceiling: CRF 24 immediately
 sclean

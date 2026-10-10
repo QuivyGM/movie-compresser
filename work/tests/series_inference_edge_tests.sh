@@ -8,6 +8,11 @@
 #
 #   bash ~/compress/work/tests/series_inference_edge_tests.sh
 #
+# Library run with SERIES_CRF_SHARED unset (the earlier rules: an
+# isolated outlier does not decide the season); the series menu shares
+# one season CRF, where one sampled episode above the ceiling already
+# proves the CRF too large (series_shared_crf_tests.sh).
+#
 # Deterministic stand-in sample encodes only (no ffmpeg); seconds.
 set -uo pipefail
 

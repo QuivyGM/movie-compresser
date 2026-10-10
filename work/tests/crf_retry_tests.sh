@@ -5,10 +5,12 @@
 #   bash ~/compress/work/tests/crf_retry_tests.sh
 #
 # Part 1 runs generated-style jobs with a stand-in encoder (sizes per
-# CRF, no ffmpeg): movie retry rules, series episodes retried one by one
-# (own CRF, predicted-fit check of a lower CRF), the season batch of job
-# scripts from earlier versions (median episode), logging, temporary
-# files, interruption, other sessions.
+# CRF, no ffmpeg): movie retry rules; for series job scripts of earlier
+# versions (compatibility; still run as generated): episodes retried one
+# by one (own CRF, predicted-fit check of a lower CRF) and the season
+# batch decided by the median episode; logging, temporary files,
+# interruption, other sessions. New series High / Base jobs (one shared
+# season CRF): series_shared_crf_tests.sh.
 # Part 2 (ffmpeg with libx265 needed) generates real jobs for a 2 s
 # synthetic source and checks that the output verification expects the
 # ACCEPTED CRF after retries.
@@ -349,7 +351,7 @@ check "f3 says why"                           "grep -q '^Headroom large, but CRF
 movie_job f4 High 9 "$FLOOR" "[9]='$(gib 5.2) 0' [10]='$(gib 4.8) 0'"
 eq    "f4 below CRF_START, over: up to 10 as usual" "$(encoded f4)/$(awk '{print $3}' "$T/out/M.mkv")" "1:9 1:10 /10"
 check "menus pass CRF_MIN (the search floor), not CRF_START, as the retry floor" \
-    "grep -qF 'RETRY_SPEC=\"\$CRF_CEILING_BYTES:\$CRF_MAX:\$CRF_MIN:' '$SRC_WORK/movie_compress.sh' && grep -qF 'local i=\"\$1\" min=\"\$CRF_MIN\"' '$SRC_WORK/series_compress.sh' && ! grep -q 'RETRY_SPEC=.*CRF_START' '$SRC_WORK/movie_compress.sh'"
+    "grep -qF 'RETRY_SPEC=\"\$CRF_CEILING_BYTES:\$CRF_MAX:\$CRF_MIN:' '$SRC_WORK/movie_compress.sh' && grep -qF 'series_season_retry_spec \"\$TIER\" \"\$CRF_CEILING_BYTES\" \"\$CRF_MAX\" \"\$CRF_MIN\"' '$SRC_WORK/series_compress.sh' && ! grep -q 'RETRY_SPEC=.*CRF_START' '$SRC_WORK/movie_compress.sh'"
 check "crf_tier_load: CRF_MIN is the search floor" \
     "( for l in ui bitrate policy; do source '$W/lib/'\$l.sh; done; COMPRESS_CONF='$SRC_WORK/lib/compress.conf' load_policy 2>/dev/null; crf_tier_load movie High; [[ \$CRF_MIN == \$MOVIE_HIGH_CRF_SEARCH_MIN && \$CRF_START == \$MOVIE_HIGH_CRF_START ]] && (( CRF_MIN < CRF_START )) )"
 
@@ -425,11 +427,15 @@ unset SERIES_EXTRA
 
 # ------------------------------------------------------------
 echo
-echo "== series: one item per episode (season CRF 18, ceiling 5 GiB, CRF 16-21,"
-echo "   20 % headroom, 1 lower CRF per episode, 5 % predicted-fit margin)"
+echo "== series jobs of earlier versions (compatibility): one item per episode"
+echo "   (season CRF 18, ceiling 5 GiB, CRF 16-21, 20 % headroom, 1 lower CRF"
+echo "   per episode, 5 % predicted-fit margin); new series High / Base jobs"
+echo "   are one shared-CRF season batch (series_shared_crf_tests.sh)"
 
 # ep_job SESSION SIZES...  ->  one item per episode as series_compress.sh
-# emits it: EP_CRFS[i] its CRF, EP_EXTRA[i] its retry settings (default EPX)
+# emitted it before the shared season CRF (job scripts of earlier
+# versions still run this way): EP_CRFS[i] its CRF, EP_EXTRA[i] its retry
+# settings (default EPX)
 EPX="ceiling_vbytes=$(gib 5) crf_min=16 crf_max=21 down_headroom_pct=20 down_max=1 down_fit_pct=5"
 ep_job() {
     local s="$1" body="" e n
@@ -621,7 +627,7 @@ else
     check "real series: both verified at CRF 19" "[[ \$(grep -cE 'AS PLANNED .*CRF 19(\\.0)? \\(single pass\\)' '$T/r2.log') == 2 ]] && [[ -f '$R/out/E01.mkv' && -f '$R/out/E02.mkv' ]] && grep -q 'retrying season at CRF 19' '$T/r2.log'"
     check "real series: no temp files"          "[[ -z \$(find '$R/out' -name '*.part') ]]"
 
-    # series per episode (as series_compress.sh emits it now): ceiling 1
+    # series per episode (job scripts of earlier versions): ceiling 1
     # byte, E01 at the season CRF 18, E02 (outlier) at 19: each retried
     # alone up to CRF_MAX 19
     rm -f "$R"/out/E0?.mkv

@@ -4,17 +4,48 @@
 # fallback. Sourced, not executed. Needs media_probe.sh (stream_info,
 # get_duration, file_bytes) to be sourced as well.
 
-# stream_packet_bytes FILE  ->  "index bytes" per stream, from a full
-# packet scan. Slow on large files, but exact.
+# stream_packet_bytes FILE [strict]  ->  "index bytes" per stream, from a
+# full packet scan. Slow on large files, but exact.
+#
+# Returns 1 when the scan cannot be trusted: ffprobe exited non-zero
+# (killed, unreadable file, ...), a line of its output is malformed, or
+# no packet was listed at all. What was read is printed anyway (callers
+# that only report keep working), but a failed scan may be partial: its
+# totals can be too SMALL, so a caller that decides on them must check
+# the status. "strict" also fails when ffprobe reported any error (its
+# -v error output, e.g. a damaged or truncated file whose scan still
+# exits 0); that output goes to stderr as before.
 stream_packet_bytes() {
+    local file="$1" strict="${2:-}" errf="" rc=0
+    local -a ps
+
+    errf=$(mktemp "${TMPDIR:-/tmp}/packet-scan.XXXXXX" 2>/dev/null) || errf=""
+
     ffprobe -v error \
         -show_entries packet=stream_index,size \
         -of csv=p=0 \
-        "$1" |
+        "$file" 2> "${errf:-/dev/stderr}" |
     awk -F',' '
-        $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { s[$1] += $2 }
-        END { for (i in s) printf "%d %.0f\n", i, s[i] }' |
+        $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { s[$1] += $2; n++; next }
+        NF { bad++ }
+        END {
+            for (i in s) printf "%d %.0f\n", i, s[i]
+            exit (bad || !n) ? 2 : 0 }' |
     sort -n
+    ps=("${PIPESTATUS[@]}")
+    (( ps[0] == 0 && ps[1] == 0 && ps[2] == 0 )) || rc=1
+
+    if [[ -n "$errf" ]]; then
+        if [[ -s "$errf" ]]; then
+            cat -- "$errf" >&2
+            [[ "$strict" == strict ]] && rc=1
+        fi
+        rm -f -- "$errf"
+    elif [[ "$strict" == strict ]]; then
+        # ffprobe's error output could not be checked
+        rc=1
+    fi
+    return "$rc"
 }
 
 # stream_stored_stats FILE
@@ -53,13 +84,21 @@ stream_stored_stats() {
 # Always one packet scan (authoritative: verify.sh Validate + update,
 # finished-encode reports). Menus use stats_load instead. Video = the main video stream only (cover art is not
 # counted); audio = all audio streams combined.
+#
+# FILE [strict]: returns 1 when the totals cannot be trusted: the stream
+# probe failed or listed nothing, the packet scan failed
+# (stream_packet_bytes, "strict" passed on), or the file has no main
+# video stream. The totals are printed anyway ("0 0" when nothing was
+# read), so report-only callers (verify.sh, the encode report) are
+# unchanged; a caller that decides on them must check the status.
 media_stream_totals() {
-    local file="$1"
-    local info
+    local file="$1" strict="${2:-}"
+    local info packets rc=0
 
-    info=$(stream_info "$file")
+    info=$(stream_info "$file") || rc=1
+    [[ -n "$info" ]] || rc=1
+    packets=$(stream_packet_bytes "$file" "$strict") || rc=1
 
-    stream_packet_bytes "$file" |
     awk -v info="$info" '
         BEGIN {
             n = split(info, l, "\n")
@@ -72,7 +111,8 @@ media_stream_totals() {
         }
         $1 == main          { v += $2 }
         type[$1] == "audio" { a += $2 }
-        END { printf "%.0f %.0f\n", v, a }'
+        END { printf "%.0f %.0f\n", v, a; exit (main == "") ? 3 : 0 }' <<< "$packets" || rc=1
+    return "$rc"
 }
 
 # stored_tag_totals FILE MAIN_VIDEO_INDEX  ->  "video_bytes audio_bytes"
