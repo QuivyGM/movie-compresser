@@ -22,7 +22,10 @@
 # fits with at least down_headroom_pct to spare tries CRF - 1 (down to
 # crf_min, at most down_max times; High / Base also only when CRF - 1 is
 # predicted to fit, down_fit_pct); a lower attempt above the ceiling is
-# discarded and the fitting one kept. Movie Quality uses the upper edge
+# discarded and the fitting one kept. Movie High / Base
+# (down_mode=boundary) instead test CRF - 1 exactly once after the first
+# fit, without headroom or prediction gate (the actual encode corrects
+# the estimate). Movie Quality uses the upper edge
 # of its acceptable band as the ceiling and tries CRF - 1 only while the
 # actual video is below the band (down_below_vbytes). Series episodes
 # are items of their own: each is checked and retried alone, at its own
@@ -904,6 +907,12 @@ record_crf_estimate() {
 #            discarded and the accepted encode is kept. The accepted
 #            encode is renamed to "<output>.accepted-crf<N>.part" first
 #            and only deleted after a lower attempt has fitted.
+#            down_mode=boundary (movie High / Base): CRF - 1 is tested
+#            exactly once after the first fit, whatever the headroom or
+#            its estimate (down_headroom_pct / down_max / down_fit_pct
+#            ignored); not below crf_min, never a CRF an actual encode
+#            already found above the ceiling. The result is the lowest
+#            CRF that fits next to one that does not (or crf_min).
 # The ceiling is a hard upper bound: an attempt above it is never
 # chosen over one that fits.
 # ------------------------------------------------------------
@@ -1073,7 +1082,7 @@ _drop_attempt() {
 item_crf_encode() {
     local fn="$1"
     local planned="${ITEM_EXP[crf]:-}" ceil max min c act prev="" prev_crf="" ok
-    local thr down_max downs=0 nc a2 acc why="Headroom large" fit pred lim
+    local thr down_max downs=0 nc a2 acc why="Headroom large" fit pred lim boundary=0
     local -A over=()
 
     ITEM_EXP[crf_planned]="$planned"
@@ -1098,6 +1107,15 @@ item_crf_encode() {
     if [[ "${ITEM_EXP[down_below_vbytes]:-}" =~ ^[0-9]+$ ]]; then
         thr=$(( ITEM_EXP[down_below_vbytes] - 1 ))
         why="Below the acceptable band"
+    fi
+    # movie High / Base: one CRF - 1 test after the first fit; the
+    # estimates chose the CRF, the actual encode decides
+    if [[ "${ITEM_EXP[down_mode]:-}" == boundary ]]; then
+        boundary=1
+        thr="$ceil"
+        down_max=1
+        fit=""
+        why="Fits"
     fi
     c="$planned"
 
@@ -1168,14 +1186,21 @@ item_crf_encode() {
     while [[ -n "$thr" ]] && (( act <= thr )); do
         nc=$((c - 1))
         if (( c <= min )); then
-            echo "$why, but CRF $min is the $ITEM_TIER minimum"
+            if (( boundary )); then
+                echo "CRF $min is the $ITEM_TIER minimum; keeping CRF $c"
+            else
+                echo "$why, but CRF $min is the $ITEM_TIER minimum"
+            fi
             break
         fi
         if (( downs >= down_max )); then
-            (( down_max > 0 )) && echo "$why, but the lower-CRF retry limit ($down_max) is reached"
+            (( down_max > 0 && ! boundary )) && echo "$why, but the lower-CRF retry limit ($down_max) is reached"
             break
         fi
-        [[ -n "${over[$nc]:-}" ]] && break
+        if [[ -n "${over[$nc]:-}" ]]; then
+            (( boundary )) && echo "CRF $nc was already over the ceiling; keeping CRF $c"
+            break
+        fi
 
         # High / Base: only a lower CRF that is predicted to fit
         if [[ -n "$fit" ]]; then
@@ -1196,7 +1221,11 @@ item_crf_encode() {
         acc="$KEPT_PART"
         ITEM_PART="$acc"
 
-        echo "$why -> trying CRF $nc"
+        if (( boundary )); then
+            echo "Testing CRF $nc for better quality..."
+        else
+            echo "$why -> trying CRF $nc"
+        fi
         ((downs += 1))
         ITEM_EXP[crf]="$nc"
         ITEM_CRF_RUN="$nc"
@@ -1219,10 +1248,15 @@ item_crf_encode() {
         a2=$(item_video_bytes "$ITEM_PART")
 
         echo
-        echo "CRF $nc actual: $(_gib "$a2") GiB / $(_gib "$ceil") GiB ceiling"
+        if (( boundary )); then
+            echo "CRF $nc actual: $(_gib "$a2") GiB / $(_gib "$ceil") GiB ceiling -> $( (( a2 <= ceil )) && echo fits || echo over ceiling)"
+            echo "Keeping CRF $( (( a2 <= ceil )) && echo "$nc" || echo "$c")"
+        else
+            echo "CRF $nc actual: $(_gib "$a2") GiB / $(_gib "$ceil") GiB ceiling"
+        fi
 
         if (( a2 <= ceil )); then
-            echo "Result: accepted"
+            (( boundary )) || echo "Result: accepted"
             item_attempt_note "$nc" "$a2" ACCEPTED-CANDIDATE
             _drop_attempt "$acc"
             c="$nc"
@@ -1230,7 +1264,7 @@ item_crf_encode() {
             continue
         fi
 
-        echo "Result: over ceiling -> keeping CRF $c"
+        (( boundary )) || echo "Result: over ceiling -> keeping CRF $c"
         item_attempt_note "$nc" "$a2" REJECTED "over ceiling; keep CRF $c"
         _drop_attempt "$ITEM_PART"
         ITEM_PART="$acc"

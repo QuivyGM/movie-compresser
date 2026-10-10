@@ -335,8 +335,8 @@ est 19=9 20=7.5 21=6.9 22=5
 EST_CALLS=()
 crf_select 19 23 "$(gib_bytes 7)" fake_est
 eq "High/Base crf_select: first CRF under the ceiling" "$CRF_SELECTED ${CRF_TRIED[*]}" "21 19 20 21"
-check "High/Base retry spec in the menu (+ predicted-fit margin)" \
-    "grep -qF '[[ \"\$TIER\" != \"Custom\" ]] && RETRY_SPEC=\"\$CRF_CEILING_BYTES:\$CRF_MAX:\$CRF_MIN:\$CRF_DOWN_RETRY_HEADROOM_PCT:\$CRF_DOWN_RETRY_MAX::\$CRF_DOWN_RETRY_FIT_MARGIN_PCT\"' '$M'"
+check "High/Base retry spec in the menu (one CRF - 1 boundary test)" \
+    "grep -qF '[[ \"\$TIER\" != \"Custom\" ]] && RETRY_SPEC=\"\$CRF_CEILING_BYTES:\$CRF_MAX:\$CRF_MIN:0:1:::boundary\"' '$M'"
 check "Quality retry spec: no predicted-fit margin" \
     "grep -qF 'RETRY_SPEC=\"\$CRF_CEILING_BYTES:\$CRF_MAX:\$CRF_MIN:\$CRF_DOWN_RETRY_HEADROOM_PCT:\$CRF_DOWN_RETRY_MAX\"' '$M' && ! grep -q 'band).*FIT_MARGIN' '$M'"
 check "series menu does not use the Quality tier" "! grep -q 'Quality' '$SRC_WORK/series_compress.sh'"

@@ -450,13 +450,12 @@ while true; do
         VIDEO_SPEC="crf:$CRF"
 
         # High / Base: re-encoded at CRF + 1 when the actual video is above
-        # the ceiling, at CRF - 1 when it fits with CRF_DOWN_RETRY_HEADROOM_PCT
-        # to spare and CRF - 1 is predicted to stay CRF_DOWN_RETRY_FIT_MARGIN_PCT
-        # below the ceiling (actual x the sampled CRF - 1 / CRF ratio,
-        # CRF_EST_MAPS) (up to CRF_DOWN_RETRY_MAX times, not below CRF_MIN:
-        # the tier's search floor, not CRF_START, so a CRF chosen below
-        # CRF_START is not held to CRF_START)
-        # (job_runtime.sh item_crf_encode). Not for Custom, and
+        # the ceiling; once an attempt fits, CRF - 1 is encoded ONCE
+        # ("boundary": no headroom or predicted-fit gate, the estimate of
+        # CRF - 1 does not block it) unless CRF - 1 is CRF_MIN - 1 (the
+        # tier's search floor, not CRF_START) or an actual encode already
+        # put it above the ceiling; CRF - 1 is kept when it fits, else
+        # discarded (job_runtime.sh item_crf_encode). Not for Custom, and
         # not when CRF_MAX above the ceiling was already accepted below.
         # Quality: the same retry with the band's upper edge (never at or
         # above the source video) as the ceiling, and CRF - 1 only while
@@ -476,7 +475,7 @@ while true; do
                 QUALITY_SPEC="$SOURCE_VIDEO_BYTES:0:$CRF_CEILING_BYTES:source-limited"
                 ;;
             *)
-                [[ "$TIER" != "Custom" ]] && RETRY_SPEC="$CRF_CEILING_BYTES:$CRF_MAX:$CRF_MIN:$CRF_DOWN_RETRY_HEADROOM_PCT:$CRF_DOWN_RETRY_MAX::$CRF_DOWN_RETRY_FIT_MARGIN_PCT"
+                [[ "$TIER" != "Custom" ]] && RETRY_SPEC="$CRF_CEILING_BYTES:$CRF_MAX:$CRF_MIN:0:1:::boundary"
                 ;;
         esac
 

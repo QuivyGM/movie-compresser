@@ -242,7 +242,7 @@ else
     CB="$CRF_CEILING_BYTES"
     eq "job ceiling = runtime x rate" "$CB" "$(awk -v d="$DUR" 'BEGIN { printf "%.0f", 0.0001 * 1073741824 * d / 3600 }')"
     # the RETRY spec as movie_compress.sh builds it for High / Base
-    RETRY_SPEC="$CRF_CEILING_BYTES:$CRF_MAX:$CRF_MIN:$CRF_DOWN_RETRY_HEADROOM_PCT:$CRF_DOWN_RETRY_MAX::$CRF_DOWN_RETRY_FIT_MARGIN_PCT"
+    RETRY_SPEC="$CRF_CEILING_BYTES:$CRF_MAX:$CRF_MIN:0:1:::boundary"
     DV_POLICY=none HDR10P_POLICY=none
     { emit_job_header j1 movie 1
       emit_encode_item 1 "$T/in/M.mkv" "$T/out/M.mkv" High crf:21 "" "" 0 1000 "$RETRY_SPEC"
