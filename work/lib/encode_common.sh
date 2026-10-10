@@ -1520,17 +1520,20 @@ emit_failed_item() {
 #           series High, Base, Custom). No -b:v, no pass logs (PASSLOG is ignored).
 #           EST_VIDEO_BYTES, the pre-encode estimate, is reported against
 #           the actual size afterwards (never a failure).
-#           RETRY "CEILING_BYTES:CRF_MAX:CRF_MIN:HEADROOM_PCT:DOWN_MAX[:batch[:FIT_PCT[:DOWN_MODE]]]"
+#           RETRY "CEILING_BYTES:CRF_MAX:CRF_MIN:HEADROOM_PCT:DOWN_MAX[:batch|season[:FIT_PCT[:DOWN_MODE]]]"
 #           (High / Base / Quality): an attempt whose actual VIDEO bytes are above
 #           the ceiling is re-encoded at CRF + 1 up to CRF_MAX; one that
 #           fits at least HEADROOM_PCT below the ceiling tries CRF - 1
 #           (not below CRF_MIN, at most DOWN_MAX times; job_runtime.sh
 #           item_crf_encode). FIT_PCT (High / Base): CRF - 1 only when
 #           its predicted size (actual x CRF_EST ratio) stays FIT_PCT
-#           below the ceiling. ":batch" (job scripts of earlier
-#           versions): the episode joins a one-CRF season batch
-#           (job_crf_batch); series episodes are now items of their own
-#           (field empty). DOWN_MODE "boundary" (movie High / Base):
+#           below the ceiling. ":season" (series High / Base): the
+#           episode joins the shared-CRF season batch (job_crf_batch,
+#           batch_mode=season: every episode must fit, the whole season
+#           moves up together, one whole-season CRF - 1 test;
+#           HEADROOM_PCT / DOWN_MAX / FIT_PCT unused). ":batch" (job
+#           scripts of earlier versions): the median-decided season
+#           batch. DOWN_MODE "boundary" (movie High / Base):
 #           the first attempt that fits tests CRF - 1 exactly once, with
 #           no headroom / FIT_PCT gate (job_runtime.sh). "" = no retry
 #           (Custom).
@@ -1712,6 +1715,12 @@ emit_encode_item() {
     # movie High / Base: one CRF - 1 test after the first fit (job_runtime.sh)
     [[ "$mode" == "crf" && "$rdmode" == boundary ]] &&
         expect+=' down_mode=boundary'
+    # series High / Base: strict shared season CRF (job_runtime.sh job_crf_batch)
+    if [[ "$mode" == "crf" && "$rbatch" == season ]]; then
+        expect+=' batch_mode=season'
+        declare -F episode_label > /dev/null &&
+            expect+=$(printf ' ep_label=%q' "$(episode_label "$in")")
+    fi
     [[ "$mode" == "crf" && -n "$actual_sig" ]] &&
         expect+=$(printf ' actual_sig=%q' "$actual_sig")
     [[ "$mode" == "crf" && "$crf_est" =~ ^[0-9.]+=[0-9]+(:[0-9.]+=[0-9]+)*$ ]] &&
@@ -1724,7 +1733,7 @@ emit_encode_item() {
         steps+=("$(printf 'item_step hdr10+ item_hdr10plus_extract %q %q' "$in" "$vidx")")
 
     printf '# ---- item %s%s\n' "$index" \
-        "$( [[ "$dv_policy" == "preserve" ]] && echo "  (Dolby Vision profile ${HDR_DV_PROFILE} -> $DV_OUT preserved)")$( [[ "$rbatch" == batch ]] && echo "  (season CRF batch: job_crf_batch)")"
+        "$( [[ "$dv_policy" == "preserve" ]] && echo "  (Dolby Vision profile ${HDR_DV_PROFILE} -> $DV_OUT preserved)")$( [[ "$rbatch" == batch || "$rbatch" == season ]] && echo "  (season CRF batch: job_crf_batch)")"
 
     if [[ "$mode" == "crf" ]]; then
         # the final encode as a function: a CRF retry runs it again
@@ -1733,7 +1742,7 @@ emit_encode_item() {
         printf '}\n'
     fi
 
-    if [[ "$rbatch" == batch ]]; then
+    if [[ "$rbatch" == batch || "$rbatch" == season ]]; then
         printf 'item_ctx_%s() {\n' "$index"
         printf '   %s &&\n' "$begin"
         printf '   %s\n' "$expect"

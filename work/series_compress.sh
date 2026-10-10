@@ -26,19 +26,22 @@ source "$WORK_DIR/lib/naming.sh"
 #              regular episode's video estimate fits the per-episode
 #              SERIES_*_VIDEO_SIZE_CEILING_GIB, searched from
 #              SERIES_*_CRF_START up or down (the adjacent boundary:
-#              CRF N too large, N + 1 fits). An isolated outlier (the
-#              only episode above median + SERIES_CRF_OUTLIER_PCT) does
-#              not set it; it gets its own higher CRF when it does not
-#              fit at the season CRF. Two or more large episodes raise
-#              the season CRF instead.
+#              CRF N too large, N + 1 fits). Strictly shared
+#              (SERIES_CRF_SHARED=1): an outlier (an episode above
+#              median + SERIES_CRF_OUTLIER_PCT) is reported but never
+#              gets a CRF of its own; a harder episode raises the season
+#              CRF for every episode.
 # Custom:      user-entered CRF, used exactly for every episode (no
 #              High/Base range or ceiling)
 #
-# After the encode every episode's actual video is checked on its own
-# and only that episode is retried (job_runtime.sh item_crf_encode). An
-# episode whose estimate is not below its source video is only
-# re-encoded when the user chooses so (or its source video is kept / it
-# is skipped).
+# After the encode (job_runtime.sh job_crf_batch, batch_mode=season)
+# every episode's ACTUAL video must fit the per-episode ceiling: one
+# above it moves the WHOLE season to CRF + 1 (up to CRF_MAX); once the
+# season fits, CRF - 1 is tested once for the whole season and kept only
+# when every episode fits there. The final season is one CRF for every
+# encoded episode. An episode whose estimate is not below its source
+# video is only re-encoded when the user chooses so (or its source video
+# is kept / it is skipped).
 #
 # Every audio track is copied unchanged (codec, bitrate, channels,
 # Atmos / DTS:X, titles, flags) and comes on top of the video size;
@@ -52,6 +55,10 @@ source "$WORK_DIR/lib/naming.sh"
 if ! load_policy; then
     exit 1
 fi
+
+# one shared season CRF: no per-episode / isolated-outlier CRF (policy.sh
+# series_crf_shared)
+SERIES_CRF_SHARED=1
 
 # runtime files of earlier jobs confirmed finished (encode_common.sh)
 cleanup_finished_jobs "$WORK_DIR"
@@ -489,12 +496,11 @@ fi
 # sampled above the ceiling (unless the season CRF is CRF_MIN). An
 # episode that was not sampled never makes a CRF too large on its
 # estimate alone: when it decides, it is sampled itself at that CRF
-# first (crf_series_estimate, series_decisive_inferred). An isolated
-# outlier (the only episode above median + SERIES_CRF_OUTLIER_PCT) does
-# not decide it; it gets its own CRF from
-# the season CRF up, sampled itself, if it does not fit at the season
-# CRF. Sampled episodes (spread over the batch, plus the longest) are
-# encoded at the output resolution.
+# first (crf_series_estimate, series_decisive_inferred). Every episode
+# decides, an outlier (above median + SERIES_CRF_OUTLIER_PCT) too: it
+# raises the shared season CRF, it never gets a CRF of its own
+# (SERIES_CRF_SHARED). Sampled episodes (spread over the batch, plus the
+# longest) are encoded at the output resolution.
 # ============================================================
 
 mapfile -t CRF_SERIES_SAMPLED < <(series_sample_episodes "$FILE_COUNT" "$SERIES_CRF_SAMPLE_EPISODES" "$(series_longest_episode)")
@@ -520,7 +526,7 @@ crf_series_estimate_shown() {
         "${EP_LABEL[$SB_DECIDE_IDX]}" "$(series_from_text "${ef[SB_DECIDE_IDX]}")"
     if (( CRF_CEILING_BYTES > 0 )); then
         if [[ -n "$SB_ISOLATED" ]]; then
-            printf '%-10s%s ~%s GiB (above median +%s%%; does not set the season CRF)\n' "Outlier:" \
+            printf '%-10s%s ~%s GiB (above median +%s%%; must fit the shared season CRF)\n' "Outlier:" \
                 "${EP_LABEL[$SB_ISOLATED]}" "$(bytes_to_gib "${eb[SB_ISOLATED]}")" "$SERIES_CRF_OUTLIER_PCT"
         elif (( ${#SB_OUTLIERS[@]} > 1 )); then
             printf '%-10s%d episodes above median +%s%% (season difficulty)\n' "Large:" \
@@ -602,23 +608,21 @@ done
 # season figures at the season CRF (audio is never part of them)
 series_batch_stats "$CRF_CEILING_BYTES" "${EP_EST[@]}"
 EST_MEDIAN="$SB_MEDIAN"
-OUTLIER=""
-[[ "$TIER" != "Custom" ]] && OUTLIER="$SB_ISOLATED"
-
+# shared season CRF: an outlier (SB_ISOLATED) is only reported; it never
+# gets a CRF of its own, every episode above the ceiling counts
 if [[ "$TIER" != "Custom" ]]; then
     for i in "${!FILES[@]}"; do
-        [[ "$i" == "$OUTLIER" ]] && continue
         (( EP_EST[i] > CRF_CEILING_BYTES )) && EP_OVER[$i]=1
     done
 fi
 
-# ---- season CRF_MAX still above the ceiling (regular episodes)
+# ---- season CRF_MAX still above the ceiling (every episode decides)
 if (( CRF_OVER_CEILING == 1 )); then
     echo
     echo "------------------------------------------------------------"
     echo "$(ui_warn WARNING): the ${CRF_CEILING_GIB} GiB per-episode video ceiling cannot be met"
     echo "within the allowed ${TIER} quality range: even CRF ${CRF_MAX} (the lowest quality ${TIER}"
-    echo "allows) gives a largest regular episode of ~$(bytes_to_gib "${CRF_EST[$CRF]}") GiB video, ~$(crf_oversize_gib "${CRF_EST[$CRF]}" "$CRF_CEILING_BYTES") GiB above the ceiling."
+    echo "allows) gives a largest episode of ~$(bytes_to_gib "${CRF_EST[$CRF]}") GiB video, ~$(crf_oversize_gib "${CRF_EST[$CRF]}" "$CRF_CEILING_BYTES") GiB above the ceiling."
     echo "------------------------------------------------------------"
     echo "1) Encode every episode at CRF ${CRF_MAX} anyway"
     echo "2) Cancel"
@@ -633,42 +637,9 @@ if (( CRF_OVER_CEILING == 1 )); then
     done
 fi
 
-# ---- isolated outlier above the ceiling at the season CRF: its own CRF
-OUTLIER_SEASON_EST=""
-if [[ -n "$OUTLIER" ]] && (( EP_EST[OUTLIER] > CRF_CEILING_BYTES )); then
-    OUTLIER_SEASON_EST="${EP_EST[$OUTLIER]}"
-    echo
-    if ui_verbose; then
-        printf 'Isolated outlier: %s (~%s video at CRF %s, above median +%s%%);\n' \
-            "$(basename "${FILES[$OUTLIER]}")" "$(size_text "${EP_EST[$OUTLIER]}")" "$CRF" "$SERIES_CRF_OUTLIER_PCT"
-        echo "its own CRF from $CRF up (sampled itself):"
-    else
-        printf 'Outlier %s: ~%s GiB at CRF %s, above the ceiling; own CRF:\n' \
-            "${EP_LABEL[$OUTLIER]}" "$(bytes_to_gib "${EP_EST[$OUTLIER]}")" "$CRF"
-    fi
-
-    if ! series_episode_crf "$OUTLIER" "$CRF" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_episode_estimate \
-            crf_episode_step_report; then
-        echo
-        echo "$(ui_err "CRF analysis failed") (sample encode error above)."
-        echo "Compression cancelled."
-        exit 1
-    fi
-
-    EP_CRF[$OUTLIER]="$EPC_CRF"
-    EP_EST[$OUTLIER]="$EPC_BYTES"
-    EP_FROM[$OUTLIER]="sample"
-    EP_OVER[$OUTLIER]="$EPC_OVER"
-
-    if (( EPC_OVER == 0 )); then
-        printf '%-10s%s CRF %s (~%s GiB); every other episode CRF %s\n' "Outlier:" \
-            "$(ep_name "$OUTLIER")" "$EPC_CRF" "$(bytes_to_gib "$EPC_BYTES")" "$CRF"
-    fi
-fi
-
-# episode_over_ceiling_prompt INDEX  ->  an episode with its own CRF
-# still above the ceiling at CRF_MAX: encode anyway / skip it
-# (EP_CEIL_SKIP) / cancel
+# episode_over_ceiling_prompt INDEX  ->  an episode whose own sample is
+# still above the ceiling at CRF_MAX (series_late_ceiling): encode the
+# season at CRF_MAX anyway / skip it (EP_CEIL_SKIP) / cancel
 episode_over_ceiling_prompt() {
     local i="$1" oc
 
@@ -678,7 +649,7 @@ episode_over_ceiling_prompt() {
     echo "within the allowed ${TIER} quality range: even CRF ${CRF_MAX} (the lowest quality ${TIER}"
     echo "allows) is estimated at ~$(bytes_to_gib "${EP_EST[$i]}") GiB video, ~$(crf_oversize_gib "${EP_EST[$i]}" "$CRF_CEILING_BYTES") GiB above the ceiling."
     echo "------------------------------------------------------------"
-    echo "1) Encode it at CRF ${CRF_MAX} anyway"
+    echo "1) Encode it anyway (the whole season at CRF ${CRF_MAX})"
     echo "2) Skip this episode"
     echo "3) Cancel"
 
@@ -693,11 +664,6 @@ episode_over_ceiling_prompt() {
     done
     return 0
 }
-
-# ---- isolated outlier still above the ceiling at CRF_MAX
-if [[ -n "$OUTLIER" ]] && (( EP_OVER[OUTLIER] == 1 && CRF_OVER_CEILING == 0 )); then
-    episode_over_ceiling_prompt "$OUTLIER"
-fi
 
 # final_figures  ->  ABOVE, EST_LARGEST, OWN_CRF at each episode's own CRF
 final_figures() {
@@ -731,14 +697,7 @@ if ui_verbose; then
 
     echo
     echo "Selected:"
-    if (( ${#OWN_CRF[@]} )); then
-        echo "  CRF $CRF for $(( FILE_COUNT - ${#OWN_CRF[@]} )) of ${FILE_COUNT} episodes (season CRF)"
-        for i in "${OWN_CRF[@]}"; do
-            echo "  CRF ${EP_CRF[$i]} for $(basename "${FILES[$i]}") (isolated outlier, ~$(size_text "$OUTLIER_SEASON_EST") at CRF $CRF)"
-        done
-    else
-        echo "  CRF $CRF for all ${FILE_COUNT} episodes"
-    fi
+    echo "  CRF $CRF for all ${FILE_COUNT} episodes (shared season CRF)"
     echo "  median episode video:  ~$(size_text "$EST_MEDIAN")"
     echo "  largest episode video: ~$(size_text "$EST_LARGEST")"
     if [[ "$TIER" != "Custom" ]]; then
@@ -798,10 +757,11 @@ if ! series_guard_episodes crf_episode_estimate; then
     exit 1
 fi
 
-# ---- an own sample taken by the guard above the ceiling: that episode
-# alone gets a higher CRF now, before the encode (policy.sh
-# series_late_ceiling; the season CRF is not changed), then the guard
-# is decided on its estimate at that CRF
+# ---- an own sample taken by the guard above the ceiling at the season
+# CRF (policy.sh series_late_ceiling: the lowest CRF from the season CRF
+# up at which that episode's own estimate fits): the SHARED season CRF
+# rises to it for every episode (season_raise); no episode keeps a CRF
+# of its own. Then the guard is decided on the estimates at that CRF.
 if ! series_late_ceiling crf_episode_estimate crf_episode_step_report; then
     echo
     echo "$(ui_err "CRF analysis failed") (sample encode error above)."
@@ -809,21 +769,75 @@ if ! series_late_ceiling crf_episode_estimate crf_episode_step_report; then
     exit 1
 fi
 
-declare -A IS_LATE=()
+# season_raise CRF  ->  the shared season CRF becomes CRF for every
+# episode: their estimates at CRF from the season estimator (sampled now
+# when CRF was not estimated yet), an episode's own sample at CRF
+# (CRF_EP_EST) taking precedence. Returns 1 when a sample encode failed.
+season_raise() {
+    local c="$1" i
+    local -a eb ef
+
+    if [[ -z "${CRF_SERIES_EP_BYTES[$c]:-}" ]]; then
+        crf_series_estimate_shown "$c" || return 1
+        CRF_EST[$c]="$CRF_EST_RESULT"
+        CRF_TRIED+=("$c")
+    fi
+    read -ra eb <<< "${CRF_SERIES_EP_BYTES[$c]}"
+    read -ra ef <<< "${CRF_SERIES_EP_FROM[$c]}"
+
+    CRF="$c"
+    for i in "${!FILES[@]}"; do
+        EP_CRF[$i]="$c"
+        EP_EST[$i]="${eb[i]}"
+        EP_FROM[$i]="${ef[i]}"
+        if [[ "${CRF_EP_EST[$i:$c]:-}" =~ ^[0-9]+$ ]]; then
+            EP_EST[$i]="${CRF_EP_EST[$i:$c]}"
+            EP_FROM[$i]="sample"
+        fi
+        EP_OVER[$i]=0
+        (( EP_EST[i] > CRF_CEILING_BYTES )) && EP_OVER[$i]=1
+        [[ "${EP_VIDEO[$i]}" == crf:* ]] && EP_VIDEO[$i]="crf:$c"
+    done
+
+    series_batch_stats "$CRF_CEILING_BYTES" "${EP_EST[@]}"
+    EST_MEDIAN="$SB_MEDIAN"
+}
+
 if (( ${#LATE[@]} )); then
+    RAISE="$CRF"
+    RAISED_BY=""
     for i in "${LATE[@]}"; do
-        IS_LATE[$i]=1
-        EP_VIDEO[$i]="crf:${EP_CRF[$i]}"
-        if (( EP_OVER[i] == 0 )); then
-            printf '%-10s%s CRF %s (~%s GiB); season CRF %s unchanged\n' "Own CRF:" \
-                "$(ep_name "$i")" "${EP_CRF[$i]}" "$(bytes_to_gib "${EP_EST[$i]}")" "$CRF"
-        elif (( CRF_OVER_CEILING == 0 )); then
+        if (( EP_OVER[i] == 1 && CRF_OVER_CEILING == 0 )); then
             episode_over_ceiling_prompt "$i"
+            # a skipped episode is not encoded: it does not raise the season
+            (( EP_CEIL_SKIP[i] == 1 )) && continue
+        fi
+        if (( EP_CRF[i] > RAISE )); then
+            RAISE="${EP_CRF[$i]}"
+            RAISED_BY="$i"
         fi
     done
 
-    # the guard on the estimates at the final CRFs (a higher CRF can
-    # only drop an episode from it); skipped episodes are not asked for
+    if (( RAISE != CRF )); then
+        printf '%-10s%s own sample above the ceiling at CRF %s -> season CRF %s for every episode\n' \
+            "Season:" "$(ep_name "$RAISED_BY")" "$CRF" "$RAISE"
+        if ! season_raise "$RAISE"; then
+            echo
+            echo "$(ui_err "CRF analysis failed") (sample encode error above)."
+            echo "Compression cancelled."
+            exit 1
+        fi
+    else
+        # nothing raised (skipped / already at the season CRF): every
+        # episode stays at the season CRF
+        for i in "${!FILES[@]}"; do
+            EP_CRF[$i]="$CRF"
+            [[ "${EP_VIDEO[$i]}" == crf:* ]] && EP_VIDEO[$i]="crf:$CRF"
+        done
+    fi
+
+    # the guard on the estimates at the final CRF (a higher CRF can only
+    # drop an episode from it); skipped episodes are not asked for
     KEEP=()
     for i in "${GUARD[@]+"${GUARD[@]}"}"; do
         (( EP_CEIL_SKIP[i] == 1 )) && continue
@@ -924,11 +938,12 @@ if ui_verbose; then
 
     echo
     echo "Per-episode rules:"
-    echo "  - video: one season CRF (sizes vary with content); only an isolated"
-    echo "    outlier above the ceiling gets its own higher CRF; each episode's"
-    echo "    actual video is checked against the ceiling after its encode and"
-    echo "    only that episode is retried; an episode whose estimate is not"
-    echo "    below its source is only re-encoded if you chose so above"
+    echo "  - video: one shared season CRF for every encoded episode (sizes vary"
+    echo "    with content); after the whole season is encoded, every episode's"
+    echo "    actual video must fit the ceiling, otherwise the whole season is"
+    echo "    re-encoded at CRF + 1; once it fits, CRF - 1 is tested once for the"
+    echo "    whole season and kept only if every episode fits; an episode whose"
+    echo "    estimate is not below its source is only re-encoded if you chose so"
     echo "  - audio: every track copied unchanged (optional audio compression"
     echo "    afterwards with audio_compress_menu.sh)"
     echo "------------------------------------------------------------"
@@ -963,10 +978,6 @@ if ui_verbose; then
             esac
             if [[ -n "${IS_ABOVE[$i]:-}" ]]; then
                 status="ABOVE CEILING"
-            elif [[ "${EP_CRF[$i]}" != "$CRF" && -n "${IS_LATE[$i]:-}" ]]; then
-                status="OWN CRF: OWN SAMPLE ABOVE CEILING"
-            elif [[ "${EP_CRF[$i]}" != "$CRF" ]]; then
-                status="OUTLIER: OWN CRF"
             else
                 status="OK"
             fi
@@ -985,9 +996,6 @@ if ui_verbose; then
     echo "  highest = not sampled (inferred); highest sampled video bitrate x its runtime"
     echo "  promoted = not in the sample set; sampled itself because it decided the season CRF"
     if [[ "$TIER" != "Custom" ]]; then
-        echo "  OUTLIER: OWN CRF = isolated outlier, above the ceiling at the season CRF ${CRF}"
-        (( ${#LATE[@]} )) &&
-            echo "  OWN CRF: OWN SAMPLE ABOVE CEILING = not sampled, its own sample (source check) above the ceiling"
         echo "  ABOVE CEILING = video estimate above ${CRF_CEILING_GIB} GiB even at CRF ${CRF_MAX}"
     fi
 
@@ -1062,10 +1070,6 @@ else
             STATUS[$i]="SOURCE VIDEO KEPT"
         elif [[ -n "${IS_ABOVE[$i]:-}" ]]; then
             STATUS[$i]=$(ui_warn "ABOVE CEILING")
-        elif [[ "${EP_CRF[$i]}" != "$CRF" && -n "${IS_LATE[$i]:-}" ]]; then
-            STATUS[$i]="OWN CRF (own sample)"
-        elif [[ "${EP_CRF[$i]}" != "$CRF" ]]; then
-            STATUS[$i]="OUTLIER (own CRF)"
         else
             STATUS[$i]=$(ui_ok OK)
         fi
@@ -1245,28 +1249,29 @@ JOB_FILE="$WORK_DIR/${SESSION}.sh"
 # BUILD ENCODE JOB
 # ============================================================
 
-# High / Base: every episode is an item of its own (job_runtime.sh
-# item_crf_encode): its ACTUAL video above the per-episode ceiling ->
-# only that episode is re-encoded at CRF + 1 (up to CRF_MAX); with
-# CRF_DOWN_RETRY_HEADROOM_PCT to spare and CRF - 1 predicted to fit
-# (CRF_DOWN_RETRY_FIT_MARGIN_PCT, from its estimates per CRF) that
-# episode alone tries CRF - 1, at most SERIES_CRF_DOWN_RETRY_MAX times,
-# never below CRF_MIN, the tier's search floor (SERIES_*_CRF_SEARCH_MIN,
-# not CRF_START: a season CRF chosen below CRF_START keeps that room); an
-# isolated outlier or an own CRF from the late ceiling check: never below
-# the season CRF.
-# Not for Custom, and not for an episode whose estimate at CRF_MAX
-# above the ceiling was already accepted.
+# High / Base: every encoded episode joins ONE shared-CRF season batch
+# (policy.sh series_season_retry_spec; job_runtime.sh job_crf_batch,
+# batch_mode=season): the season is encoded at CRF; any episode's ACTUAL
+# video above the per-episode ceiling re-encodes the WHOLE season at
+# CRF + 1 (up to CRF_MAX); once every episode fits, CRF - 1 is tested
+# once for the whole season (not below CRF_MIN, the tier's
+# SERIES_*_CRF_SEARCH_MIN) and kept only when every episode fits. No
+# per-episode retry, headroom or own CRF. Custom: no retry.
 # ep_retry_spec INDEX  ->  RETRY of emit_encode_item ("" = none)
 ep_retry_spec() {
-    local i="$1" min="$CRF_MIN"
-
-    [[ "$TIER" == "Custom" ]] && return 0
-    (( EP_OVER[i] == 1 )) && return 0
-    (( 10#${EP_CRF[i]} > 10#$CRF )) && min="$CRF"
-    printf '%s:%s:%s:%s:%s::%s' "$CRF_CEILING_BYTES" "$CRF_MAX" "$min" \
-        "$CRF_DOWN_RETRY_HEADROOM_PCT" "$SERIES_CRF_DOWN_RETRY_MAX" "$CRF_DOWN_RETRY_FIT_MARGIN_PCT"
+    series_season_retry_spec "$TIER" "$CRF_CEILING_BYTES" "$CRF_MAX" "$CRF_MIN"
 }
+
+# one CRF for every encoded episode (anything else is a bug: never start
+# a job with mixed CRFs)
+for i in "${!FILES[@]}"; do
+    (( EP_SKIP[$i] == 1 )) && continue
+    if [[ "${EP_VIDEO[$i]}" != copy && "${EP_VIDEO[$i]}" != "crf:$CRF" ]]; then
+        echo "$(ui_err "Internal error"): $(ep_name "$i") is planned at ${EP_VIDEO[$i]}, season CRF $CRF."
+        echo "Compression cancelled."
+        exit 1
+    fi
+done
 
 {
     emit_job_header "$SESSION" series "$QUEUED"

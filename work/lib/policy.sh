@@ -1224,6 +1224,15 @@ series_crf_spread() {
     SC_MEDIAN_BYTES=$(_median "${SC_EP_BYTES[@]}")
 }
 
+# series_crf_shared  ->  0 when the season CRF is strictly shared
+# (SERIES_CRF_SHARED=1, set by series_compress.sh): no isolated-outlier
+# own CRF; every episode's estimate, the outlier's too, must fit the
+# season CRF. Unset / 0: the earlier rules (an isolated outlier does not
+# decide the season CRF and gets its own CRF).
+series_crf_shared() {
+    [[ "${SERIES_CRF_SHARED:-0}" == 1 ]]
+}
+
 # series_batch_stats CEILING_BYTES VIDEO_BYTES...
 #
 # Season figures for one CRF. VIDEO_BYTES: estimated video bytes per
@@ -1239,7 +1248,10 @@ series_crf_spread() {
 #   SB_ISOLATED   index of the isolated outlier: the only outlier of a
 #                 batch of 3+ episodes ("" = none)
 #   SB_DECIDE     largest REGULAR episode (all but SB_ISOLATED): what the
-#                 season CRF is checked on (crf_series_estimate)
+#                 season CRF is checked on (crf_series_estimate); with
+#                 SERIES_CRF_SHARED=1 the largest of ALL episodes (the
+#                 isolated outlier is only reported and raises the
+#                 season CRF like any other episode)
 #   SB_DECIDE_IDX index of that episode (the first one on a tie)
 #   SB_ABOVE      indexes of the episodes above the ceiling
 #   SB_FITS       1 when SB_DECIDE fits the ceiling (always 1 without one)
@@ -1267,7 +1279,7 @@ series_batch_stats() {
 
     SB_DECIDE=0
     for i in "${!vb[@]}"; do
-        [[ "$i" == "$SB_ISOLATED" ]] && continue
+        [[ "$i" == "$SB_ISOLATED" ]] && ! series_crf_shared && continue
         if [[ -z "$SB_DECIDE_IDX" ]] || (( vb[i] > SB_DECIDE )); then
             SB_DECIDE="${vb[i]}"
             SB_DECIDE_IDX="$i"
@@ -1321,7 +1333,9 @@ series_from_text() {
 #     fits, the failure is proven as above, or none is left
 #   - no inferred regular episode left: the failure stands (1)
 # An inferred isolated outlier never decides the season (it is sampled
-# itself before it gets its own CRF).
+# itself before it gets its own CRF). SERIES_CRF_SHARED=1: every episode
+# decides, so ONE sampled episode above the ceiling proves the failure
+# and an inferred isolated outlier is sampled like any other episode.
 series_decisive_inferred() {
     local ceil="$1" i n over=0 best=""
 
@@ -1334,10 +1348,11 @@ series_decisive_inferred() {
         (( SC_EP_BYTES[i] > ceil )) && ((over += 1))
     done
     (( over >= 2 || (over >= 1 && n < 3) )) && return 1
+    series_crf_shared && (( over >= 1 )) && return 1
 
     for i in "${!SC_EP_BYTES[@]}"; do
         series_from_sampled "${SC_EP_FROM[$i]:-}" && continue
-        [[ "$i" == "$SB_ISOLATED" ]] && continue
+        [[ "$i" == "$SB_ISOLATED" ]] && ! series_crf_shared && continue
         if [[ -z "$best" ]] || (( SC_EP_BYTES[i] > SC_EP_BYTES[best] )); then
             best="$i"
         fi
@@ -1366,19 +1381,22 @@ series_decisive_inferred() {
 #     one is above it at SKIPPED)
 #   - 1-2 episodes (no isolated outlier there): at least one sampled
 #     episode is above the ceiling at NEXT
+#   - SERIES_CRF_SHARED=1 (every episode decides): at least one sampled
+#     episode is above the ceiling at NEXT
 # Otherwise 1: SKIPPED is sampled. Reads CRF_SERIES_RATES[NEXT]
 # (crf_series_estimate; "-" = not sampled) and EP_DUR.
 series_crf_certify_over() {
-    local next="$2" ceil="$3"
+    local next="$2" ceil="$3" shared=0
 
     [[ -n "${CRF_SERIES_RATES[$next]:-}" ]] || return 1
-    awk -v r="${CRF_SERIES_RATES[$next]}" -v d="${EP_DUR[*]}" -v c="$ceil" 'BEGIN {
+    series_crf_shared && shared=1
+    awk -v r="${CRF_SERIES_RATES[$next]}" -v d="${EP_DUR[*]}" -v c="$ceil" -v sh="$shared" 'BEGIN {
         n = split(r, rate, " ")
         if (n == 0 || split(d, dur, " ") != n) exit 1
         over = 0
         for (i = 1; i <= n; i++)
             if (rate[i] != "-" && sprintf("%.0f", rate[i] * dur[i]) + 0 > c) over++
-        exit !(over >= 2 || (over >= 1 && n < 3))
+        exit !(over >= 2 || (over >= 1 && (n < 3 || sh == 1)))
     }'
 }
 
@@ -1440,6 +1458,20 @@ series_est_map() {
         out+="${out:+:}$c=${m[$c]}"
     done
     printf '%s' "$out"
+}
+
+# series_season_retry_spec TIER CEILING_BYTES CRF_MAX CRF_MIN  ->  RETRY
+# field of emit_encode_item for a series episode: High / Base
+# "CEILING:CRF_MAX:CRF_MIN:::season", the shared-CRF season batch
+# (job_runtime.sh job_crf_batch: every episode must fit, the season
+# moves up together, one whole-season CRF - 1 test, never below CRF_MIN
+# = the tier's SERIES_*_CRF_SEARCH_MIN). No per-episode headroom, lower-
+# CRF limit or fit margin: no episode can get a CRF of its own. Custom /
+# no ceiling: "" (no retry).
+series_season_retry_spec() {
+    [[ "$1" == Custom ]] && return 0
+    [[ "$2" =~ ^[0-9]+$ ]] && (( $2 > 0 )) || return 0
+    printf '%s:%s:%s:::season' "$2" "$3" "$4"
 }
 
 # series_guard_episodes ESTIMATOR
@@ -1532,13 +1564,15 @@ series_crf_analysis_lines() {
         echo "    median episode:  $(size_text "$SB_MEDIAN") video"
         # the largest REGULAR episode decides; its estimate sampled / inferred
         d="$(basename "${FILES[$SB_DECIDE_IDX]:-episode $((SB_DECIDE_IDX + 1))}"), $(series_from_text "${ef[SB_DECIDE_IDX]:-}")"
-        if [[ -n "$SB_ISOLATED" ]]; then
+        if [[ -n "$SB_ISOLATED" ]] && ! series_crf_shared; then
             echo "    largest episode: $(size_text "$SB_LARGEST") video"
             echo "    largest regular: $(size_text "$SB_DECIDE") video ($d)"
         else
             echo "    largest episode: $(size_text "$SB_LARGEST") video ($d)"
         fi
-        if [[ -n "$SB_ISOLATED" ]]; then
+        if [[ -n "$SB_ISOLATED" ]] && series_crf_shared; then
+            echo "    outlier: $(basename "${FILES[$SB_ISOLATED]:-episode $((SB_ISOLATED + 1))}") ($(size_text "${eb[SB_ISOLATED]}"), above median +${SERIES_CRF_OUTLIER_PCT}%; decides the shared season CRF)"
+        elif [[ -n "$SB_ISOLATED" ]]; then
             echo "    isolated outlier: $(basename "${FILES[$SB_ISOLATED]:-episode $((SB_ISOLATED + 1))}") ($(size_text "${eb[SB_ISOLATED]}"), above median +${SERIES_CRF_OUTLIER_PCT}%)"
         elif (( ${#SB_OUTLIERS[@]} > 1 )); then
             echo "    ${#SB_OUTLIERS[@]} episodes above median +${SERIES_CRF_OUTLIER_PCT}% (season difficulty, not outliers)"
@@ -1546,7 +1580,8 @@ series_crf_analysis_lines() {
         if (( ${CRF_CEILING_BYTES:-0} > 0 )); then
             echo "    ceiling:         ${CRF_CEILING_GIB} GiB/episode"
             printf '    -> %s; %d of %d episode(s) above the ceiling\n' \
-                "$( (( SB_FITS == 1 )) && echo "regular episodes fit" || echo "regular episode above the ceiling")" \
+                "$( if series_crf_shared; then (( SB_FITS == 1 )) && echo "every episode fits" || echo "an episode is above the ceiling"
+                    else (( SB_FITS == 1 )) && echo "regular episodes fit" || echo "regular episode above the ceiling"; fi)" \
                 "${#SB_ABOVE[@]}" "${#eb[@]}"
         fi
     done
