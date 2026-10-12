@@ -2150,12 +2150,47 @@ for s in c7 c8; do
         "$s" "$s" "$s" "$s" "$tier" "$p" "$m" "$c" "$now" "$now" "$PH/compress/work/$s.progress" > "$PH/compress/work/$s.state"
     printf 'out_time_us=1800000000\nspeed=2.0x\nprogress=continue\n' > "$PH/compress/work/$s.progress"
 done
+# series9: episode 3/4 encoding; episodes 1-2 completed per their item logs
+# (60 s of source each, 600 s wall each: 0.1x overall incl. overhead)
+SL="$PH/compress/work/logs/series9-x"
+mkdir -p "$SL"
+for i in 1 2 3 4; do
+    ffmpeg -v error -f lavfi -i "color=c=black:s=64x64:d=60" -c:v libx264 -t 60 "$PH/E0$i.mkv" 2>/dev/null
+done
+sstart=$((now - 1500))
+for i in 1 2 3; do
+    {
+        echo "input:  $PH/E0$i.mkv"
+        echo
+        echo "===== $(date -d "@$((sstart + (i - 1) * 600))" '+%F %T')  pass encode"
+        echo "ffmpeg -y -i $PH/E0$i.mkv -crf:v:0 $((i == 3 ? 19 : 18)) out.mkv"
+        (( i < 3 )) && echo "[out#0/matroska @ 0x1] video:1KiB audio:0KiB muxing overhead: 1.0%"
+    } > "$SL/item-$i.log"
+done
+for i in 1 2 3 4; do
+    printf 'item_ctx_%s() {\n   item_begin %s %q %q High 0 "" &&\n}\n' "$i" "$i" "$PH/E0$i.mkv" "/out/E0$i.mkv"
+done > "$PH/compress/work/series9.sh"
+touch -d '@1' "$PH/compress/work/series9.sh"
+printf 'version=1\nsession=series9\ntype=series\nstatus=running\nitem=3\nitems=4\nok=0\nfailed=0\nname=E03.mkv\ninput=%s\noutput=/out/E03.mkv\ntier=High\npass=encode\nmode=crf\ncrf=18\nduration=60\nstarted=%s\nupdated=%s\nprogress=%s\nlog_dir=%s\n' \
+    "$PH/E03.mkv" "$sstart" "$now" "$PH/compress/work/series9.progress" "$SL" > "$PH/compress/work/series9.state"
+printf 'out_time_us=30000000\nspeed=0.1x\nprogress=continue\n' > "$PH/compress/work/series9.progress"
+sed -i "s/echo \"c8 $now\"; }/echo \"c8 $now\"; echo \"series9 $sstart\"; }/" "$PH/stub/tmux"
+
 HOME="$PH" PATH="$PH/stub:$PATH" bash "$PH/compress/progress-check.sh" > "$T/progress.out" 2>&1
-c7=$(sed -n '/^c7 /,/^$/p' "$T/progress.out"); c8=$(sed -n '/^c8 /,/^$/p' "$T/progress.out")
-check "21 CRF job: one encode step with its CRF" "grep -q 'Tier: High .*Encoding, CRF: 21' <<< \"\$c7\""
+c7=$(sed -n '/^c7 /,/^Total elapsed:/p' "$T/progress.out"); c8=$(sed -n '/^c8 /,/^Total elapsed:/p' "$T/progress.out")
+s9=$(sed -n '/^series9 /,/^Total elapsed:/p' "$T/progress.out")
+check "21 CRF job: header, tier, CRF, status"    "grep -q '^c7 — Movie — Movie 1/1\$' <<< \"\$c7\" && grep -q '^Tier: *High\$' <<< \"\$c7\" && grep -q '^CRF: *21\$' <<< \"\$c7\" && grep -q '^Status: *Encoding\$' <<< \"\$c7\""
 check "21 CRF job: no pass 1/2 or 2/2"           "! grep -q 'Pass' <<< \"\$c7\""
-check "21 CRF job: progress and ETA"             "grep -q '50.0%.*ETA 00:15:00' <<< \"\$c7\""
-check "20 two-pass job: still Pass 1/2"          "grep -q 'Tier: Test .*Pass: 1/2' <<< \"\$c8\""
+check "21 CRF job: progress and item ETA"        "grep -q '^Progress: *50.0%\$' <<< \"\$c7\" && grep -q '^Encoded: *00:30:00 / 01:00:00\$' <<< \"\$c7\" && grep -q '^Item ETA: *00:15:00\$' <<< \"\$c7\""
+check "21 CRF job: last item, total ETA = item ETA" "grep -q '^Total ETA: *00:15:00\$' <<< \"\$c7\""
+check "20 two-pass job: still Pass 1/2, no CRF"  "grep -q '^Tier: *Test\$' <<< \"\$c8\" && grep -q '^Status: *Pass 1/2\$' <<< \"\$c8\" && ! grep -q '^CRF:' <<< \"\$c8\""
+check "series: header Episode 3/4"               "grep -q '^series9 — Series — Episode 3/4\$' <<< \"\$s9\""
+check "series: CRF of the running encode (log)"  "grep -q '^CRF: *19\$' <<< \"\$s9\""
+check "series: item elapsed from its log"        "grep -qE '^Item elapsed: +00:05:0[0-9]\$' <<< \"\$s9\""
+check "series: total elapsed from job start"     "grep -qE '^Total elapsed: +00:25:0[0-9]\$' <<< \"\$s9\""
+# item: 30 s left at 0.1x = 300 s; episode 4: 60 s at 0.1x = 600 s
+check "series: total ETA from completed episodes" "grep -q '^Total ETA: *00:15:00\$' <<< \"\$s9\" && grep -q 'based on 2 completed episodes at 0.100x overall' <<< \"\$s9\""
+check "progress-check is read-only"              "[[ \$(cat '$PH/compress/work/series9.progress') == *'progress=continue'* ]] && [[ ! -e '$PH/compress/work/series9.state.tmp' ]]"
 check "21 sdrcrf job: own .sh / .state removed after success" "[[ ! -e '$WORK_DIR/sdrcrf.sh' && ! -e '$WORK_DIR/sdrcrf.state' ]]"
 
 echo

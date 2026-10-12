@@ -429,6 +429,7 @@ while true; do
             printf '%-16s%s\n' "Runtime:" "$(format_hms "$DURATION")"
             printf '%-16s%s GiB/hour\n' "Size rate:" "$CRF_GIB_PER_HOUR"
             printf '%-16s%s GiB\n' "Video ceiling:" "$CRF_CEILING_GIB"
+            printf '%-16s<= %s Mb/s average\n' "Video bitrate:" "$(bytes_to_mbps "$CRF_CEILING_BYTES" "$DURATION")"
         fi
 
         if [[ "$TIER" == "Custom" ]]; then
@@ -696,8 +697,9 @@ while true; do
                     printf "                     (Quality: CRF %s-%s, source-limited: below the %s GiB source video)\n" \
                         "$CRF_MIN" "$CRF_MAX" "$SOURCE_VIDEO_GIB"
                 else
-                    printf "                     (%s: CRF %s-%s, %s GiB video ceiling = %s GiB/hour x %s%s)\n" \
+                    printf "                     (%s: CRF %s-%s, %s GiB video ceiling = %s GiB/hour x %s, <= %s Mb/s average%s)\n" \
                         "$TIER" "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_GIB" "$CRF_GIB_PER_HOUR" "$(format_hms "$DURATION")" \
+                        "$(bytes_to_mbps "$CRF_CEILING_BYTES" "$DURATION")" \
                         "$( (( CRF_OVER_CEILING == 1 )) && echo "; ceiling NOT met" )"
                 fi
                 printf "  Video size:        ~%s -> ~%s GiB (estimated from %s sampled CRF%s)\n" \
@@ -773,9 +775,12 @@ while true; do
             "$( [[ "$VIDEO_SPEC" == crf:* ]] && (( ${CRF_OVER_CEILING:-0} == 1 )) && echo " | $(ui_warn "ceiling not met")")"
         printf '  %-8s%s -> ~%s GiB  (video ~%s, audio %s)\n' "Size:" "$SOURCE_TOTAL_GIB" \
             "$(awk -v t="$EXPECTED_TOTAL_GIB" 'BEGIN { printf "%.2f", t }')" "$EXPECTED_VIDEO_GIB" "$SOURCE_AUDIO_GIB"
-        [[ "$VIDEO_SPEC" == crf:* && ( "$TIER" == High || "$TIER" == Base ) ]] &&
+        if [[ "$VIDEO_SPEC" == crf:* && ( "$TIER" == High || "$TIER" == Base ) ]]; then
             printf '  %-8s%s GiB video  (%s GiB/h x %s)\n' "Ceiling:" "$CRF_CEILING_GIB" \
                 "$CRF_GIB_PER_HOUR" "$(format_hms "$DURATION")"
+            printf '  %-8sCRF %s-%s, video <= %s Mb/s average\n' "Limits:" "$CRF_MIN" "$CRF_MAX" \
+                "$(bytes_to_mbps "$CRF_CEILING_BYTES" "$DURATION")"
+        fi
 
         # only what is lost or dropped (COMPRESS_VERBOSE=1 lists every note)
         while IFS= read -r note; do
