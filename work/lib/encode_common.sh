@@ -77,6 +77,178 @@ refresh_mkv_stats() {
         --add-track-statistics-tags
 }
 
+# _compression_tags_strip  (filter)  ->  mkvextract tags XML without the
+# COMPRESSION_CRF / COMPRESSION_TIER simple tags of global tags (Targets
+# without a track / edition / chapter / attachment UID); a global Tag
+# left without any simple tag is dropped. Everything else is printed
+# unchanged. Expects mkvextract's layout (one element per line).
+_compression_tags_strip() {
+    awk '
+        function flush_simple() {
+            if (sbuf != "" && !(global && sname ~ /^COMPRESSION_(CRF|TIER)$/)) { tbuf = tbuf sbuf; kept++ }
+            sbuf = ""; sname = ""
+        }
+        /<Tag>/ && !intag { intag = 1; tbuf = $0 "\n"; global = 1; kept = 0; sdepth = 0; next }
+        intag && sdepth == 0 && /<(TrackUID|EditionUID|ChapterUID|AttachmentUID)>/ { global = 0 }
+        intag && /<Simple>/ {
+            if (sdepth == 0) { sbuf = ""; sname = "" }
+            sdepth++
+        }
+        intag && sdepth > 0 {
+            sbuf = sbuf $0 "\n"
+            if (sdepth == 1 && sname == "" && match($0, /<Name>[^<]*<\/Name>/))
+                sname = substr($0, RSTART + 6, RLENGTH - 13)
+            if (/<\/Simple>/ && --sdepth == 0) flush_simple()
+            next
+        }
+        intag && /<\/Tag>/ {
+            intag = 0
+            if (kept > 0 || !global) printf "%s%s\n", tbuf, $0
+            next
+        }
+        intag { tbuf = tbuf $0 "\n"; next }
+        { print }'
+}
+
+# _compression_tags_canon  (filter)  ->  the content of a tags XML for
+# comparison: Tag / Simple nesting, targets, names and values, without
+# the compression tags (_compression_tags_strip), the XML header /
+# indentation and the attributes mkvpropedit normalises on writing
+# (TagLanguage / TagLanguageIETF / TagDefault, TargetTypeValue 50)
+_compression_tags_canon() {
+    _compression_tags_strip | awk '
+        { sub(/\r$/, ""); gsub(/^[ \t]+|[ \t]+$/, "") }
+        /^<(TagLanguage|TagLanguageIETF|TagDefault)>/ || /^<TargetTypeValue>50<\/TargetTypeValue>$/ { next }
+        /^<\/?(Tag|Simple)>$/ || /^<[A-Za-z]+>.*<\/[A-Za-z]+>$/ { print }'
+}
+
+# mkv_set_compression_tags FILE CRF TIER WORKDIR
+#
+# Writes the global Matroska tags COMPRESSION_CRF=CRF and (when TIER is
+# not empty) COMPRESSION_TIER=TIER into FILE with mkvpropedit. Every
+# existing tag (global, track, edition, chapter, attachment) is kept:
+# the file's tags are extracted, earlier COMPRESSION_* global values are
+# replaced, the new tag is appended and the whole set is written back
+# (--tags all:). Afterwards the tags are read back; when anything other
+# than the compression tags differs, the original tag set is restored.
+# Only tags change (no remux). Returns non-zero when the tags were not
+# written (FILE unchanged); WORKDIR keeps the XML and tool logs.
+mkv_set_compression_tags() {
+    local file="$1" crf="$2" tier="$3" dir="$4"
+    local orig="$dir/tags_source.xml" new="$dir/tags_compression.xml"
+    local back="$dir/tags_written.xml" log="$dir/mkvpropedit_tags.log"
+    local rc restore
+
+    [[ "$crf" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 2
+    command -v mkvextract >/dev/null 2>&1 && command -v mkvpropedit >/dev/null 2>&1 || return 3
+    mkdir -p "$dir" || return 4
+
+    rm -f -- "$orig" "$new" "$back"
+    mkvextract "$file" tags "$orig" > "$log" 2>&1 || return 5
+    # no tags at all: mkvextract writes no (or an empty) file
+    if grep -q '<Tags>' "$orig" 2>/dev/null; then
+        restore="all:$orig"
+    else
+        printf '<?xml version="1.0"?>\n<Tags>\n</Tags>\n' > "$orig"
+        restore="all:"
+    fi
+
+    {
+        _compression_tags_strip < "$orig" | sed '/<\/Tags>/,$d'
+        echo '  <Tag>'
+        echo '    <Targets>'
+        echo '      <TargetTypeValue>50</TargetTypeValue>'
+        echo '    </Targets>'
+        printf '    <Simple>\n      <Name>COMPRESSION_CRF</Name>\n      <String>%s</String>\n    </Simple>\n' "$crf"
+        [[ -n "$tier" ]] &&
+            printf '    <Simple>\n      <Name>COMPRESSION_TIER</Name>\n      <String>%s</String>\n    </Simple>\n' "$tier"
+        echo '  </Tag>'
+        echo '</Tags>'
+    } > "$new"
+
+    mkvpropedit "$file" --tags "all:$new" >> "$log" 2>&1
+    rc=$?
+    (( rc <= 1 )) || return 6
+
+    # read back: the other tags must be exactly the ones extracted before
+    if mkvextract "$file" tags "$back" >> "$log" 2>&1 &&
+       grep -q '<Name>COMPRESSION_CRF</Name>' "$back" &&
+       [[ "$(_compression_tags_canon < "$back")" == "$(_compression_tags_canon < "$orig")" ]]; then
+        return 0
+    fi
+
+    echo "tags read back differ from the source tags: original tags restored" >> "$log"
+    mkvpropedit "$file" --tags "$restore" >> "$log" 2>&1
+    return 7
+}
+
+# compression_tier_name TIER  ->  TIER when it is a menu CRF tier
+# (Quality / High / Base / Custom), else nothing
+compression_tier_name() {
+    case "$1" in
+        Quality|High|Base|Custom) printf '%s' "$1" ;;
+    esac
+}
+
+# work/logs/compression_tags.tsv: one row per finished CRF encode, written
+# by the job when the output got its final name (job_runtime.sh
+# item_succeeded). The authoritative record for Validate + update.
+COMPRESSION_LEDGER_HEADER=$'date\toutput\tcrf\ttier\tvideo_bytes\tsession\tinput'
+
+# compression_ledger_add LOG_DIR OUTPUT CRF TIER VIDEO_BYTES SESSION INPUT
+# A failure to write is ignored.
+compression_ledger_add() {
+    local f="$1/compression_tags.tsv"
+
+    [[ -s "$f" ]] || printf '%s\n' "$COMPRESSION_LEDGER_HEADER" >> "$f" 2>/dev/null
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$2" "$3" "${4:--}" "${5:--}" "$6" "$7" \
+        >> "$f" 2>/dev/null || true
+}
+
+# compression_record_lookup LOG_DIR OUTPUT VIDEO_BYTES
+#   ->  "CRF<TAB>TIER<TAB>RECORD" (TIER "-" when the record has none)
+#
+# The CRF / tier of the encode that produced OUTPUT, from the job records
+# in LOG_DIR only (nothing is derived from bitrate, size, name or encoder
+# settings). VIDEO_BYTES (exact main video packet bytes of OUTPUT, packet
+# scan) identifies the encode: a record counts only when its measured
+# video bytes are exactly these.
+#   1. compression_tags.tsv: same output file name
+#   2. crf_estimates.tsv (encodes of earlier versions): an attempt that
+#      was kept (not REJECTED / FAILED / a replaced candidate) whose
+#      input file name is the source of OUTPUT's name
+# Returns 1 when no record matches, 2 when matching records disagree.
+compression_record_lookup() {
+    local logs="$1" out="$2" vb="$3" name stem hits n
+
+    [[ "$vb" =~ ^[1-9][0-9]*$ ]] || return 1
+    name="${out##*/}"
+    stem=$(output_source_stem "$name" 2>/dev/null)
+    stem="${stem,,}"
+
+    hits=$(
+        [[ -s "$logs/compression_tags.tsv" ]] &&
+            awk -F'\t' -v n="$name" -v vb="$vb" '
+                NR > 1 && $5 == vb && $3 ~ /^[0-9]+([.][0-9]+)?$/ {
+                    o = $2; sub(/.*\//, "", o)
+                    if (o == n) printf "%s\t%s\tcompression_tags.tsv\n", $3, ($4 == "" ? "-" : $4)
+                }' "$logs/compression_tags.tsv"
+        [[ -s "$logs/crf_estimates.tsv" && -n "$stem" ]] &&
+            awk -F'\t' -v s="$stem" -v vb="$vb" '
+                NR > 1 && $7 == vb && $3 ~ /^[0-9]+([.][0-9]+)?$/ && $12 !~ /^(REJECTED|FAILED|ACCEPTED-CANDIDATE)$/ {
+                    i = $10; sub(/.*\//, "", i); sub(/\.[^.]*$/, "", i)
+                    if (tolower(i) == s) printf "%s\t%s\tcrf_estimates.tsv\n", $3, $2
+                }' "$logs/crf_estimates.tsv"
+    )
+    [[ -n "$hits" ]] || return 1
+
+    # tiers that are not menu CRF tiers are not recorded
+    hits=$(awk -F'\t' -v OFS='\t' '$2 !~ /^(Quality|High|Base|Custom)$/ { $2 = "-" } { print }' <<< "$hits")
+    n=$(cut -f1,2 <<< "$hits" | sort -u | wc -l)
+    (( n == 1 )) || return 2
+    head -n 1 <<< "$hits"
+}
+
 actual_file_gib() {
     stat -L -c %s -- "$1" |
         awk '{printf "%.2f",$1/1073741824}'

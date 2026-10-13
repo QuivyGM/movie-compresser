@@ -40,6 +40,11 @@
 # attempt is only deleted once a later one has completed, and is kept
 # (not deleted) when the job is interrupted. Custom CRF never retries.
 #
+# A CRF encode records its final CRF and tier in the output as the
+# global MKV tags COMPRESSION_CRF / COMPRESSION_TIER (item_tag_compression,
+# just before the verification; stream copies and two-pass encodes get
+# none).
+#
 # Outputs are written to "<output>.part" and only renamed to the final
 # name after ffmpeg succeeded and the result passed a duration check, so
 # an interrupted or failed encode is never left under the final name.
@@ -526,6 +531,39 @@ item_restore_mkv_chapters() {
     echo restored > "$ITEM_TMP/chapters_state"
 }
 
+# item_tag_compression
+#
+# Records the CRF of the accepted encode in "$ITEM_PART" as the global
+# MKV tags COMPRESSION_CRF / COMPRESSION_TIER (mkv_set_compression_tags;
+# all other tags kept). Only for CRF encodes (ITEM_EXP[mode]=crf):
+# stream copies and two-pass encodes get no CRF. Called by
+# item_succeeded once ITEM_EXP[crf] is final (after every CRF retry /
+# season decision) and after the last remux / restore step (covers,
+# chapters); what follows (verification, rename, statistics refresh)
+# leaves global tags alone. A failure is a warning only: the encode is
+# unchanged.
+item_tag_compression() {
+    local crf="${ITEM_EXP[crf]:-}" tier rc
+
+    [[ "${ITEM_EXP[mode]:-}" == crf ]] || return 0
+    [[ "${ITEM_OUTPUT,,}" == *.mkv ]] || return 0
+
+    tier=$(compression_tier_name "$ITEM_TIER")
+
+    echo "Recording compression tags: COMPRESSION_CRF=$crf${tier:+ COMPRESSION_TIER=$tier}"
+    mkv_set_compression_tags "$ITEM_PART" "$crf" "$tier" "$ITEM_TMP" >> "$ITEM_LOG" 2>&1
+    rc=$?
+    if (( rc != 0 )); then
+        cat -- "$ITEM_TMP/mkvpropedit_tags.log" >> "$ITEM_LOG" 2>/dev/null
+        if (( rc == 3 )); then
+            echo "WARNING: compression tags not written (mkvtoolnix missing)."
+        else
+            echo "WARNING: compression tags not written (exit $rc, see $ITEM_LOG)."
+        fi
+    fi
+    return 0
+}
+
 # item_part_complete  ->  0 when "$ITEM_PART" was written and covers the
 # whole source (ffmpeg exits 0 when stopped with 'q'); otherwise 1 with
 # ITEM_FAIL_REASON set
@@ -559,6 +597,10 @@ item_succeeded() {
         item_failed
         return 1
     fi
+
+    # the final CRF (CRF encodes only), after the last restore step and
+    # before the verification reports it
+    item_tag_compression
 
     # Metadata verification before the output gets its final name: a
     # Dolby Vision / HDR10+ preservation that did not survive, or lost
@@ -610,7 +652,14 @@ item_succeeded() {
         echo "WARNING: MKV statistics update failed (is mkvtoolnix installed?)."
     fi
 
+    ITEM_FINAL_VBYTES=""
     report_output_stats "$final"
+
+    # retained record of the final CRF (Validate + update backfill)
+    if [[ "${ITEM_EXP[mode]:-}" == crf ]]; then
+        compression_ledger_add "$JOB_WORK/logs" "$final" "${ITEM_EXP[crf]:-}" \
+            "$(compression_tier_name "$ITEM_TIER")" "$ITEM_FINAL_VBYTES" "$JOB_SESSION" "$ITEM_INPUT"
+    fi
 
     if [[ -s "$ITEM_TMP/report.txt" ]]; then
         echo
@@ -739,6 +788,7 @@ report_output_stats() {
     bytes=$(file_bytes "$out")
     totals=$(media_stream_totals "$out")
     read -r vbytes abytes <<< "$totals"
+    [[ "$vbytes" =~ ^[0-9]+$ ]] && ITEM_FINAL_VBYTES="$vbytes"
     est="${ITEM_EXP[est_vbytes]:-}"
 
     echo

@@ -10,7 +10,13 @@
 #                      statistics with mkvpropedit, checks the stored
 #                      NUMBER_OF_BYTES tags against the scan and that a
 #                      normal metadata-first read now returns the same
-#                      values without scanning.
+#                      values without scanning. Outputs (OUT) also get
+#                      COMPRESSION_CRF / COMPRESSION_TIER written or
+#                      corrected from the job records in work/logs
+#                      (never guessed; see backfill_compression_tags).
+#
+# Both modes report the COMPRESSION_CRF / COMPRESSION_TIER tags ("not
+# recorded" when absent, never a failure); Verify never writes them.
 #
 # Recursive, so series folders are included. Non-MKV files are only
 # inspected; mkvpropedit is never run on them.
@@ -78,6 +84,9 @@ UPDATED=0
 VERIFIED=0
 CHECK_REQUIRED=0
 NO_SOURCE=0
+TAGS_WRITTEN=0
+TAGS_CURRENT=0
+TAGS_UNRECOVERED=0
 
 inspect_file() {
     local file="$1"
@@ -169,6 +178,12 @@ inspect_file() {
             *)         row "Video encode" "x265 ${rc}" ;;
         esac
     fi
+    # COMPRESSION_CRF / COMPRESSION_TIER tags (report only; outputs of
+    # earlier versions have none and still verify normally)
+    local cname cval
+    while IFS=$'\t' read -r cname cval; do
+        row "$cname" "$cval"
+    done < <(compression_tag_lines "$file")
     probe_hdr "$file" "$vidx"
     row "Dynamic range" "$(hdr_description)"
     row "Video" "$(rate_size "$vbytes" "$dur" "$approx")"
@@ -185,6 +200,9 @@ inspect_file() {
 
     if (( update == 1 )); then
         update_and_check "$file" "$vidx" "$vbytes" "$abytes"
+        # Validate + update only: Verify never writes compression tags
+        (( validate == 1 )) && [[ "$root" == "$OUT" ]] &&
+            backfill_compression_tags "$file" "$vbytes"
     elif (( scan == 1 )) && ! is_mkv "$file"; then
         echo "  Not MKV: statistics tags not updated."
     elif (( scan == 1 )) && [[ -L "$file" ]]; then
@@ -283,6 +301,61 @@ update_and_check() {
     fi
 }
 
+# backfill_compression_tags FILE VIDEO_BYTES
+#
+# Validate + update: writes / corrects COMPRESSION_CRF / COMPRESSION_TIER
+# from the job records in work/logs (compression_record_lookup; the
+# packet-scanned VIDEO_BYTES identify the encode). Without a matching
+# record nothing is written (no value is guessed). Tags that already
+# hold the recorded values are not rewritten.
+backfill_compression_tags() {
+    local file="$1" vbytes="$2" rec rc crf tier from ccrf ctier what
+
+    rec=$(compression_record_lookup "$BASE/work/logs" "$file" "$vbytes")
+    rc=$?
+    IFS=$'\t' read -r ccrf ctier <<< "$(compression_tags "$file")"
+
+    if (( rc != 0 )); then
+        if (( rc == 2 )); then
+            what="not recovered (job records disagree)"
+        else
+            what="not recovered (no job record of this encode)"
+        fi
+        [[ "$ccrf" != "-" ]] && what+="; existing tags left unchanged" || what+="; left missing"
+        row "Compression tags" "$what"
+        ((TAGS_UNRECOVERED++))
+        return
+    fi
+
+    IFS=$'\t' read -r crf tier from <<< "$rec"
+    # a record without a menu tier leaves an existing tier tag as it is
+    [[ "$tier" == "-" ]] && tier=""
+    [[ -z "$tier" && "$ctier" != "-" ]] && tier="$ctier"
+
+    if [[ "$ccrf" == "$crf" && "$ctier" == "${tier:--}" ]]; then
+        row "Compression tags" "UNCHANGED (CRF $crf${tier:+, $tier}; matches $from)"
+        ((TAGS_CURRENT++))
+        return
+    fi
+
+    local tmp ok=1
+    tmp=$(mktemp -d)
+    mkv_set_compression_tags "$file" "$crf" "$tier" "$tmp" || ok=0
+    rm -rf -- "$tmp"
+    if (( ok == 0 )); then
+        row "Compression tags" "write FAILED (mkvtoolnix); left unchanged"
+        ((CHECK_REQUIRED++))
+        return
+    fi
+
+    if [[ "$ccrf" == "-" ]]; then
+        row "Compression tags" "WRITTEN (CRF $crf${tier:+, $tier}; from $from)"
+    else
+        row "Compression tags" "CORRECTED (CRF $ccrf$([[ "$ctier" != "-" ]] && echo ", $ctier") -> CRF $crf${tier:+, $tier}; from $from)"
+    fi
+    ((TAGS_WRITTEN++))
+}
+
 # ------------------------------------------------------------
 # Menu
 # ------------------------------------------------------------
@@ -347,6 +420,12 @@ fi
 
 if [[ "$ROOT" == "$OUT" ]]; then
     echo "Unpaired outputs:  $NO_SOURCE"
+fi
+
+if (( TAGS_WRITTEN + TAGS_CURRENT + TAGS_UNRECOVERED > 0 )); then
+    echo "CRF tags written:  $TAGS_WRITTEN"
+    echo "CRF tags current:  $TAGS_CURRENT"
+    echo "CRF not recovered: $TAGS_UNRECOVERED"
 fi
 
 echo "============================================================"

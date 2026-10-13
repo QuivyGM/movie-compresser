@@ -1298,6 +1298,11 @@ item_verify_output() {
         warns+=("stream order changed")
     fi
 
+    # ---- compression tags (report only; never a warning or failure)
+    while IFS=$'\t' read -r s o; do
+        _rep "$s" "$o" >&3
+    done < <(compression_tag_lines "$out")
+
     if (( ${#fails[@]} )); then
         echo "  RESULT: FAILED - ${fails[0]}" >&3
         printf '%s\n' "${fails[0]}" > "$ITEM_TMP/reason"

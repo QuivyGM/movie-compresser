@@ -699,6 +699,31 @@ format_title() {
         -of default=nw=1:nk=1 "$1" 2>/dev/null | head -n 1 || true
 }
 
+# compression_tags FILE  ->  "CRF<TAB>TIER" from the global
+# COMPRESSION_CRF / COMPRESSION_TIER tags of a CRF encode
+# (encode_common.sh mkv_set_compression_tags); "-" for a tag that is
+# not there (outputs of earlier versions, stream copies, two-pass).
+compression_tags() {
+    ffprobe -v error -show_entries format_tags -of default=nw=1 "$1" 2>/dev/null |
+        awk '
+            { sub(/\r$/, ""); k = toupper($0); v = substr($0, index($0, "=") + 1) }
+            k ~ /^TAG:([^=]*\/)?COMPRESSION_CRF=/  && crf == ""  { crf = v }
+            k ~ /^TAG:([^=]*\/)?COMPRESSION_TIER=/ && tier == "" { tier = v }
+            END { printf "%s\t%s\n", (crf != "" ? crf : "-"), (tier != "" ? tier : "-") }'
+}
+
+# compression_tag_lines FILE  ->  "Compression CRF<TAB>VALUE" and
+# "Compression tier<TAB>VALUE" ("not recorded" when absent). Report
+# only: a missing tag is never an error.
+compression_tag_lines() {
+    local crf tier
+
+    IFS=$'\t' read -r crf tier <<< "$(compression_tags "$1")"
+    [[ -n "$crf" && "$crf" != "-" ]] || crf="not recorded"
+    [[ -n "$tier" && "$tier" != "-" ]] || tier="not recorded"
+    printf 'Compression CRF\t%s\nCompression tier\t%s\n' "$crf" "$tier"
+}
+
 # stream_tag FILE STREAM_INDEX TAG  ->  tag value (empty if missing)
 stream_tag() {
     ffprobe -v error \
