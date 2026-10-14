@@ -1419,7 +1419,7 @@ if [[ -s "$MH/compress/in/Multi.mkv" ]]; then
     for t in Quality High Base Custom; do
         ((n += 1))
         rm -rf "$MH/compress/work"/c[0-9]*.sh "$MH/compress/work"/c[0-9]*_passes
-        in="1\n$n\nn\n"; [[ $t == Custom ]] && in="1\n4\n24\nn\n"
+        in="1\n$n\nn\n"; [[ $t == Custom ]] && in="1\n5\n24\nn\n"
         # Quality: the small source is below the 20 GiB target -> source
         # guard first; 2 = encode below the source size
         [[ $t == Quality ]] && in="1\n1\n2\nn\n"
@@ -1446,7 +1446,7 @@ if [[ -s "$MH/compress/in/Multi.mkv" ]]; then
     check "movie High: policy + analysis shown"      "grep -q 'CRF range: 19-23' '$AC/movie_High.log' && grep -q '^  CRF 19 -> estimated ' '$AC/movie_High.log' && grep -A1 '^Selected:' '$AC/movie_High.log' | grep -q 'CRF 19'"
     check "7 movie Base: CRF 25 fits, no 26+ samples" "grep -q 'sampling CRF 25 ' '$AC/movie_Base.log' && ! grep -qE 'sampling CRF (2[6-9]) ' '$AC/movie_Base.log'"
     check "18 movie Custom: exactly CRF 24"          "grep -q 'sampling CRF 24 ' '$AC/movie_Custom.log' && [[ \$(grep -c 'sampling CRF' '$AC/movie_Custom.log') == 1 ]]"
-    check "18 movie Custom: menu entry"              "grep -q '4) Custom CRF  exactly the CRF you enter' '$AC/movie_Custom.log' && grep -q 'CRF: 24 (used exactly; no size ceiling)' '$AC/movie_Custom.log'"
+    check "18 movie Custom: menu entry"              "grep -q '5) Custom CRF  exactly the CRF you enter' '$AC/movie_Custom.log' && grep -q 'CRF: 24 (used exactly; no size ceiling)' '$AC/movie_Custom.log'"
     # 14 total preview = estimated video + copied audio + other streams
     hest=$(grep -o 'est_vbytes=[0-9]*' "$AC/movie_High_job.sh" | cut -d= -f2)
     stats_load "$MH/compress/in/Multi.mkv" "" exact

@@ -183,10 +183,10 @@ mkv_set_compression_tags() {
 }
 
 # compression_tier_name TIER  ->  TIER when it is a menu CRF tier
-# (Quality / High / Base / Custom), else nothing
+# (Quality / High / Base / Compact / Custom), else nothing
 compression_tier_name() {
     case "$1" in
-        Quality|High|Base|Custom) printf '%s' "$1" ;;
+        Quality|High|Base|Compact|Custom) printf '%s' "$1" ;;
     esac
 }
 
@@ -243,7 +243,7 @@ compression_record_lookup() {
     [[ -n "$hits" ]] || return 1
 
     # tiers that are not menu CRF tiers are not recorded
-    hits=$(awk -F'\t' -v OFS='\t' '$2 !~ /^(Quality|High|Base|Custom)$/ { $2 = "-" } { print }' <<< "$hits")
+    hits=$(awk -F'\t' -v OFS='\t' '$2 !~ /^(Quality|High|Base|Compact|Custom)$/ { $2 = "-" } { print }' <<< "$hits")
     n=$(cut -f1,2 <<< "$hits" | sort -u | wc -l)
     (( n == 1 )) || return 2
     head -n 1 <<< "$hits"

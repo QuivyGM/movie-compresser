@@ -222,7 +222,7 @@ if (( HAVE_DV == 1 && HAVE_H10P == 1 )); then
     check "source is DV 8.1 + HDR10 + HDR10+"    "[[ \"\$probe_out\" == 'HDR10 1 1 8.1' ]]"
 
     L="$T/movie_dv.log"
-    menu "$H/compress/work/movie_compress.sh" "1\n4\n24\nn\n" "$L"
+    menu "$H/compress/work/movie_compress.sh" "1\n5\n24\nn\n" "$L"
     sed -n '/^Dynamic range/,/^Compression tier/p' "$L" | sed 's/^/  | /'
     check "movie: no unbound variable"           "! grep -q 'unbound variable' '$L' && grep -q '^exit=0\$' '$L'"
     check "movie: header DV 8.1 + HDR10 + HDR10+" "grep -qE '^Dynamic range: +Dolby Vision 8.1 \\+ HDR10 \\+ HDR10\\+\$' '$L'"

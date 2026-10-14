@@ -6,10 +6,10 @@
 #   series:  "<series>/<episode>[ 1080p] HEVC <Tier>.mkv"  (folder = source
 #            folder name; older runs: "<series>[ 1080p] HEVC <Tier>/...")
 #   audio:   "<any of the above> AudioCompressed[ N].mkv"
-# Tier: Quality | High | Base | Normal | Custom | CRF<nn>
+# Tier: Quality | High | Base | Compact | Normal | Custom | CRF<nn>
 
 NAMING_SUFFIX_RE=' AudioCompressed( [0-9]+)?$'
-NAMING_TIER_RE='( 1080p)? HEVC (Quality|High|Base|Normal|Custom|CRF[0-9]+)( EAC3)?( \([0-9]+\))?$'
+NAMING_TIER_RE='( 1080p)? HEVC (Quality|High|Base|Compact|Normal|Custom|CRF[0-9]+)( EAC3)?( \([0-9]+\))?$'
 
 # series_output_dir OUT_ROOT SERIES_DIR  ->  OUT_ROOT/<SERIES_DIR basename>
 # The source folder name exactly (spaces, hyphens, punctuation, case);
@@ -68,7 +68,7 @@ output_tier() {
         return
     fi
 
-    tier=$(grep -oE 'HEVC (Quality|High|Base|Normal|Custom|CRF[0-9]+)( EAC3)?' <<< "$n" |
+    tier=$(grep -oE 'HEVC (Quality|High|Base|Compact|Normal|Custom|CRF[0-9]+)( EAC3)?' <<< "$n" |
         tail -n 1 | sed -E 's/^HEVC //; s/ EAC3$/ + EAC3/')
 
     [[ "$n" =~ \ 1080p\ HEVC\  ]] && tier="$tier (1080p)"
