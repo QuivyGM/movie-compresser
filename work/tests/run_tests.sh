@@ -163,13 +163,16 @@ conf_set() {
 # CRF tiers pinned to the values this suite's expectations are written
 # for (movie High 19-23 / 3.5 GiB per hour of runtime, Base 25-29 / 1.0
 # GiB per hour: 7 / 2 GiB for a 2 h movie; series High 18-21 / 5 GiB,
-# Base 24-27 / 1.5 GiB per episode), so editing the production numbers
+# Base 24-27 / 1.5 GiB per episode; no movie Base video floor: 1.0 GiB
+# per hour is below the production 2.5 Mb/s floor; the floor is covered
+# by movie_ceiling_tests.sh / movie_crf_refine_tests.sh), so editing the production numbers
 # does not change what the suite checks. Every other setting is the
 # project's. All test configs below (conf_with, menus) start from this copy.
 cp "$SRC_WORK/lib/compress.conf" "$T/compress.conf"
 conf_set "$T/compress.conf" \
     MOVIE_HIGH_CRF_SEARCH_MIN=19 MOVIE_HIGH_CRF_START=19 MOVIE_HIGH_CRF_MAX=23 MOVIE_HIGH_VIDEO_GIB_PER_HOUR=3.5 \
     MOVIE_BASE_CRF_SEARCH_MIN=25 MOVIE_BASE_CRF_START=25 MOVIE_BASE_CRF_MAX=29 MOVIE_BASE_VIDEO_GIB_PER_HOUR=1.0 \
+    MOVIE_BASE_VIDEO_FLOOR_MBPS=0 \
     SERIES_HIGH_CRF_SEARCH_MIN=18 SERIES_HIGH_CRF_START=18 SERIES_HIGH_CRF_MAX=21 SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=5 \
     SERIES_BASE_CRF_SEARCH_MIN=24 SERIES_BASE_CRF_START=24 SERIES_BASE_CRF_MAX=27 SERIES_BASE_VIDEO_SIZE_CEILING_GIB=1.5
 export COMPRESS_CONF="$T/compress.conf"
@@ -201,8 +204,8 @@ check "default compress.conf loads"           "load_policy 2>'$T/pol.err'"
         "! declare -F series_video_plan series_plan series_episode_video_kbps series_gib_per_hour >/dev/null"
     check "no movie/series AAC settings in the config" \
         "! grep -qE '^(MOVIE|SERIES)_[A-Z_]*(AAC|AUDIO)' '$SRC_WORK/lib/compress.conf'"
-    check "no series GiB/hour or High/Base two-pass bitrate settings in the config" \
-        "! grep -qE '^(SERIES_(HIGH|BASE)_VIDEO_GIB_PER_HOUR|(MOVIE|SERIES)_(HIGH|BASE)_VIDEO_(FLOOR_MBPS|MAX_MBPS))=' '$SRC_WORK/lib/compress.conf'"
+    check "no series GiB/hour or High/Base two-pass bitrate settings in the config (movie Base floor only)" \
+        "! grep -qE '^(SERIES_(HIGH|BASE)_VIDEO_GIB_PER_HOUR|(MOVIE_HIGH|SERIES_HIGH|SERIES_BASE)_VIDEO_(FLOOR_MBPS|MAX_MBPS)|MOVIE_BASE_VIDEO_MAX_MBPS)=' '$SRC_WORK/lib/compress.conf' && grep -qE '^MOVIE_BASE_VIDEO_FLOOR_MBPS=' '$SRC_WORK/lib/compress.conf'"
     check "movie High/Base: GiB/hour of runtime, no fixed ceiling in the config" \
         "grep -qE '^MOVIE_HIGH_VIDEO_GIB_PER_HOUR=' '$SRC_WORK/lib/compress.conf' && grep -qE '^MOVIE_BASE_VIDEO_GIB_PER_HOUR=' '$SRC_WORK/lib/compress.conf' && ! grep -qE '^MOVIE_(HIGH|BASE)_VIDEO_SIZE_CEILING_GIB=' '$SRC_WORK/lib/compress.conf'"
     check "audio menu settings still in the config" \

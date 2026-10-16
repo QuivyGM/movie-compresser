@@ -33,6 +33,7 @@ POLICY_KEYS_CRF=(
     MOVIE_BASE_CRF_SEARCH_MIN MOVIE_BASE_CRF_START MOVIE_BASE_CRF_MAX
     SERIES_HIGH_CRF_SEARCH_MIN SERIES_HIGH_CRF_START SERIES_HIGH_CRF_MAX
     SERIES_BASE_CRF_SEARCH_MIN SERIES_BASE_CRF_START SERIES_BASE_CRF_MAX
+    MOVIE_BASE_FLOOR_CRF_MIN
 )
 
 # High / Base tiers (*_CRF_START / *_CRF_SEARCH_MIN / *_CRF_MAX)
@@ -78,10 +79,14 @@ POLICY_KEYS_RETIRED_QUALITY=(
 # video policy, replaced by the CRF tiers; a config that still sets
 # them gets a note. (MOVIE_HIGH / MOVIE_BASE_VIDEO_GIB_PER_HOUR are not
 # among them: they are active again, as the rate of the movie High /
-# Base video ceiling, POLICY_KEYS_POSITIVE.)
+# Base video ceiling, POLICY_KEYS_POSITIVE. MOVIE_BASE_VIDEO_FLOOR_MBPS
+# is active again too, as the movie Base minimum video bitrate of the
+# CRF search; MOVIE_BASE_VIDEO_MAX_MBPS stays retired: the runtime-scaled
+# ceiling, ~2.98 Mb/s at 1.25 GiB/hour, is already below the former
+# 5 Mb/s maximum.)
 POLICY_KEYS_RETIRED_VIDEO=(
     MOVIE_HIGH_VIDEO_FLOOR_MBPS MOVIE_HIGH_VIDEO_MAX_MBPS
-    MOVIE_BASE_VIDEO_FLOOR_MBPS MOVIE_BASE_VIDEO_MAX_MBPS
+    MOVIE_BASE_VIDEO_MAX_MBPS
     SERIES_HIGH_VIDEO_GIB_PER_HOUR SERIES_HIGH_VIDEO_FLOOR_MBPS SERIES_HIGH_VIDEO_MAX_MBPS
     SERIES_BASE_VIDEO_GIB_PER_HOUR SERIES_BASE_VIDEO_FLOOR_MBPS SERIES_BASE_VIDEO_MAX_MBPS
 )
@@ -187,6 +192,23 @@ validate_policy() {
         errs+=("MOVIE_QUALITY_TARGET_VIDEO_GIB ($qt) is greater than MOVIE_QUALITY_ACCEPT_MAX_GIB ($qmax)")
     fi
 
+    # movie Base floor: 0 (off) or a number of Mb/s below the ceiling
+    # rate; the floor CRF limit at most CRF_SEARCH_MIN
+    local bf="${MOVIE_BASE_VIDEO_FLOOR_MBPS:-}" br="${MOVIE_BASE_VIDEO_GIB_PER_HOUR:-}"
+    if [[ -z "${MOVIE_BASE_VIDEO_FLOOR_MBPS+x}" ]]; then
+        errs+=("MOVIE_BASE_VIDEO_FLOOR_MBPS is not set")
+    elif [[ "$bf" == -* ]]; then
+        errs+=("MOVIE_BASE_VIDEO_FLOOR_MBPS=\"$bf\": must not be negative")
+    elif ! _policy_is_num "$bf"; then
+        errs+=("MOVIE_BASE_VIDEO_FLOOR_MBPS=\"$bf\": not a number (Mb/s, 0 = no floor)")
+    elif _policy_is_num "$br" && awk -v f="$bf" -v c="$(gib_per_hour_mbps "$br")" 'BEGIN { exit !(f > 0 && f >= c) }'; then
+        errs+=("MOVIE_BASE_VIDEO_FLOOR_MBPS ($bf) is not below the Base ceiling rate ($(gib_per_hour_mbps "$br") Mb/s = MOVIE_BASE_VIDEO_GIB_PER_HOUR $br)")
+    fi
+    local fm="${MOVIE_BASE_FLOOR_CRF_MIN:-}" bsm="${MOVIE_BASE_CRF_SEARCH_MIN:-}"
+    if [[ "$fm" =~ ^[0-9]+$ && "$bsm" =~ ^[0-9]+$ ]] && (( 10#$fm > 10#$bsm )); then
+        errs+=("MOVIE_BASE_FLOOR_CRF_MIN ($fm) is greater than MOVIE_BASE_CRF_SEARCH_MIN ($bsm)")
+    fi
+
     if _policy_is_num "${SERIES_CONTAINER_RESERVE_PCT:-}"; then
         if awk -v x="$SERIES_CONTAINER_RESERVE_PCT" 'BEGIN { exit !(x >= 100) }'; then
             errs+=("SERIES_CONTAINER_RESERVE_PCT=\"$SERIES_CONTAINER_RESERVE_PCT\": must be below 100")
@@ -260,6 +282,7 @@ load_policy() {
         "${POLICY_KEYS_RETIRED[@]}" "${POLICY_KEYS_RETIRED_VIDEO[@]}" \
         "${POLICY_KEYS_RETIRED_QUALITY[@]}" "${POLICY_KEYS_LEGACY_CRF_MIN[@]}" \
         "${POLICY_KEYS_RETIRED_MOVIE_CEILING[@]}" \
+        MOVIE_BASE_VIDEO_FLOOR_MBPS \
         SERIES_CONTAINER_RESERVE_PCT CRF_DOWN_RETRY_HEADROOM_PCT CRF_DOWN_RETRY_MAX \
         CRF_DOWN_RETRY_FIT_MARGIN_PCT SERIES_CRF_DOWN_RETRY_MAX \
         CRF_ADAPTIVE_STEP_THRESHOLD_PCT
@@ -404,6 +427,10 @@ movie_policy_line() (
             printf 'CRF %s-%s, search starts at %s [lowest CRF with the video estimate at or below %s GiB per hour of runtime%s]' \
                 "$CRF_MIN" "$CRF_MAX" "$CRF_START" "$CRF_GIB_PER_HOUR" \
                 "${CRF_CEILING_GIB:+: $CRF_CEILING_GIB GiB for this movie}"
+            if [[ -n "$CRF_FLOOR_MBPS" ]] && awk -v f="$CRF_FLOOR_MBPS" 'BEGIN { exit !(f > 0) }'; then
+                printf '; video floor %s Mb/s (CRF down to %s to reach it; not for a source video below it)' \
+                    "$CRF_FLOOR_MBPS" "$CRF_FLOOR_CRF_MIN"
+            fi
             ;;
         Custom)
             printf 'CRF entered in the menu, used exactly'
@@ -484,6 +511,33 @@ movie_ceiling_bytes() {
         printf "%.0f", (b < 1 ? 1 : b) }'
 }
 
+# gib_per_hour_mbps GIB_PER_HOUR  ->  the average video bitrate of that
+# rate in Mb/s ("2.983" for 1.25; 1 GiB = 1073741824 bytes)
+gib_per_hour_mbps() {
+    awk -v r="$1" 'BEGIN { printf "%.3f", r * 1073741824 * 8 / 3600 / 1000000 }'
+}
+
+# movie_floor_bytes FLOOR_MBPS DURATION_SECONDS  ->  whole bytes
+#
+# The movie Base video floor: FLOOR_MBPS x 1000000 / 8 x DURATION_SECONDS
+# (decimal Mb/s, as every bitrate shown; the video stream only). 0 when
+# the floor is 0 (off); returns 1 (nothing printed) when either value is
+# not a number or the runtime is not positive.
+movie_floor_bytes() {
+    [[ "${1:-}" =~ ^[0-9]+([.][0-9]+)?$ && "${2:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    awk -v f="$1" -v d="$2" 'BEGIN {
+        if (d <= 0) exit 1
+        printf "%.0f", f * 1000000 / 8 * d }'
+}
+
+# movie_floor_source_exempt FLOOR_BYTES SOURCE_VIDEO_BYTES  ->  0 when the
+# source's own VIDEO stream is known and below the floor (same runtime,
+# so bytes compare like bitrates): Base never inflates such a source to
+# reach the floor. An unknown source video size is not exempt.
+movie_floor_source_exempt() {
+    [[ "${1:-}" =~ ^[0-9]+$ && "${2:-}" =~ ^[0-9]+$ ]] && (( $2 > 0 && $2 < $1 ))
+}
+
 # crf_tier_load SCOPE TIER [CUSTOM_CRF [DURATION]]
 #
 # SCOPE: movie | series. TIER: High | Base | Custom (| Quality, movie).
@@ -497,12 +551,20 @@ movie_ceiling_bytes() {
 # both ceiling values are empty; an unusable DURATION returns 1.
 # Series High / Base: the fixed SERIES_*_VIDEO_SIZE_CEILING_GIB per
 # episode (CRF_GIB_PER_HOUR empty).
+# Movie Base also: CRF_FLOOR_MBPS (MOVIE_BASE_VIDEO_FLOOR_MBPS) and
+# CRF_FLOOR_CRF_MIN (MOVIE_BASE_FLOOR_CRF_MIN), and with DURATION
+# CRF_FLOOR_BYTES (movie_floor_bytes; 0 = no floor). Every other tier:
+# all three empty / 0 (no floor). The source exemption is the menu's
+# (movie_floor_source_exempt).
 # Custom: CRF_START = CRF_MIN = CRF_MAX = CUSTOM_CRF, no ceiling
 # (CRF_CEILING_BYTES=0).
 crf_tier_load() {
     local scope="${1^^}" tier="$2" u
 
     CRF_GIB_PER_HOUR=""
+    CRF_FLOOR_MBPS=""
+    CRF_FLOOR_CRF_MIN=""
+    CRF_FLOOR_BYTES=0
 
     case "$tier" in
         High|Base)
@@ -524,6 +586,13 @@ crf_tier_load() {
                         return 1
                     fi
                     CRF_CEILING_GIB=$(bytes_to_gib "$CRF_CEILING_BYTES")
+                fi
+                if [[ "$u" == BASE ]]; then
+                    CRF_FLOOR_MBPS="$MOVIE_BASE_VIDEO_FLOOR_MBPS"
+                    CRF_FLOOR_CRF_MIN="$MOVIE_BASE_FLOOR_CRF_MIN"
+                    if [[ -n "${4:-}" ]]; then
+                        CRF_FLOOR_BYTES=$(movie_floor_bytes "$CRF_FLOOR_MBPS" "$4") || CRF_FLOOR_BYTES=0
+                    fi
                 fi
             else
                 local c="${scope}_${u}_VIDEO_SIZE_CEILING_GIB"
@@ -607,6 +676,11 @@ crf_policy_lines() (
         echo "  video size ceiling: ${CRF_GIB_PER_HOUR} GiB per hour of runtime (runtime hours x ${CRF_GIB_PER_HOUR} GiB)"
         [[ -n "$CRF_CEILING_GIB" ]] &&
             echo "  this movie: $(format_hms "$4") -> ${CRF_CEILING_GIB} GiB video ceiling"
+        if [[ -n "$CRF_FLOOR_MBPS" ]] && awk -v f="$CRF_FLOOR_MBPS" 'BEGIN { exit !(f > 0) }'; then
+            echo "  video floor: ${CRF_FLOOR_MBPS} Mb/s average (below it at CRF ${CRF_MIN}: CRF down to ${CRF_FLOOR_CRF_MIN}; not for a source video below it)"
+            (( CRF_FLOOR_BYTES > 0 )) &&
+                echo "  this movie: $(format_hms "$4") -> $(bytes_to_gib "$CRF_FLOOR_BYTES") GiB video floor"
+        fi
     fi
     echo "  encode: x265 CRF, single pass, preset slow, 10-bit"
     echo "  audio: copied unchanged"
@@ -900,6 +974,81 @@ crf_select_boundary() {
 # from CRF_MIN up whose estimate fits (upward only; same globals).
 crf_select() {
     crf_select_boundary "$1" "$1" "$2" "$3" "$4" "${5:-}" "${6:-}"
+}
+
+# crf_floor_extend FLOOR_BYTES FLOOR_CRF_MIN CEILING_BYTES [REPORT]
+#
+# Movie Base minimum video bitrate, after crf_select_boundary (same
+# ESTIMATOR, CRF_EST / CRF_TRIED; every CRF estimated at most once). The
+# ceiling stays the upper limit; a CRF is acceptable when its estimate
+# fits the ceiling AND is at or above FLOOR_BYTES. As the boundary search
+# already chose the LOWEST CRF that fits, a higher CRF can never reach
+# the floor; only a lower one can:
+#   - CRF_SELECTED at or above the floor (or over the ceiling, which is
+#     above the floor too): unchanged (CRF_FLOOR_STATUS=ok)
+#   - below the floor with CRF_SELECTED - 1 estimated above the ceiling
+#     (CRF_BOUNDARY_LOW): nothing fits both; CRF_SELECTED kept (gap)
+#   - below the floor at CRF_MIN (CRF_AT_FLOOR=1): CRF_MIN - 1, - 2, ...
+#     one at a time, down to FLOOR_CRF_MIN, stopping at the first CRF at
+#     or above the floor (extended; CRF_SELECTED = it) or the first one
+#     above the ceiling (gap; CRF_SELECTED = the CRF above it, which
+#     fits, CRF_BOUNDARY_LOW = the one above the ceiling); FLOOR_CRF_MIN
+#     still below the floor: CRF_SELECTED = FLOOR_CRF_MIN (limit)
+# FLOOR_BYTES 0 = no floor (CRF_FLOOR_STATUS=off, nothing estimated).
+#
+# REPORT kinds: below-floor C NEXT (C fits, below the floor; NEXT next),
+# floor-over C (C above the ceiling), floor-met C (C fits and reaches the
+# floor).
+# Sets CRF_FLOOR_STATUS: off | ok | extended | gap | limit (gap / limit:
+# CRF_SELECTED is estimated below the floor; the menu asks). Returns 1
+# when an estimate failed (CRF_SELECTED empty).
+crf_floor_extend() {
+    local floor="$1" fmin="$2" ceil="$3" report="${4:-}" c
+
+    CRF_FLOOR_STATUS=off
+    [[ "$floor" =~ ^[0-9]+$ ]] && (( floor > 0 )) || return 0
+
+    CRF_FLOOR_STATUS=ok
+    c="$CRF_SELECTED"
+    if (( CRF_OVER_CEILING == 1 || CRF_EST[$c] >= floor )); then
+        return 0
+    fi
+    if (( CRF_AT_FLOOR != 1 )); then
+        CRF_FLOOR_STATUS=gap
+        return 0
+    fi
+
+    while (( c > 10#$fmin )); do
+        _crfs_report "$report" below-floor "$c" "$((c - 1))"
+        if ! _crf_select_probe "$((c - 1))"; then
+            CRF_SELECTED=""
+            return 1
+        fi
+        if (( CRF_EST_RESULT > ceil )); then
+            _crfs_report "$report" floor-over "$((c - 1))"
+            CRF_BOUNDARY_LOW=$((c - 1))
+            CRF_AT_FLOOR=0
+            CRF_FLOOR_STATUS=gap
+            return 0
+        fi
+        c=$((c - 1))
+        CRF_SELECTED="$c"
+        if (( CRF_EST_RESULT >= floor )); then
+            _crfs_report "$report" floor-met "$c"
+            CRF_AT_FLOOR=0
+            CRF_FLOOR_STATUS=extended
+            return 0
+        fi
+    done
+
+    CRF_FLOOR_STATUS=limit
+    return 0
+}
+
+# crf_below_floor EST_BYTES FLOOR_BYTES  ->  0 when a floor is set and
+# the estimate is below it
+crf_below_floor() {
+    [[ "$1" =~ ^[0-9]+$ && "$2" =~ ^[0-9]+$ ]] && (( $2 > 0 && $1 < $2 ))
 }
 
 # _crf_select_probe CRF  (PROBE for crf_select)  ->  _CRF_SELECT_EST at

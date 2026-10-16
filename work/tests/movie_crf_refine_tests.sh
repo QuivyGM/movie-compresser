@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Movie High / Base post-encode CRF refinement (down_mode=boundary): once
-# an attempt fits the video ceiling, CRF - 1 is encoded exactly once and
-# kept only when its ACTUAL video fits. Series and movie Quality keep
-# their headroom-gated lower-CRF retry.
+# an attempt fits the video ceiling, High (and job scripts of earlier
+# versions, down_max=1) encode CRF - 1 exactly once and keep it only when
+# its ACTUAL video fits; Base (down_max=CRF_LIMIT) walks down one CRF at a
+# time while each actual fits (cached actual results above the ceiling
+# are not encoded again), with its video floor (floor_vbytes /
+# floor_crf_min). Series and movie Quality keep their headroom-gated
+# lower-CRF retry.
 #
 #   bash ~/compress/work/tests/movie_crf_refine_tests.sh
 #
@@ -119,6 +123,74 @@ check "4 log"                                     "logs b4 'CRF 10 is the High m
 
 check "4 menu floor is the search min: spec carries CRF_MIN" \
     "grep -qF '[[ \"\$TIER\" != \"Custom\" ]] && RETRY_SPEC=\"\$CRF_CEILING_BYTES:\$CRF_MAX:\$CRF_MIN:0:1:::boundary\"' '$SRC_WORK/movie_compress.sh'"
+
+echo "== movie Base: walk down while each actual fits (down_max=CRF_LIMIT), video floor"
+
+# the menu's Base spec: "...:0:51:::boundary:FLOOR_BYTES:FLOOR_CRF_MIN"
+BW="ceiling_vbytes=$(gib 8.35) crf_min=10 crf_max=20 down_headroom_pct=0 down_max=51 down_mode=boundary floor_vbytes=0 floor_crf_min=10 crf_est=12=$(gib 9.72):13=$(gib 7.84)"
+below_floor() { grep -q '^Below the Base video floor' "$T/$1.log"; }
+
+movie_job w1 Base 13 "$BW" "[13]='$(gib 6.7) 0' [12]='$(gib 7.2) 0' [11]='$(gib 7.9) 0' [10]='$(gib 8.6) 0'"
+eq    "7 N fits, N-1 fits -> N-2 tested too, until one is over" "$(encoded w1)" "13 12 11 10 "
+eq    "7 lowest fitting CRF 11 kept and verified" "$(final)/$(verified w1)/$(leftovers)" "11/11 /"
+check "7 log" "logs w1 'CRF 10 actual: 8.60 GiB / 8.35 GiB ceiling -> over ceiling' && logs w1 'Keeping CRF 11'"
+check "7 no floor flag without a floor" "! below_floor w1"
+
+movie_job w2 Base 13 "$BW" "[13]='$(gib 6.7) 0' [12]='$(gib 8.9) 0'"
+eq    "8 N fits, N-1 over -> N"                   "$(encoded w2)/$(final)/$(leftovers)" "13 12 /13/"
+
+movie_job w3 Base 13 "$BW" "[13]='$(gib 5) 0' [12]='$(gib 5.5) 0' [11]='$(gib 6) 0' [10]='$(gib 6.5) 0' [9]='$(gib 7) 0'"
+eq    "9 every CRF fits: walk stops at crf_min 10" "$(encoded w3)/$(final)" "13 12 11 10 /10"
+check "9 log" "logs w3 'CRF 10 is the Base minimum; keeping CRF 10'"
+
+movie_job w4 Base 13 "$BW" "[13]='$(gib 8.6) 0' [14]='$(gib 7.5) 0'"
+eq    "10 N over: up to 14; 13 proven over, no walk" "$(encoded w4)/$(final)" "13 14 /14"
+
+movie_job w5 Base 13 "$BW" "[13]='$(gib 6.7) 0' [12]=fail"
+eq    "11 N-1 encode fails: N kept"               "$(encoded w5)/$(final)/$(leftovers)" "13 12 /13/"
+
+# cached actual results (same source + settings): an N-1 cached above the
+# ceiling is not encoded again; a cached fitting one still is (its file
+# is needed)
+SIG="$CRF_ACTUAL_SCHEMA|stat=$(stat -L -c '%s %Y' -- "$T/in/M.mkv")|refine-test"
+BWS="$BW actual_sig=$(printf '%q' "$SIG")"
+movie_job c1 Base 13 "$BWS" "[13]='$(gib 6.7) 0' [12]='$(gib 8.9) 0'"
+eq    "12 first job: 13 fits, 12 over (both saved)" "$(encoded c1)/$(final)" "13 12 /13"
+movie_job c2 Base 13 "$BWS" "[13]='$(gib 6.7) 0' [12]='$(gib 8.9) 0'"
+eq    "12 cached CRF 12 over the ceiling: not encoded again" "$(encoded c2)/$(final)" "13 /13"
+check "12 log" "logs c2 'CRF 12 actual (cached): 8.90 GiB / 8.35 GiB ceiling -> over ceiling; keeping CRF 13'"
+( WORK_DIR="$W" crf_actual_save "$SIG" 12 "$(gib 7.0)" )
+movie_job c3 Base 13 "$BWS" "[13]='$(gib 6.7) 0' [12]='$(gib 7.0) 0' [11]='$(gib 8.8) 0'"
+eq    "12 cached CRF 12 fitting: still encoded, walk continues to 11" "$(encoded c3)/$(final)" "13 12 11 /12"
+
+# the floor (floor_vbytes; the stand-in runtime is 100 s)
+BF="ceiling_vbytes=$(gib 8.35) crf_min=10 crf_max=20 down_headroom_pct=0 down_max=51 down_mode=boundary floor_vbytes=$(gib 7.5) floor_crf_min=8"
+movie_job f1 Base 13 "$BF" "[13]='$(gib 6.7) 0' [12]='$(gib 7.2) 0' [11]='$(gib 8.6) 0'"
+eq    "13 floor between two CRFs (12 below, 11 over): 12 kept" "$(encoded f1)/$(final)" "13 12 11 /12"
+check "13 below the floor: flagged, never silent" "logs f1 '         (no lower CRF allowed fits the ceiling and reaches it); keeping CRF 12.' && below_floor f1"
+
+movie_job f2 Base 10 "$BF" "[10]='$(gib 5) 0' [9]='$(gib 6.5) 0' [8]='$(gib 7.6) 0' [7]='$(gib 7.8) 0'"
+eq    "14 below the floor at crf_min: below it down to the floor (8)" "$(encoded f2)/$(final)" "10 9 8 /8"
+check "14 log, no flag" "grep -q '^Below the .* Mb/s video floor -> testing CRF 9...\$' '$T/f2.log' && grep -q '^CRF 8 reaches the .* Mb/s video floor; keeping CRF 8\$' '$T/f2.log' && ! below_floor f2"
+
+movie_job f3 Base 10 "$BF" "[10]='$(gib 5) 0' [9]='$(gib 5.5) 0' [8]='$(gib 6) 0' [7]='$(gib 7.6) 0'"
+eq    "15 floor_crf_min 8 still below: stop there, flagged" "$(encoded f3)/$(final)" "10 9 8 /8"
+check "15 log" "logs f3 'CRF 8 is the lowest CRF the Base video floor allows; keeping CRF 8' && below_floor f3"
+
+movie_job f4 Base 10 "$BF" "[10]='$(gib 5) 0' [9]='$(gib 9) 0'"
+eq    "16 below the floor, CRF - 1 over the ceiling: kept, flagged" "$(encoded f4)/$(final)" "10 9 /10"
+check "16 flag" "below_floor f4"
+
+movie_job f5 Base 8 "$BF" "[8]='$(gib 7.6) 0' [7]='$(gib 7.8) 0'"
+eq    "17 planned below crf_min (search reached the floor): no lower CRF" "$(encoded f5)/$(final)" "8 /8"
+
+movie_job f6 Base 13 "$BF" "[13]='$(gib 8.0) 0' [12]='$(gib 8.9) 0'"
+eq    "18 above the floor: walk as without a floor" "$(encoded f6)/$(final)" "13 12 /13"
+check "18 no flag" "! below_floor f6"
+
+movie_job f7 Base 10 "${BF/floor_vbytes=$(gib 7.5)/floor_vbytes=0}" "[10]='$(gib 5) 0' [9]='$(gib 6) 0'"
+eq    "19 floor 0 (source exempt): never below crf_min" "$(encoded f7)/$(final)" "10 /10"
+check "19 no flag" "! below_floor f7"
 
 echo "== per-episode headroom retry unchanged (no down_mode: headroom + predicted-fit gate;"
 echo "   the series items of earlier job scripts, compatibility)"

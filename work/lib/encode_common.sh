@@ -965,6 +965,9 @@ crf_step_result() {
         down)        printf 'fits -> trying CRF %s' "$3" ;;
         down-over)   printf '%s' "$(ui_warn "too large")" ;;
         floor)       printf 'fits (lowest %s CRF allowed)' "${TIER:-tier}" ;;
+        below-floor) printf 'fits, %s -> trying CRF %s' "$(ui_warn "below the video floor")" "$3" ;;
+        floor-over)  printf '%s' "$(ui_warn "too large")" ;;
+        floor-met)   printf 'fits, at or above the video floor' ;;
     esac
 }
 
@@ -984,6 +987,7 @@ crf_step_skips() {
         over) (( 10#$3 > 10#$2 + 1 )) ;;
         check|resume|refine|refine-over|refine-fits|boundary) return 0 ;;
         down|down-over|floor) return 0 ;;
+        below-floor|floor-over|floor-met) return 0 ;;
         *)    return 1 ;;
     esac
 }
@@ -1713,7 +1717,7 @@ emit_failed_item() {
 #           series High, Base, Custom). No -b:v, no pass logs (PASSLOG is ignored).
 #           EST_VIDEO_BYTES, the pre-encode estimate, is reported against
 #           the actual size afterwards (never a failure).
-#           RETRY "CEILING_BYTES:CRF_MAX:CRF_MIN:HEADROOM_PCT:DOWN_MAX[:batch|season[:FIT_PCT[:DOWN_MODE]]]"
+#           RETRY "CEILING_BYTES:CRF_MAX:CRF_MIN:HEADROOM_PCT:DOWN_MAX[:batch|season[:FIT_PCT[:DOWN_MODE[:FLOOR_BYTES:FLOOR_CRF_MIN]]]]"
 #           (High / Base / Quality): an attempt whose actual VIDEO bytes are above
 #           the ceiling is re-encoded at CRF + 1 up to CRF_MAX; one that
 #           fits at least HEADROOM_PCT below the ceiling tries CRF - 1
@@ -1727,8 +1731,12 @@ emit_failed_item() {
 #           HEADROOM_PCT / DOWN_MAX / FIT_PCT unused). ":batch" (job
 #           scripts of earlier versions): the median-decided season
 #           batch. DOWN_MODE "boundary" (movie High / Base):
-#           the first attempt that fits tests CRF - 1 exactly once, with
-#           no headroom / FIT_PCT gate (job_runtime.sh). "" = no retry
+#           the first attempt that fits tests lower CRFs with no headroom /
+#           FIT_PCT gate, up to DOWN_MAX of them (High: 1, CRF - 1 exactly
+#           once; Base: CRF_LIMIT, i.e. until one is above the ceiling or
+#           CRF_MIN is reached; job_runtime.sh). FLOOR_BYTES /
+#           FLOOR_CRF_MIN (movie Base): the video floor (0 = none) and the
+#           lowest CRF a result below it may go to. "" = no retry
 #           (Custom).
 #           CRF_EST "CRF=BYTES:..." the pre-encode estimates per CRF (for
 #           the FIT_PCT prediction).
@@ -1774,7 +1782,7 @@ emit_encode_item() {
     local crf_est="${12:-}"
     local actual_sig="${13:-}"
 
-    local mode kbps="" crf="" rceil="" rmax="" rmin="" rdpct="" rdmax="" rbatch="" rfit="" rdmode=""
+    local mode kbps="" crf="" rceil="" rmax="" rmin="" rdpct="" rdmax="" rbatch="" rfit="" rdmode="" rfloor="" rfloormin=""
     local qtarget="" qmin="" qmax="" qstatus=""
 
     case "$video" in
@@ -1787,7 +1795,7 @@ emit_encode_item() {
     [[ "$mode" == "abr" ]] || passlog=""
     [[ "$est" =~ ^[0-9]+$ ]] || est=""
     if [[ "$mode" == "crf" && -n "$retry" ]]; then
-        IFS=: read -r rceil rmax rmin rdpct rdmax rbatch rfit rdmode <<< "$retry"
+        IFS=: read -r rceil rmax rmin rdpct rdmax rbatch rfit rdmode rfloor rfloormin <<< "$retry"
     fi
     if [[ "$mode" == "crf" && -n "$quality" ]]; then
         IFS=: read -r qtarget qmin qmax qstatus <<< "$quality"
@@ -1908,6 +1916,10 @@ emit_encode_item() {
     # movie High / Base: one CRF - 1 test after the first fit (job_runtime.sh)
     [[ "$mode" == "crf" && "$rdmode" == boundary ]] &&
         expect+=' down_mode=boundary'
+    # movie Base: the video floor (bytes; 0 = none / source exempt) and the
+    # lowest CRF the post-encode retry may use to reach it (job_runtime.sh)
+    [[ "$mode" == "crf" && "$rdmode" == boundary && "$rfloor" =~ ^[0-9]+$ ]] &&
+        expect+=$(printf ' floor_vbytes=%q floor_crf_min=%q' "$rfloor" "$rfloormin")
     # series High / Base: strict shared season CRF (job_runtime.sh job_crf_batch)
     if [[ "$mode" == "crf" && "$rbatch" == season ]]; then
         expect+=' batch_mode=season'

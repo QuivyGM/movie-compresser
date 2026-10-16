@@ -70,7 +70,7 @@ COMPRESS_CONF=$(conf_with base \
     MOVIE_QUALITY_TARGET_VIDEO_GIB=20 MOVIE_QUALITY_ACCEPT_MIN_GIB=18 MOVIE_QUALITY_ACCEPT_MAX_GIB=22 \
     MOVIE_QUALITY_CRF_MIN=0 MOVIE_QUALITY_CRF_START=8 MOVIE_QUALITY_CRF_MAX=23 \
     MOVIE_HIGH_CRF_SEARCH_MIN=12 MOVIE_HIGH_CRF_START=12 MOVIE_HIGH_CRF_MAX=23 MOVIE_HIGH_VIDEO_GIB_PER_HOUR=3.5 \
-    MOVIE_BASE_CRF_SEARCH_MIN=20 MOVIE_BASE_CRF_START=20 MOVIE_BASE_CRF_MAX=29 MOVIE_BASE_VIDEO_GIB_PER_HOUR=1.0 \
+    MOVIE_BASE_CRF_SEARCH_MIN=20 MOVIE_BASE_CRF_START=20 MOVIE_BASE_CRF_MAX=29 MOVIE_BASE_VIDEO_GIB_PER_HOUR=1.0 MOVIE_BASE_VIDEO_FLOOR_MBPS=0 \
     SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=21 SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=5 \
     SERIES_BASE_CRF_SEARCH_MIN=13 SERIES_BASE_CRF_START=13 SERIES_BASE_CRF_MAX=27 SERIES_BASE_VIDEO_SIZE_CEILING_GIB=1.5 \
     SERIES_CRF_OUTLIER_PCT=25 SERIES_CRF_SAMPLE_EPISODES=4 CRF_ADAPTIVE_STEP_THRESHOLD_PCT=150)
@@ -382,8 +382,8 @@ TGIB=([12]=17.5 [13]=7.4 [14]=6.9)
 COMPRESS_VERBOSE=1 crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_title_estimate crf_title_step_report > "$T/movie5.out"
 check "movie verbose: jump shown below the sample line" \
     "grep -q '^  sampling CRF 12 (1 section)\\.\\.\\. ~' '$T/movie5.out' && grep -q '^           too large -> jumping to CRF 14\$' '$T/movie5.out' && grep -q '^Boundary:\$' '$T/movie5.out'"
-check "movie menu passes the reporter (High / Base and both Quality searches)" \
-    "[[ \$(grep -c 'crf_title_step_report' '$SRC_WORK/movie_compress.sh') == 3 ]]"
+check "movie menu passes the reporter (High / Base, the Base floor and both Quality searches)" \
+    "[[ \$(grep -c 'crf_title_step_report' '$SRC_WORK/movie_compress.sh') == 4 ]]"
 unset -f crf_sample_title
 source "$WORK_DIR/lib/encode_common.sh" > /dev/null
 

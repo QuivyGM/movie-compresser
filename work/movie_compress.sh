@@ -394,6 +394,17 @@ while true; do
             CRF_CEILING_GIB="$SOURCE_VIDEO_GIB"
         fi
 
+        # Base: minimum video bitrate (MOVIE_BASE_VIDEO_FLOOR_MBPS, bytes
+        # over this runtime). A source whose own VIDEO stream is below it
+        # is exempt (never inflated to reach it): CRF_FLOOR_BYTES=0.
+        FLOOR_EXEMPT=0
+        if [[ "$TIER" == Base ]] && (( ${CRF_FLOOR_BYTES:-0} > 0 )) &&
+           movie_floor_source_exempt "$CRF_FLOOR_BYTES" "$SOURCE_VIDEO_BYTES"; then
+            FLOOR_EXEMPT=1
+            CRF_FLOOR_BYTES=0
+        fi
+        CRF_FLOOR_STATUS=off
+
         if ui_verbose; then
             echo
             crf_policy_lines movie "$TIER" "$CUSTOM_CRF" "$DURATION"
@@ -430,6 +441,12 @@ while true; do
             printf '%-16s%s GiB/hour\n' "Size rate:" "$CRF_GIB_PER_HOUR"
             printf '%-16s%s GiB\n' "Video ceiling:" "$CRF_CEILING_GIB"
             printf '%-16s<= %s Mb/s average\n' "Video bitrate:" "$(bytes_to_mbps "$CRF_CEILING_BYTES" "$DURATION")"
+            if (( FLOOR_EXEMPT == 1 )); then
+                printf '%-16s%s Mb/s not applied (source video %s Mb/s is below it)\n' "Video floor:" \
+                    "$CRF_FLOOR_MBPS" "$SOURCE_VIDEO_MBPS"
+            elif (( ${CRF_FLOOR_BYTES:-0} > 0 )); then
+                printf '%-16s>= %s Mb/s average (%s GiB)\n' "Video floor:" "$CRF_FLOOR_MBPS" "$(bytes_to_gib "$CRF_FLOOR_BYTES")"
+            fi
         fi
 
         if [[ "$TIER" == "Custom" ]]; then
@@ -448,6 +465,13 @@ while true; do
         else
             crf_select_boundary "$CRF_START" "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_title_estimate_actual \
                 crf_title_step_report || CRF_SELECTED=""
+            # Base: the lowest CRF that fits is also checked against the
+            # floor (below it at CRF_MIN: lower CRFs, down to the floor
+            # CRF limit; policy.sh crf_floor_extend)
+            if [[ -n "$CRF_SELECTED" && "$TIER" == Base ]]; then
+                crf_floor_extend "$CRF_FLOOR_BYTES" "$CRF_FLOOR_CRF_MIN" "$CRF_CEILING_BYTES" \
+                    crf_title_step_report || CRF_SELECTED=""
+            fi
         fi
 
         if [[ -z "$CRF_SELECTED" ]]; then
@@ -489,6 +513,12 @@ while true; do
                 ;;
             *)
                 [[ "$TIER" != "Custom" ]] && RETRY_SPEC="$CRF_CEILING_BYTES:$CRF_MAX:$CRF_MIN:0:1:::boundary"
+                # Base: CRF - 1, - 2, ... while each actual encode fits
+                # (down_max = CRF_LIMIT: no count limit, the ceiling / CRF_MIN
+                # stop it), plus the floor (0 = none / source exempt) and the
+                # lowest CRF the floor may push the retry to
+                [[ "$TIER" == Base ]] &&
+                    RETRY_SPEC="$CRF_CEILING_BYTES:$CRF_MAX:$CRF_MIN:0:$CRF_LIMIT:::boundary:$CRF_FLOOR_BYTES:$CRF_FLOOR_CRF_MIN"
                 ;;
         esac
 
@@ -561,6 +591,36 @@ while true; do
 
             # CRF_MAX above the ceiling accepted: nothing left to retry
             RETRY_SPEC=""
+        fi
+
+        # Base: no CRF estimated inside ceiling AND floor (crf_floor_extend
+        # gap / limit): never accepted silently
+        if [[ "$CRF_FLOOR_STATUS" == gap || "$CRF_FLOOR_STATUS" == limit ]]; then
+            echo
+            echo "------------------------------------------------------------"
+            echo "$(ui_warn WARNING): Base CRF ${CRF} is estimated at ~$(bytes_to_mbps "$EST_VIDEO_BYTES" "$DURATION") Mb/s (~${EXPECTED_VIDEO_GIB} GiB video),"
+            echo "below the ${CRF_FLOOR_MBPS} Mb/s Base video floor ($(bytes_to_gib "$CRF_FLOOR_BYTES") GiB; source video ${SOURCE_VIDEO_MBPS} Mb/s)."
+            if [[ "$CRF_FLOOR_STATUS" == gap ]]; then
+                echo "CRF ${CRF_BOUNDARY_LOW}, the next higher quality, is estimated above the ${CRF_CEILING_GIB} GiB ceiling."
+            else
+                echo "CRF ${CRF} is the lowest CRF the floor may use (MOVIE_BASE_FLOOR_CRF_MIN)."
+            fi
+            echo "------------------------------------------------------------"
+            echo "1) Encode at CRF ${CRF} anyway (below the floor)"
+            echo "2) Skip this movie"
+
+            while true; do
+                read -rp "Select [1-2]: " fc
+                case "$fc" in
+                    1|2) break ;;
+                    *) echo "Invalid selection." ;;
+                esac
+            done
+
+            if [[ "$fc" == "2" ]]; then
+                skip_movie && continue
+                break
+            fi
         fi
 
         # Source-quality guard: never make a lossy re-encode that is not
@@ -780,6 +840,12 @@ while true; do
                 "$CRF_GIB_PER_HOUR" "$(format_hms "$DURATION")"
             printf '  %-8sCRF %s-%s, video <= %s Mb/s average\n' "Limits:" "$CRF_MIN" "$CRF_MAX" \
                 "$(bytes_to_mbps "$CRF_CEILING_BYTES" "$DURATION")"
+            if [[ "$TIER" == Base ]] && (( FLOOR_EXEMPT == 1 )); then
+                printf '  %-8s%s Mb/s not applied (source video %s Mb/s)\n' "Floor:" "$CRF_FLOOR_MBPS" "$SOURCE_VIDEO_MBPS"
+            elif [[ "$TIER" == Base ]] && (( ${CRF_FLOOR_BYTES:-0} > 0 )); then
+                printf '  %-8s>= %s Mb/s video%s\n' "Floor:" "$CRF_FLOOR_MBPS" \
+                    "$(crf_below_floor "$EST_VIDEO_BYTES" "$CRF_FLOOR_BYTES" && echo " | $(ui_warn "estimate below the floor")")"
+            fi
         fi
 
         # only what is lost or dropped (COMPRESS_VERBOSE=1 lists every note)

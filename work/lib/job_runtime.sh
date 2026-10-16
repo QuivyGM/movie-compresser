@@ -24,9 +24,11 @@
 # predicted to fit, down_fit_pct); a lower attempt above the ceiling is
 # discarded and the fitting one kept. Movie High / Base also save every
 # completed attempt's actual video bytes (item_actual_save). Movie High / Base
-# (down_mode=boundary) instead test CRF - 1 exactly once after the first
-# fit, without headroom or prediction gate (the actual encode corrects
-# the estimate). Movie Quality uses the upper edge
+# (down_mode=boundary) instead test CRF - 1 after the first fit, without
+# headroom or prediction gate (the actual encode corrects the estimate):
+# High exactly once (down_max=1), Base one CRF at a time while each fits
+# (down_max=CRF_LIMIT), with its video floor (floor_vbytes /
+# floor_crf_min). Movie Quality uses the upper edge
 # of its acceptable band as the ceiling and tries CRF - 1 only while the
 # actual video is below the band (down_below_vbytes). Series High / Base
 # episodes form a season batch with ONE shared CRF (job_crf_batch,
@@ -105,9 +107,11 @@ job_init() {
     ITEM_BATCH_CRF=""
     ITEM_CRF_RUN=""           # CRF that replaces the planned -crf:v:0 value
     ITEM_OVER_CEILING=0
+    ITEM_BELOW_FLOOR=0        # movie Base result below its video floor (flagged)
     ITEM_ATTEMPT_ROWS=()
     JOB_BATCH=()
     JOB_OVER_NAMES=()
+    JOB_FLOOR_NAMES=()
     declare -gA JOB_DONE_PARTS=()   # completed attempt files: never deleted on interruption
 
     mkdir -p "$JOB_LOG_DIR"
@@ -230,6 +234,7 @@ item_begin() {
     ITEM_EXP=()
     ITEM_CRF_RUN=""
     ITEM_OVER_CEILING=0
+    ITEM_BELOW_FLOOR=0
     ITEM_ATTEMPT_ROWS=()
     JOB_STATUS="running"
 
@@ -640,6 +645,7 @@ item_succeeded() {
     ITEM_PART=""
     ITEM_FINAL="$final"
     (( ITEM_OVER_CEILING == 1 )) && JOB_OVER_NAMES+=("$ITEM_NAME")
+    (( ${ITEM_BELOW_FLOOR:-0} == 1 )) && JOB_FLOOR_NAMES+=("$ITEM_NAME")
 
     if [[ -n "$ITEM_PASSLOG" ]]; then
         rm -f -- "$ITEM_PASSLOG" "$ITEM_PASSLOG".*
@@ -1049,6 +1055,19 @@ item_actual_save() {
     return 0
 }
 
+# item_actual_cached CRF  ->  movie Base (item_expect actual_sig=): the
+# cached actual video bytes of exactly CRF from an earlier encode of the
+# same source and encode settings (encode_common.sh crf_actual_lookup);
+# 1 when none or the source changed since the search
+item_actual_cached() {
+    local sig="${ITEM_EXP[actual_sig]:-}" st
+
+    [[ -n "$sig" ]] || return 1
+    st=$(stat -L -c '%s %Y' -- "$ITEM_INPUT" 2>/dev/null) || return 1
+    [[ -n "$st" && "$sig" == "$CRF_ACTUAL_SCHEMA|stat=$st|"* ]] || return 1
+    crf_actual_lookup "$sig" "$1"
+}
+
 # _down_threshold CEILING_BYTES HEADROOM_PCT  ->  bytes at or below which
 # a fitting result may try CRF - 1 ("" = downward retry off)
 _down_threshold() {
@@ -1174,10 +1193,18 @@ _drop_attempt() {
 # an upward retry fails, the completed earlier attempt is kept the same
 # way. Leaves the accepted attempt in ITEM_PART and its CRF in
 # ITEM_EXP[crf] (what item_verify_output checks).
+# Movie Base (down_mode=boundary, down_max > 1, floor_vbytes): phase 2
+# walks down one CRF at a time while each actual encode fits, until a CRF
+# is above the ceiling (this job's encode, or a cached actual result,
+# item_actual_cached, which is not encoded again) or crf_min is reached;
+# below crf_min only while the result is below floor_vbytes, down to
+# floor_crf_min. A final result below the floor is flagged
+# (ITEM_BELOW_FLOOR; the job keeps its session open at the end).
 item_crf_encode() {
     local fn="$1"
     local planned="${ITEM_EXP[crf]:-}" ceil max min c act prev="" prev_crf="" ok
     local thr down_max downs=0 nc a2 acc why="Headroom large" fit pred lim boundary=0
+    local walk=0 floor=0 fmin="" cached
     local -A over=()
 
     ITEM_EXP[crf_planned]="$planned"
@@ -1208,9 +1235,19 @@ item_crf_encode() {
     if [[ "${ITEM_EXP[down_mode]:-}" == boundary ]]; then
         boundary=1
         thr="$ceil"
-        down_max=1
+        # High (and job scripts of earlier versions): exactly one CRF - 1
+        # test; Base: down_max=CRF_LIMIT, walk down while each fits
+        if (( down_max > 1 )); then
+            walk=1
+        else
+            down_max=1
+        fi
         fit=""
         why="Fits"
+        floor="${ITEM_EXP[floor_vbytes]:-0}"
+        [[ "$floor" =~ ^[0-9]+$ ]] || floor=0
+        fmin="${ITEM_EXP[floor_crf_min]:-}"
+        [[ "$fmin" =~ ^[0-9]+$ ]] || fmin="$min"
     fi
     c="$planned"
 
@@ -1281,8 +1318,13 @@ item_crf_encode() {
     # ---- phase 2: down while the accepted result has enough headroom
     while [[ -n "$thr" ]] && (( act <= thr )); do
         nc=$((c - 1))
-        if (( c <= min )); then
-            if (( boundary )); then
+        # Base: below crf_min only while the result is below the floor
+        if (( c <= min )) && ! (( floor > 0 && act < floor && c > fmin )); then
+            if (( boundary && c < min && act >= floor )); then
+                echo "CRF $c reaches the $(_mbps_of "$floor") Mb/s video floor; keeping CRF $c"
+            elif (( boundary && floor > 0 && act < floor )); then
+                echo "CRF $c is the lowest CRF the $ITEM_TIER video floor allows; keeping CRF $c"
+            elif (( boundary )); then
                 echo "CRF $min is the $ITEM_TIER minimum; keeping CRF $c"
             else
                 echo "$why, but CRF $min is the $ITEM_TIER minimum"
@@ -1295,6 +1337,14 @@ item_crf_encode() {
         fi
         if [[ -n "${over[$nc]:-}" ]]; then
             (( boundary )) && echo "CRF $nc was already over the ceiling; keeping CRF $c"
+            break
+        fi
+        # Base: a cached actual result of CRF - 1 above the ceiling is the
+        # boundary already (no duplicate encode); one that fits must still
+        # be encoded (its output is needed)
+        if (( walk )) && cached=$(item_actual_cached "$nc") && (( cached > ceil )); then
+            over[$nc]=1
+            echo "CRF $nc actual (cached): $(_gib "$cached") GiB / $(_gib "$ceil") GiB ceiling -> over ceiling; keeping CRF $c"
             break
         fi
 
@@ -1317,7 +1367,9 @@ item_crf_encode() {
         acc="$KEPT_PART"
         ITEM_PART="$acc"
 
-        if (( boundary )); then
+        if (( boundary && floor > 0 && act < floor )); then
+            echo "Below the $(_mbps_of "$floor") Mb/s video floor -> testing CRF $nc..."
+        elif (( boundary )); then
             echo "Testing CRF $nc for better quality..."
         else
             echo "$why -> trying CRF $nc"
@@ -1368,10 +1420,25 @@ item_crf_encode() {
         break
     done
 
+    # Base: a result below the floor is kept, but never silently
+    if (( floor > 0 && act < floor )); then
+        ITEM_BELOW_FLOOR=1
+        echo "WARNING: CRF $c actual video $(_mbps_of "$act") Mb/s is below the $(_mbps_of "$floor") Mb/s $ITEM_TIER video floor"
+        echo "         (no lower CRF allowed fits the ceiling and reaches it); keeping CRF $c."
+    fi
+
     ITEM_EXP[crf]="$c"
     ITEM_CRF_RUN=""
     item_rows_final "$c"
     return 0
+}
+
+# _mbps_of VIDEO_BYTES  ->  average Mb/s over the item's runtime
+# (ITEM_DURATION, else the input's duration; "?" when unknown)
+_mbps_of() {
+    local d="${ITEM_DURATION:-}"
+    [[ "$d" =~ ^[0-9]+([.][0-9]+)?$ ]] || d=$(get_duration "$ITEM_INPUT" 2>/dev/null)
+    awk -v b="$1" -v d="$d" 'BEGIN { if (d + 0 > 0) printf "%.2f", b * 8 / d / 1000000; else printf "?" }'
 }
 
 # job_batch_add INDEX  ->  episode INDEX belongs to the series CRF batch
@@ -1916,11 +1983,20 @@ job_finish() {
         echo "CRF attempts: $JOB_WORK/logs/crf_estimates.tsv"
     fi
 
+    if (( ${#JOB_FLOOR_NAMES[@]} )); then
+        echo
+        echo "Below the Base video floor (kept: no lower CRF allowed fits the ceiling and reaches it):"
+        for n in "${JOB_FLOOR_NAMES[@]}"; do
+            echo "  $n"
+        done
+        echo "CRF attempts: $JOB_WORK/logs/crf_estimates.tsv"
+    fi
+
     echo "============================================================"
 
-    if (( JOB_FAILED > 0 || ${#JOB_OVER_NAMES[@]} > 0 )); then
+    if (( JOB_FAILED > 0 || ${#JOB_OVER_NAMES[@]} > 0 || ${#JOB_FLOOR_NAMES[@]} > 0 )); then
         # Keep the tmux session open so a failure or a kept over-ceiling
-        # result is noticed.
+        # or below-floor result is noticed.
         echo
         read -rp "Press Enter to close this session... " _ || true
     fi
