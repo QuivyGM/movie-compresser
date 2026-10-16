@@ -288,7 +288,7 @@ unset CRF_ACTUAL_SIG
 check "menu: Base runs crf_floor_extend after the boundary search" \
     "grep -qF 'crf_floor_extend \"\$CRF_FLOOR_BYTES\" \"\$CRF_FLOOR_CRF_MIN\" \"\$CRF_CEILING_BYTES\"' '$M'"
 check "menu: gap / limit asks (never accepted silently)" \
-    "grep -qF '[[ \"\$CRF_FLOOR_STATUS\" == gap || \"\$CRF_FLOOR_STATUS\" == limit ]]; }; then' '$M' && grep -qF 'Base video floor' '$SRC_WORK/lib/encode_common.sh'"
+    "grep -qF '[[ \"\$CRF_FLOOR_STATUS\" == gap || \"\$CRF_FLOOR_STATUS\" == limit ]]; }; then' '$M' && grep -qF 'Base cannot satisfy both limits' '$SRC_WORK/lib/encode_common.sh'"
 check "menu: Base retry spec walks down (CRF_LIMIT) and carries the floor" \
     "grep -qF 'RETRY_SPEC=\"\$CRF_CEILING_BYTES:\$CRF_MAX:\$CRF_MIN:0:\$CRF_LIMIT:::boundary:\$CRF_FLOOR_BYTES:\$CRF_FLOOR_CRF_MIN\"' '$M'"
 check "menu: High retry spec unchanged (one CRF - 1 test, no floor)" \
@@ -315,61 +315,144 @@ check "menu: floor step only for TIER == Base (one call site)" \
 eq "audio Compact settings independent of the Base floor / rate" \
     "$( COMPRESS_CONF=$(conf_with iso MOVIE_BASE_VIDEO_FLOOR_MBPS=0 MOVIE_BASE_VIDEO_GIB_PER_HOUR=2) load_policy 2>/dev/null; echo "$AUDIO_COMPACT_TRIGGER_GIB $AUDIO_COMPACT_LIMIT_GIB $(audio_menu_compact_kbps 6)" )" \
     "$AUDIO_COMPACT_TRIGGER_GIB $AUDIO_COMPACT_LIMIT_GIB $(audio_menu_compact_kbps 6)"
-# ---- 3c. Base prompt when no CRF fits both limits (base_crf_prompt):
-# automatic CRF anyway / manual CRF (estimated first) / skip
-# prompt_run INPUT [ESTIMATOR]  ->  "BASE_PICK/BASE_PICK_CRF/CRFs newly
-# estimated"; the screen in $T/prompt.out
+# ---- 3c. Base output: figures, estimate table, boundary rows, limits
+# (output only; the figures come from CRF_EST)
+G=1073741824
+b_of_gib()  { awk -v g="$1" -v G=$G 'BEGIN { printf "%.0f", g * G }'; }
+# squeezed-space comparison of output lines
+sq()        { tr -s ' ' <<< "$1" | sed 's/ *$//'; }
+has_line()  { grep -qxF -- "$(sq "$2")" <(sq "$(cat "$1")"); }
+eq "GiB/h: 2.50 GiB over 2 h"                 "$(video_gib_per_hour 2684354560 7200)" "1.25"
+eq "GiB/h: 3.38 GiB over 02:27:25"            "$(video_gib_per_hour "$(b_of_gib 3.38)" 8845)" "1.38"
+eq "Mb/s: 3.38 GiB over 02:27:25"             "$(bytes_to_mbps "$(b_of_gib 3.38)" 8845)" "3.28"
+eq "Mb/s: 2.50 GiB over 02:27:25"             "$(bytes_to_mbps "$(b_of_gib 2.50)" 8845)" "2.43"
+eq "GiB/h: unknown runtime"                   "$(video_gib_per_hour 100 N/A)" "N/A"
+lim() { ( CRF_CEILING_BYTES=2684354560 CRF_FLOOR_BYTES="$2"; crf_limit_text "$1" ); }
+eq "limit text: over the ceiling"             "$(lim 2790000000 2250000000)" "OVER ceiling by 0.10 GiB"
+eq "limit text: below the floor"              "$(lim 2160000000 2250000000)" "BELOW floor by 0.08 GiB"
+eq "limit text: inside both"                  "$(lim 2400000000 2250000000)" "OK"
+eq "limit text: no floor (High / Compact / exempt): never BELOW" "$(lim 2160000000 0)" "OK"
+
+# base_sel_state: a 2 h Base search with the stand-in estimator, in this shell
+base_sel_state() {
+    EST_DUR=7200
+    CALLS=()
+    TIER=Base
+    DURATION=7200
+    SOURCE_VIDEO_MBPS=20.00
+    crf_tier_load movie Base "" 7200
+    crf_select_boundary "$CRF_START" "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" mb_est "${1:-}"
+    crf_floor_extend "$CRF_FLOOR_BYTES" "$CRF_FLOOR_CRF_MIN" "$CRF_CEILING_BYTES" "${1:-}"
+    CRF="$CRF_SELECTED"
+}
+MB=([20]=2.4 [19]=3.1 [22]=2.0 [21]=2.6 [16]=2.7)
+( base_sel_state > /dev/null; base_limits_lines ) > "$T/limits.out"
+check "Base limits block: rate defines the ceiling, ceiling / floor in GiB and Mb/s, allowed range" \
+    "has_line '$T/limits.out' 'Runtime:         02:00:00' && has_line '$T/limits.out' 'Base rate:       1.25 GiB/h (defines the video ceiling)' && has_line '$T/limits.out' 'Video ceiling:   2.50 GiB / 2.98 Mb/s' && has_line '$T/limits.out' 'Video floor:     2.10 GiB / 2.50 Mb/s' && has_line '$T/limits.out' 'Allowed video:   2.10–2.50 GiB'"
+( base_sel_state > /dev/null; CRF_FLOOR_BYTES=0 SOURCE_VIDEO_MBPS=2.00 CRF_FLOOR_MBPS=2.5; base_limits_lines ) > "$T/limits0.out"
+check "Base limits block, source exempt: floor not applied, up to the ceiling" \
+    "has_line '$T/limits0.out' 'Video floor:     not applied (source video 2.00 Mb/s is below 2.5 Mb/s)' && has_line '$T/limits0.out' 'Allowed video:   up to 2.50 GiB'"
+( base_sel_state > /dev/null; crf_estimates_table ) > "$T/table.out"
+check "Base estimate table: header, every CRF estimated, GiB/h, Mb/s, vs limits" \
+    "has_line '$T/table.out' 'CRF   Video      GiB/h      Mb/s     vs limits' && has_line '$T/table.out' '19    2.60 GiB   1.30       3.10     OVER ceiling by 0.10 GiB' && has_line '$T/table.out' '20    2.01 GiB   1.01       2.40     BELOW floor by 0.08 GiB' && [[ \$(grep -c '^[0-9]' '$T/table.out') == 2 ]]"
+( base_sel_state crf_title_step_report ) > "$T/bsearch.out"
+check "Base boundary rows during the search (live progress kept)" \
+    "has_line '$T/bsearch.out' 'Boundary:' && has_line '$T/bsearch.out' '  CRF 19   2.60 GiB   1.30 GiB/h   3.10 Mb/s   OVER ceiling by 0.10 GiB' && has_line '$T/bsearch.out' '  CRF 20   2.01 GiB   1.01 GiB/h   2.40 Mb/s   BELOW floor by 0.08 GiB' && grep -q 'fits -> trying CRF 19' '$T/bsearch.out'"
+MB=([20]=2.7 [19]=3.1)
+( base_sel_state crf_title_step_report ) > "$T/bsearch2.out"
+check "Base boundary row inside both limits: OK" \
+    "has_line '$T/bsearch2.out' '  CRF 20   2.26 GiB   1.13 GiB/h   2.70 Mb/s   OK'"
+check "other tiers keep the two-line boundary block" \
+    "[[ \"\$( TIER=High; crf_title_step_report boundary 13 14 | tr '\n' '|' )\" == '|Boundary:|  CRF 13  over|  CRF 14  fits|' ]]"
+# High / Compact: ceiling only, no floor output
+for t in High Compact; do
+    (
+        EST_DUR=7200; CALLS=(); TIER=$t; DURATION=7200
+        crf_tier_load movie "$t" "" 7200
+        declare -A MB=()
+        k=1; [[ "$t" == High ]] && k=3
+        for c in $(seq 8 40); do MB[$c]=$(awk -v c="$c" -v k="$k" 'BEGIN { printf "%.3f", k * 8 * 0.85 ^ (c - 8) }'); done
+        crf_select_boundary "$CRF_START" "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" mb_est
+        crf_estimates_table
+    ) > "$T/table_$t.out"
+    check "$t estimate table: OVER / OK against its own ceiling, no floor output" \
+        "grep -q 'OVER ceiling by' '$T/table_$t.out' && grep -qE ' OK\$' '$T/table_$t.out' && ! grep -qi 'floor\\|BELOW' '$T/table_$t.out'"
+done
+# queued-item summary (compact output)
+( base_sel_state > /dev/null; CRF_EST[21]=$(mbps_bytes 3.1)
+  base_added_lines 1080p 21 1 "Dolby Vision preserved" "${CRF_EST[21]}" 6.53 10.09 ) > "$T/added.out"
+check "Base summary: CRF MANUAL, video GiB / GiB/h / Mb/s, Base range, over the ceiling" \
+    "has_line '$T/added.out' 'Base 1080p | CRF 21 MANUAL | Dolby Vision preserved' && has_line '$T/added.out' 'Video:       ~2.60 GiB   1.30 GiB/h   3.10 Mb/s' && has_line '$T/added.out' 'Base range:   2.10–2.50 GiB' && has_line '$T/added.out' '              +0.10 GiB over ceiling' && has_line '$T/added.out' 'Audio:        6.53 GiB copied' && has_line '$T/added.out' 'Total:       ~10.09 GiB'"
+( base_sel_state > /dev/null; base_added_lines 1920x800 20 0 SDR "$(mbps_bytes 2.7)" 1.2 3.6 ) > "$T/added2.out"
+check "Base summary, automatic CRF inside both limits: OK, no MANUAL" \
+    "has_line '$T/added2.out' 'Base 1920x800 | CRF 20 | SDR' && has_line '$T/added2.out' '              OK'"
+check "menu: estimate table for High / Base / Compact only, Base header and summary" \
+    "grep -qF 'crf_ceiling_tier \"\$TIER\" && crf_estimates_table' '$M' && grep -qF 'base_limits_lines' '$M' && grep -qF 'base_added_lines' '$M'"
+
+# ---- 3d. Base prompt when no CRF fits both limits (base_crf_prompt):
+# automatic CRF / adjacent higher-quality CRF (when already estimated) /
+# another CRF (estimated first) / skip
+# prompt_run INPUT [ESTIMATOR [DROP_ADJACENT]]  ->  "BASE_PICK/BASE_PICK_CRF/CRFs
+# newly estimated"; the screen in $T/prompt.out
 prompt_run() {
     (
-        EST_DUR=7200
-        CALLS=()
-        crf_tier_load movie Base "" 7200
-        crf_select_boundary "$CRF_START" "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" mb_est
-        crf_floor_extend "$CRF_FLOOR_BYTES" "$CRF_FLOOR_CRF_MIN" "$CRF_CEILING_BYTES"
-        CRF="$CRF_SELECTED"
-        DURATION=7200
-        SOURCE_VIDEO_MBPS=20.00
+        base_sel_state > /dev/null
+        [[ -n "${3:-}" && -n "$CRF_BOUNDARY_LOW" ]] && unset "CRF_EST[$CRF_BOUNDARY_LOW]"
         n=${#CALLS[@]}
         base_crf_prompt "${2:-mb_est}" < <(printf '%b' "$1") > "$T/prompt.out" 2>&1
         echo "$BASE_PICK/$BASE_PICK_CRF/${CALLS[*]:n}"
     )
 }
 shows()   { grep -qF -- "$1" "$T/prompt.out"; }
-shows_x() { grep -qxF -- "$1" "$T/prompt.out"; }
+shows_x() { has_line "$T/prompt.out" "$1"; }
 # gap at 2 h: CRF 20 = 2.4 Mb/s (below the floor), 19 = 3.1 (above the
 # 2.98 Mb/s ceiling); extra CRFs for the manual choices
 MB=([20]=2.4 [19]=3.1 [22]=2.0 [21]=2.6 [16]=2.7)
-eq    "prompt: 1 = automatic CRF anyway" "$(prompt_run '1\n')" "auto/20/"
-check "prompt: three choices, gap explained" \
-    "shows_x '1) Encode at CRF 20 anyway (below the floor)' && shows_x '2) Adjust CRF manually' && shows_x '3) Skip this movie' && shows 'CRF 19, the next higher quality, is estimated above the 2.50 GiB ceiling.'"
-eq    "prompt: 3 = skip"                  "$(prompt_run '3\n')" "skip/20/"
+eq    "prompt: 1 = automatic CRF"         "$(prompt_run '1\n')" "auto/20/"
+check "  screen: gap message, closest choices, automatic choice, ceiling rule" \
+    "shows_x 'Base cannot satisfy both limits' && shows_x 'No tested CRF satisfies both Base limits.' && shows_x 'Closest choices:' && shows_x '  CRF 19   +0.10 GiB above ceiling        higher quality' && shows_x '  CRF 20   -0.08 GiB below floor          smaller file' && shows_x 'Automatic choice: CRF 20' && shows '1.25 GiB/h defines the Base ceiling, an upper limit; no CRF is aimed at that rate.'"
+check "  screen: side-by-side grid" \
+    "shows_x '                    CRF 19             CRF 20' && shows_x 'Video               2.60 GiB           2.01 GiB' && shows_x 'Rate                1.30 GiB/h         1.01 GiB/h' && shows_x 'Bitrate             3.10 Mb/s          2.40 Mb/s' && shows_x 'Ceiling             +0.10 GiB OVER     0.49 GiB under' && shows_x 'Floor               above              -0.08 GiB BELOW' && shows_x 'Quality             higher             lower'"
+check "  screen: four choices, adjacent CRF offered directly" \
+    "shows_x '1) Encode CRF 20  [automatic, below floor by 0.08 GiB]' && shows_x '2) Encode CRF 19  [higher quality, 0.10 GiB over ceiling]' && shows_x '3) Choose another CRF' && shows_x '4) Skip'"
+eq    "prompt: 2 = adjacent higher-quality CRF 19 (already estimated, nothing estimated)" "$(prompt_run '2\n')" "manual/19/"
+eq    "prompt: 4 = skip"                  "$(prompt_run '4\n')" "skip/20/"
 eq    "prompt: invalid choice asked again" "$(prompt_run '9\n1\n')" "auto/20/"
-check "prompt: invalid choice message"    "shows_x 'Invalid selection.'"
+check "  invalid choice message"          "shows_x 'Invalid selection.'"
 eq    "prompt: end of input = skip"       "$(prompt_run '')" "skip/20/"
-eq    "manual CRF inside 18-29, not estimated yet -> estimated, below the floor" "$(prompt_run '2\n22\n1\n')" "manual/22/22"
-check "  screen: estimate, bitrate, limits, floor warning, 'anyway'" \
-    "shows 'Estimating CRF 22 (sample encodes only)...' && shows_x 'Manual Base CRF:   22' && shows_x 'Estimated video:   1.68 GiB' && shows_x 'Estimated bitrate: 2.00 Mb/s' && shows_x 'Base ceiling:      2.50 GiB' && shows_x 'Base floor:        2.5 Mb/s' && shows 'estimated bitrate is below the 2.5 Mb/s Base floor.' && ! shows 'exceeds the Base ceiling' && shows_x '1) Encode at CRF 22 anyway' && shows_x '2) Choose another CRF'"
-eq    "manual CRF already estimated (19): not estimated again, above the ceiling" "$(prompt_run '2\n19\n1\n')" "manual/19/"
-check "  screen: cached estimate shown, ceiling warning" \
-    "shows_x 'Estimated video:   2.60 GiB (already estimated)' && ! shows 'Estimating CRF 19' && shows 'estimated video exceeds the Base ceiling by 0.10 GiB.' && ! shows 'below the 2.5 Mb/s Base floor'"
-eq    "manual CRF inside both limits (21): normal confirmation" "$(prompt_run '2\n21\n1\n')" "manual/21/21"
-check "  screen: no warning, no 'anyway'" \
-    "shows_x '1) Encode at CRF 21' && ! shows 'WARNING: estimated'"
-eq    "manual CRF outside 18-29 (16) accepted, inside both limits" "$(prompt_run '2\n16\n1\n')" "manual/16/16"
-eq    "invalid CRFs (52, abc, -1, 2.5) asked again" "$(prompt_run '2\n52\nabc\n-1\n2.5\n21\n1\n')" "manual/21/21"
+eq    "choose another: CRF 22, not estimated yet -> estimated, below the floor" "$(prompt_run '3\n22\n1\n')" "manual/22/22"
+check "  screen: manual figures, limits, result, floor warning, 'anyway'" \
+    "shows 'Estimating CRF 22 (sample encodes only)...' && shows_x 'Manual Base CRF: 22' && shows_x 'Estimated video: 1.68 GiB' && shows_x 'Rate:            0.84 GiB/h' && shows_x 'Bitrate:         2.00 Mb/s' && shows_x 'Base limits:' && shows_x '  Ceiling:       2.50 GiB / 2.98 Mb/s' && shows_x '  Floor:         2.10 GiB / 2.50 Mb/s' && shows_x 'Result:' && shows_x '  Ceiling:       OK (0.82 GiB under)' && shows_x '  Floor:         -0.42 GiB BELOW' && shows 'estimated bitrate is below the 2.5 Mb/s Base floor.' && shows_x '1) Encode at CRF 22 anyway' && shows_x '2) Choose another CRF'"
+eq    "choose another: CRF 19 already estimated, above the ceiling" "$(prompt_run '3\n19\n1\n')" "manual/19/"
+check "  screen: cached estimate, ceiling OVER, floor OK" \
+    "shows_x 'Estimated video: 2.60 GiB (already estimated)' && ! shows 'Estimating CRF 19' && shows_x '  Ceiling:       +0.10 GiB OVER' && shows_x '  Floor:         OK' && shows 'estimated video exceeds the Base ceiling by 0.10 GiB.'"
+eq    "choose another: CRF 21 inside both limits" "$(prompt_run '3\n21\n1\n')" "manual/21/21"
+check "  screen: no warning, no 'anyway'" "shows_x '1) Encode at CRF 21' && ! shows 'WARNING: estimated'"
+eq    "choose another: CRF 16, outside 18-29, inside both limits" "$(prompt_run '3\n16\n1\n')" "manual/16/16"
+eq    "invalid CRFs (52, abc, -1, 2.5) asked again" "$(prompt_run '3\n52\nabc\n-1\n2.5\n21\n1\n')" "manual/21/21"
 eq    "  4 x 'Enter a whole x265 CRF from 0 to 51'" "$(grep -c 'Enter a whole x265 CRF from 0 to 51' "$T/prompt.out")" "4"
-eq    "empty CRF = the automatic CRF (20, already estimated)" "$(prompt_run '2\n\n1\n')" "manual/20/"
-eq    "choose another CRF: 19 (over) -> 2 -> 21" "$(prompt_run '2\n19\n2\n21\n1\n')" "manual/21/21"
-check "  screen: both CRFs shown" "shows_x 'Manual Base CRF:   19' && shows_x 'Manual Base CRF:   21'"
-eq    "skip from the manual CRF screen"   "$(prompt_run '2\n22\n3\n')" "skip/20/22"
+eq    "empty CRF = the automatic CRF (already estimated)" "$(prompt_run '3\n\n1\n')" "manual/20/"
+eq    "manual screen: choose another CRF (19 -> 21)" "$(prompt_run '3\n19\n2\n21\n1\n')" "manual/21/21"
+eq    "manual screen: skip"               "$(prompt_run '3\n22\n3\n')" "skip/20/22"
 fail_est() { [[ "$1" == 40 ]] && return 1; mb_est "$1"; }
-eq    "estimate failure: asked again"     "$(prompt_run '2\n40\n21\n1\n' fail_est)" "manual/21/21"
-check "  screen: failure named"           "shows 'Could not estimate CRF 40'"
+eq    "estimate failure: asked again"     "$(prompt_run '3\n40\n21\n1\n' fail_est)" "manual/21/21"
+check "  failure named"                   "shows 'Could not estimate CRF 40'"
+# the adjacent CRF without an estimate: not offered, not estimated
+eq    "adjacent CRF not estimated: three choices, 2 = choose another" "$(prompt_run '2\n21\n1\n' mb_est drop)" "manual/21/21"
+check "  screen: no direct adjacent option, single column" \
+    "! shows 'Encode CRF 19' && shows_x '2) Choose another CRF' && shows_x '3) Skip' && shows_x '                    CRF 20' && ! shows 'Quality '"
+eq    "  3 = skip"                        "$(prompt_run '3\n' mb_est drop)" "skip/20/"
+# floor CRF limit reached: no adjacent CRF
+MB=([20]=1.1 [19]=1.2 [18]=1.4 [17]=1.65 [16]=1.95 [15]=2.2 [14]=2.4)
+eq    "floor limit (CRF 14 still below): automatic CRF 14" "$(prompt_run '1\n')" "auto/14/"
+check "  screen: lowest CRF the floor may use, three choices" \
+    "shows_x '  CRF 14   -0.08 GiB below floor          lowest CRF the floor may use' && shows_x '2) Choose another CRF' && ! shows 'Encode CRF 13'"
+# even CRF_MAX above the ceiling
 MB=([20]=4 [21]=3.8 [22]=3.6 [23]=3.5 [24]=3.4 [25]=3.3 [26]=3.2 [27]=3.1 [28]=3.05 [29]=3.0 [30]=2.9)
 eq    "over the ceiling even at CRF_MAX: same prompt, automatic CRF 29" "$(prompt_run '1\n')" "auto/29/"
-check "  screen: ceiling reason, 'above the ceiling'" \
-    "shows 'the 2.50 GiB video ceiling cannot be met within the' && shows_x '1) Encode at CRF 29 anyway (above the ceiling)'"
-eq    "  manual CRF 30 (above CRF_MAX) inside both limits" "$(prompt_run '2\n30\n1\n')" "manual/30/30"
+check "  screen: ceiling reason" \
+    "shows_x 'Base cannot meet its video ceiling within CRF 18-29' && shows_x 'No CRF in the Base range (18-29) fits the video ceiling.' && shows_x '1) Encode CRF 29  [automatic, 0.01 GiB over ceiling]'"
+eq    "  choose another: CRF 30 (above CRF_MAX) inside both limits" "$(prompt_run '2\n30\n1\n')" "manual/30/30"
 # menu wiring: Base only; High / Compact keep their over-ceiling prompt
 check "menu: Base uses base_crf_prompt (floor gap / limit and over the ceiling)" \
     "grep -qF 'base_crf_prompt crf_title_estimate_actual' '$M' && grep -qF '{ (( CRF_OVER_CEILING == 1 )) || [[ \"\$CRF_FLOOR_STATUS\" == gap || \"\$CRF_FLOOR_STATUS\" == limit ]]; }; then' '$M'"

@@ -440,11 +440,18 @@ while true; do
         if ui_verbose; then
             printf "Estimating video size from sample encodes (%sx%s output%s):\n" \
                 "$OUT_WIDTH" "$OUT_HEIGHT" "$( (( DOWNSCALED == 1 )) && echo ", downscaled like the final encode")"
+        elif [[ "$TIER" == Base ]]; then
+            printf 'Estimating Base — %sx%s\n' "$OUT_WIDTH" "$OUT_HEIGHT"
+            echo "$CRF_RULE2"
         else
             printf 'Estimating %s at %sx%s...\n' \
                 "$( [[ "$TIER" == "Custom" ]] && echo "CRF $CUSTOM_CRF" || echo "$TIER")" "$OUT_WIDTH" "$OUT_HEIGHT"
         fi
-        if crf_ceiling_tier "$TIER"; then
+        if [[ "$TIER" == Base ]]; then
+            # runtime, rate, ceiling, floor and the allowed video range
+            base_limits_lines
+            echo
+        elif crf_ceiling_tier "$TIER"; then
             printf '%-16s%s\n' "Runtime:" "$(format_hms "$DURATION")"
             printf '%-16s%s GiB/hour\n' "Size rate:" "$CRF_GIB_PER_HOUR"
             printf '%-16s%s GiB\n' "Video ceiling:" "$CRF_CEILING_GIB"
@@ -488,6 +495,10 @@ while true; do
             skip_movie && continue
             break
         fi
+
+        # High / Base / Compact: the estimates side by side (output only;
+        # the CRFs estimated by the search, nothing estimated for it)
+        crf_ceiling_tier "$TIER" && crf_estimates_table
 
         CRF="$CRF_SELECTED"
         EST_VIDEO_BYTES="${CRF_EST[$CRF]}"
@@ -844,32 +855,46 @@ while true; do
 
         echo
         echo "Added: $BASENAME"
-        printf '  %s | %s | %sx%s | %s | audio copied%s\n' "$TIER" "$VIDEO_TEXT" \
-            "$OUT_WIDTH" "$OUT_HEIGHT" "$(hdr_policy_short)" \
-            "$( [[ "$VIDEO_SPEC" == crf:* ]] && (( ${CRF_OVER_CEILING:-0} == 1 )) && echo " | $(ui_warn "ceiling not met")")"
-        printf '  %-8s%s -> ~%s GiB  (video ~%s, audio %s)\n' "Size:" "$SOURCE_TOTAL_GIB" \
-            "$(awk -v t="$EXPECTED_TOTAL_GIB" 'BEGIN { printf "%.2f", t }')" "$EXPECTED_VIDEO_GIB" "$SOURCE_AUDIO_GIB"
-        if [[ "$VIDEO_SPEC" == crf:* ]] && crf_ceiling_tier "$TIER"; then
-            printf '  %-8s%s GiB video  (%s GiB/h x %s)\n' "Ceiling:" "$CRF_CEILING_GIB" \
-                "$CRF_GIB_PER_HOUR" "$(format_hms "$DURATION")"
-            printf '  %-8sCRF %s-%s, video <= %s Mb/s average\n' "Limits:" "$CRF_MIN" "$CRF_MAX" \
-                "$(bytes_to_mbps "$CRF_CEILING_BYTES" "$DURATION")"
-            if [[ "$TIER" == Base ]] && (( FLOOR_EXEMPT == 1 )); then
-                printf '  %-8s%s Mb/s not applied (source video %s Mb/s)\n' "Floor:" "$CRF_FLOOR_MBPS" "$SOURCE_VIDEO_MBPS"
-            elif [[ "$TIER" == Base ]] && (( ${CRF_FLOOR_BYTES:-0} > 0 )); then
-                printf '  %-8s>= %s Mb/s video%s\n' "Floor:" "$CRF_FLOOR_MBPS" \
-                    "$(crf_below_floor "$EST_VIDEO_BYTES" "$CRF_FLOOR_BYTES" && echo " | $(ui_warn "estimate below the floor")")"
+        if [[ "$TIER" == Base && "$VIDEO_SPEC" == crf:* ]]; then
+            # Base: CRF (MANUAL), video with GiB/h and Mb/s, the Base range
+            base_added_lines \
+                "$( (( DOWNSCALED == 1 )) && echo 1080p || echo "${OUT_WIDTH}x${OUT_HEIGHT}")" \
+                "$CRF" "${BASE_MANUAL:-0}" "$(hdr_policy_short)" "$EST_VIDEO_BYTES" \
+                "$SOURCE_AUDIO_GIB" "$EXPECTED_TOTAL_GIB"
+            while IFS= read -r note; do
+                [[ "$note" =~ LOST|DROPPED|WARNING|cannot|skipped|missing ]] &&
+                    printf '%s %s\n' "$(ui_warn "Note:")" "$note"
+            done < <(printf '%s\n' "${MAP_NOTES[@]+"${MAP_NOTES[@]}"}"; chapter_notes "$IN")
+            printf '%-14s%s%s\n' "Output:" "$(basename "$OUT")" \
+                "$( (( RESOLVED_OVERWRITE == 1 )) && echo "  [overwrites existing]")"
+        else
+            printf '  %s | %s | %sx%s | %s | audio copied%s\n' "$TIER" "$VIDEO_TEXT" \
+                "$OUT_WIDTH" "$OUT_HEIGHT" "$(hdr_policy_short)" \
+                "$( [[ "$VIDEO_SPEC" == crf:* ]] && (( ${CRF_OVER_CEILING:-0} == 1 )) && echo " | $(ui_warn "ceiling not met")")"
+            printf '  %-8s%s -> ~%s GiB  (video ~%s, audio %s)\n' "Size:" "$SOURCE_TOTAL_GIB" \
+                "$(awk -v t="$EXPECTED_TOTAL_GIB" 'BEGIN { printf "%.2f", t }')" "$EXPECTED_VIDEO_GIB" "$SOURCE_AUDIO_GIB"
+            if [[ "$VIDEO_SPEC" == crf:* ]] && crf_ceiling_tier "$TIER"; then
+                printf '  %-8s%s GiB video  (%s GiB/h x %s)\n' "Ceiling:" "$CRF_CEILING_GIB" \
+                    "$CRF_GIB_PER_HOUR" "$(format_hms "$DURATION")"
+                printf '  %-8sCRF %s-%s, video <= %s Mb/s average\n' "Limits:" "$CRF_MIN" "$CRF_MAX" \
+                    "$(bytes_to_mbps "$CRF_CEILING_BYTES" "$DURATION")"
+                if [[ "$TIER" == Base ]] && (( FLOOR_EXEMPT == 1 )); then
+                    printf '  %-8s%s Mb/s not applied (source video %s Mb/s)\n' "Floor:" "$CRF_FLOOR_MBPS" "$SOURCE_VIDEO_MBPS"
+                elif [[ "$TIER" == Base ]] && (( ${CRF_FLOOR_BYTES:-0} > 0 )); then
+                    printf '  %-8s>= %s Mb/s video%s\n' "Floor:" "$CRF_FLOOR_MBPS" \
+                        "$(crf_below_floor "$EST_VIDEO_BYTES" "$CRF_FLOOR_BYTES" && echo " | $(ui_warn "estimate below the floor")")"
+                fi
             fi
+
+            # only what is lost or dropped (COMPRESS_VERBOSE=1 lists every note)
+            while IFS= read -r note; do
+                [[ "$note" =~ LOST|DROPPED|WARNING|cannot|skipped|missing ]] &&
+                    printf '  %s %s\n' "$(ui_warn "Note:")" "$note"
+            done < <(printf '%s\n' "${MAP_NOTES[@]+"${MAP_NOTES[@]}"}"; chapter_notes "$IN")
+
+            printf '  %-8s%s%s\n' "Output:" "$(basename "$OUT")" \
+                "$( (( RESOLVED_OVERWRITE == 1 )) && echo "  [overwrites existing]")"
         fi
-
-        # only what is lost or dropped (COMPRESS_VERBOSE=1 lists every note)
-        while IFS= read -r note; do
-            [[ "$note" =~ LOST|DROPPED|WARNING|cannot|skipped|missing ]] &&
-                printf '  %s %s\n' "$(ui_warn "Note:")" "$note"
-        done < <(printf '%s\n' "${MAP_NOTES[@]+"${MAP_NOTES[@]}"}"; chapter_notes "$IN")
-
-        printf '  %-8s%s%s\n' "Output:" "$(basename "$OUT")" \
-            "$( (( RESOLVED_OVERWRITE == 1 )) && echo "  [overwrites existing]")"
         echo
     fi
 

@@ -1000,7 +1000,13 @@ crf_title_step_report() {
     crf_step_skips "$@" || return 0
     if [[ "$1" == boundary ]]; then
         echo
-        crf_boundary_lines "$2" "$3"
+        # movie Base: both CRFs with their figures (crf_compare_boundary_lines)
+        if [[ "${TIER:-}" == Base && "${DURATION:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+           (( ${CRF_CEILING_BYTES:-0} > 0 )); then
+            crf_compare_boundary_lines "$2" "$3"
+        else
+            crf_boundary_lines "$2" "$3"
+        fi
     else
         printf '           %s\n' "$(crf_step_result "$@")"
     fi
@@ -1017,6 +1023,120 @@ crf_episode_step_report() {
 }
 
 # ------------------------------------------------------------
+# CRF estimate comparison (movie High / Base / Compact; output only)
+#
+# Every figure comes from the estimates already in CRF_EST (sample
+# encodes or cached actual results): nothing here estimates a CRF. Read
+# CRF_CEILING_BYTES, CRF_FLOOR_BYTES (movie Base after the source
+# exemption; 0 = no floor: High / Compact / exempt) and DURATION.
+# ------------------------------------------------------------
+
+CRF_RULE="------------------------------------------------------------"
+CRF_RULE2="============================================================"
+
+# crf_limit_text VIDEO_BYTES  ->  "OK" | "OVER ceiling by 0.31 GiB" |
+# "BELOW floor by 0.07 GiB" (no floor: never BELOW)
+crf_limit_text() {
+    crf_limit_check "$1" "$CRF_CEILING_BYTES" "${CRF_FLOOR_BYTES:-0}"
+    case "$CRF_LIMIT_KIND" in
+        over)  printf 'OVER ceiling by %s GiB' "$CRF_LIMIT_GIB" ;;
+        below) printf 'BELOW floor by %s GiB' "$CRF_LIMIT_GIB" ;;
+        *)     printf 'OK' ;;
+    esac
+}
+
+# crf_compare_row CRF  ->  one table row: CRF, video GiB, GiB/h, Mb/s,
+# status against the limits
+crf_compare_row() {
+    local e="${CRF_EST[$1]}"
+    printf '%-5s %-10s %-10s %-8s %s\n' "$1" "$(bytes_to_gib "$e") GiB" \
+        "$(video_gib_per_hour "$e" "$DURATION")" "$(bytes_to_mbps "$e" "$DURATION")" "$(crf_limit_text "$e")"
+}
+
+# crf_estimates_table  ->  every CRF estimated (CRF_TRIED), lowest first
+crf_estimates_table() {
+    local c
+
+    echo
+    echo "CRF estimates"
+    echo "$CRF_RULE"
+    printf '%-5s %-10s %-10s %-8s %s\n' CRF Video GiB/h Mb/s "vs limits"
+    for c in $(printf '%s\n' "${CRF_TRIED[@]}" | sort -n); do
+        crf_compare_row "$c"
+    done
+    echo "$CRF_RULE"
+}
+
+# crf_compare_boundary_lines LO HI  ->  the Boundary block with the
+# figures of both CRFs (movie Base; other tiers: crf_boundary_lines)
+crf_compare_boundary_lines() {
+    local c e
+
+    echo "Boundary:"
+    for c in "$1" "$2"; do
+        e="${CRF_EST[$c]}"
+        printf '  CRF %-4s %-10s %-12s %-11s %s\n' "$c" "$(bytes_to_gib "$e") GiB" \
+            "$(video_gib_per_hour "$e" "$DURATION") GiB/h" "$(bytes_to_mbps "$e" "$DURATION") Mb/s" "$(crf_limit_text "$e")"
+    done
+}
+
+# base_limits_lines  ->  the movie Base limits for this movie (before the
+# estimates): runtime, rate, ceiling, floor, allowed video range
+base_limits_lines() {
+    printf '%-17s%s\n' "Runtime:" "$(format_hms "$DURATION")"
+    printf '%-17s%s GiB/h (defines the video ceiling)\n' "Base rate:" "$CRF_GIB_PER_HOUR"
+    printf '%-17s%s GiB / %s Mb/s\n' "Video ceiling:" "$(bytes_to_gib "$CRF_CEILING_BYTES")" \
+        "$(bytes_to_mbps "$CRF_CEILING_BYTES" "$DURATION")"
+    if (( ${CRF_FLOOR_BYTES:-0} > 0 )); then
+        printf '%-17s%s GiB / %s Mb/s\n' "Video floor:" "$(bytes_to_gib "$CRF_FLOOR_BYTES")" \
+            "$(bytes_to_mbps "$CRF_FLOOR_BYTES" "$DURATION")"
+        printf '%-17s%s–%s GiB\n' "Allowed video:" "$(bytes_to_gib "$CRF_FLOOR_BYTES")" "$(bytes_to_gib "$CRF_CEILING_BYTES")"
+    else
+        printf '%-17snot applied (source video %s Mb/s is below %s Mb/s)\n' "Video floor:" \
+            "${SOURCE_VIDEO_MBPS:-N/A}" "${CRF_FLOOR_MBPS:-?}"
+        printf '%-17sup to %s GiB\n' "Allowed video:" "$(bytes_to_gib "$CRF_CEILING_BYTES")"
+    fi
+}
+
+# base_range_text VIDEO_BYTES  ->  the second Base range line of the
+# queued-item summary: "OK" | "+0.31 GiB over ceiling" | "-0.07 GiB
+# below floor"
+base_range_text() {
+    crf_limit_check "$1" "$CRF_CEILING_BYTES" "${CRF_FLOOR_BYTES:-0}"
+    case "$CRF_LIMIT_KIND" in
+        over)  printf '+%s GiB over ceiling' "$CRF_LIMIT_GIB" ;;
+        below) printf -- '-%s GiB below floor' "$CRF_LIMIT_GIB" ;;
+        *)     printf 'OK' ;;
+    esac
+}
+
+# base_added_lines RES_LABEL CRF MANUAL HDR_TEXT EST_VIDEO_BYTES AUDIO_GIB TOTAL_GIB
+#   ->  the queued-item summary of a movie Base CRF encode (compact
+#       output; the menu prints the notes and the output name after it):
+#       tier / resolution / CRF (MANUAL: a manual CRF) / HDR, video with
+#       GiB/h and Mb/s, the Base range and where the estimate is in it,
+#       audio, total
+base_added_lines() {
+    local res="$1" crf="$2" manual="$3" hdr="$4" e="$5" audio="$6" total="$7"
+
+    echo
+    printf 'Base %s | %s | %s\n' "$res" "$(ui_bold "CRF $crf$( [[ "$manual" == 1 ]] && echo " MANUAL")")" "$hdr"
+    echo
+    printf '%-13s~%s GiB   %s GiB/h   %s Mb/s\n' "Video:" "$(bytes_to_gib "$e")" \
+        "$(video_gib_per_hour "$e" "$DURATION")" "$(bytes_to_mbps "$e" "$DURATION")"
+    if (( ${CRF_FLOOR_BYTES:-0} > 0 )); then
+        printf '%-14s%s–%s GiB\n' "Base range:" "$(bytes_to_gib "$CRF_FLOOR_BYTES")" "$(bytes_to_gib "$CRF_CEILING_BYTES")"
+    else
+        printf '%-14sup to %s GiB (floor not applied: source video %s Mb/s)\n' "Base range:" \
+            "$(bytes_to_gib "$CRF_CEILING_BYTES")" "${SOURCE_VIDEO_MBPS:-N/A}"
+    fi
+    printf '%-14s%s\n' "" "$(base_range_text "$e")"
+    echo
+    printf '%-14s%s GiB copied\n' "Audio:" "$audio"
+    printf '%-13s~%s GiB\n' "Total:" "$(awk -v t="$total" 'BEGIN { printf "%.2f", t }')"
+}
+
+# ------------------------------------------------------------
 # Movie Base: no CRF inside both limits (prompt)
 # ------------------------------------------------------------
 
@@ -1025,65 +1145,172 @@ crf_episode_step_report() {
 # Movie Base, when the search found no CRF that fits the ceiling AND
 # reaches the video floor: CRF_FLOOR_STATUS gap / limit (policy.sh
 # crf_floor_extend) or CRF_OVER_CEILING=1 (even CRF_MAX above the
-# ceiling). Warns, then asks:
-#   1) encode at the automatic CRF (CRF) anyway
-#   2) adjust the CRF manually: a whole x265 CRF 0-51 (not limited to
-#      the Base search range; empty = the automatic CRF), estimated with
+# ceiling). Shows the closest choices side by side, then asks:
+#   1) encode the automatic CRF (CRF) anyway
+#   2) encode the adjacent higher-quality CRF (gap: CRF_BOUNDARY_LOW,
+#      above the ceiling), only when it already has an estimate in
+#      CRF_EST (never estimated for this menu); a Base manual CRF
+#   n) choose another CRF: a whole x265 CRF 0-51 (not limited to the
+#      Base search range; empty = the automatic CRF), estimated with
 #      ESTIMATOR through the search's CRF_EST (a CRF already estimated is
 #      shown, not estimated again; sample encodes only, never the final
-#      encode), shown against the ceiling and the floor with a warning
-#      for each limit it misses, then: encode at it / choose another CRF
-#      / skip
-#   3) skip this movie
-# Reads CRF CRF_EST CRF_MAX CRF_OVER_CEILING CRF_FLOOR_STATUS
+#      encode), shown against the ceiling and the floor, then: encode at
+#      it / choose another CRF / skip
+#   n) skip this movie
+# Reads CRF CRF_EST CRF_MIN CRF_MAX CRF_OVER_CEILING CRF_FLOOR_STATUS
 # CRF_BOUNDARY_LOW CRF_CEILING_BYTES CRF_CEILING_GIB CRF_FLOOR_BYTES
-# CRF_FLOOR_MBPS DURATION SOURCE_VIDEO_MBPS. Sets BASE_PICK (auto |
-# manual | skip; end of input: skip) and BASE_PICK_CRF (the CRF to
-# encode). Always returns 0.
+# CRF_FLOOR_MBPS CRF_GIB_PER_HOUR DURATION SOURCE_VIDEO_MBPS. Sets
+# BASE_PICK (auto | manual | skip; end of input: skip) and BASE_PICK_CRF
+# (the CRF to encode). Always returns 0.
 base_crf_prompt() {
-    local est="$1" sel e
+    local est="$1" sel adj="" n_other n_skip auto_tag adj_tag
 
     BASE_PICK=""
     BASE_PICK_CRF="$CRF"
-    e="${CRF_EST[$CRF]:-}"
+    if [[ "${CRF_FLOOR_STATUS:-}" == gap && -n "${CRF_BOUNDARY_LOW:-}" && -n "${CRF_EST[$CRF_BOUNDARY_LOW]+x}" ]]; then
+        adj="$CRF_BOUNDARY_LOW"
+    fi
 
     echo
-    echo "------------------------------------------------------------"
     if (( ${CRF_OVER_CEILING:-0} == 1 )); then
-        echo "$(ui_warn WARNING): the ${CRF_CEILING_GIB} GiB video ceiling cannot be met within the"
-        echo "Base CRF range: even CRF ${CRF_MAX} (the lowest quality Base allows) is"
-        echo "estimated at ~$(bytes_to_gib "$e") GiB video, ~$(crf_oversize_gib "$e" "$CRF_CEILING_BYTES") GiB above the ceiling."
+        echo "Base cannot meet its video ceiling within CRF ${CRF_MIN}-${CRF_MAX}"
     else
-        echo "$(ui_warn WARNING): Base CRF ${CRF} is estimated at ~$(bytes_to_mbps "$e" "$DURATION") Mb/s (~$(bytes_to_gib "$e") GiB video),"
-        echo "below the ${CRF_FLOOR_MBPS} Mb/s Base video floor ($(bytes_to_gib "$CRF_FLOOR_BYTES") GiB; source video ${SOURCE_VIDEO_MBPS} Mb/s)."
-        if [[ "$CRF_FLOOR_STATUS" == gap ]]; then
-            echo "CRF ${CRF_BOUNDARY_LOW}, the next higher quality, is estimated above the ${CRF_CEILING_GIB} GiB ceiling."
-        else
-            echo "CRF ${CRF} is the lowest CRF the floor may use (MOVIE_BASE_FLOOR_CRF_MIN)."
-        fi
+        echo "Base cannot satisfy both limits"
     fi
-    echo "------------------------------------------------------------"
+    echo "$CRF_RULE2"
+    _base_gap_lines "$adj"
+    echo
+    _base_compare_grid $adj "$CRF"
+    echo "$CRF_RULE"
+
+    crf_limit_check "${CRF_EST[$CRF]}" "$CRF_CEILING_BYTES" "${CRF_FLOOR_BYTES:-0}"
+    case "$CRF_LIMIT_KIND" in
+        over)  auto_tag="automatic, ${CRF_LIMIT_GIB} GiB over ceiling" ;;
+        below) auto_tag="automatic, below floor by ${CRF_LIMIT_GIB} GiB" ;;
+        *)     auto_tag="automatic" ;;
+    esac
+    if [[ -n "$adj" ]]; then
+        crf_limit_check "${CRF_EST[$adj]}" "$CRF_CEILING_BYTES" "${CRF_FLOOR_BYTES:-0}"
+        adj_tag="higher quality"
+        [[ "$CRF_LIMIT_KIND" == over ]] && adj_tag+=", ${CRF_LIMIT_GIB} GiB over ceiling"
+        n_other=3
+        n_skip=4
+    else
+        n_other=2
+        n_skip=3
+    fi
 
     while true; do
         echo
-        if (( ${CRF_OVER_CEILING:-0} == 1 )); then
-            echo "1) Encode at CRF ${CRF} anyway (above the ceiling)"
-        else
-            echo "1) Encode at CRF ${CRF} anyway (below the floor)"
-        fi
-        echo "2) Adjust CRF manually"
-        echo "3) Skip this movie"
-        if ! read -rp "Select [1-3]: " sel; then
+        echo "1) Encode CRF ${CRF}  [${auto_tag}]"
+        [[ -n "$adj" ]] && echo "2) Encode CRF ${adj}  [${adj_tag}]"
+        echo "${n_other}) Choose another CRF"
+        echo "${n_skip}) Skip"
+        if ! read -rp "Select [1-${n_skip}]: " sel; then
             BASE_PICK=skip
             return 0
         fi
-        case "$sel" in
-            1) BASE_PICK=auto; return 0 ;;
-            2) _base_crf_manual "$est"; [[ -n "$BASE_PICK" ]] && return 0 ;;
-            3) BASE_PICK=skip; return 0 ;;
-            *) echo "Invalid selection." ;;
-        esac
+        if [[ "$sel" == 1 ]]; then
+            BASE_PICK=auto
+            return 0
+        elif [[ -n "$adj" && "$sel" == 2 ]]; then
+            BASE_PICK=manual
+            BASE_PICK_CRF="$adj"
+            return 0
+        elif [[ "$sel" == "$n_other" ]]; then
+            _base_crf_manual "$est"
+            [[ -n "$BASE_PICK" ]] && return 0
+        elif [[ "$sel" == "$n_skip" ]]; then
+            BASE_PICK=skip
+            return 0
+        else
+            echo "Invalid selection."
+        fi
     done
+}
+
+# _base_gap_lines [ADJACENT_CRF]  ->  why no CRF fits both limits, the
+# closest choices and the automatic choice (base_crf_prompt)
+_base_gap_lines() {
+    local adj="${1:-}" e
+
+    if (( ${CRF_OVER_CEILING:-0} == 1 )); then
+        echo "No CRF in the Base range (${CRF_MIN}-${CRF_MAX}) fits the video ceiling."
+    else
+        echo "No tested CRF satisfies both Base limits."
+    fi
+    echo
+    echo "Closest choices:"
+    if [[ -n "$adj" ]]; then
+        crf_limit_check "${CRF_EST[$adj]}" "$CRF_CEILING_BYTES" "${CRF_FLOOR_BYTES:-0}"
+        printf '  CRF %-4s %-26s %s\n' "$adj" "+${CRF_LIMIT_GIB} GiB above ceiling" "higher quality"
+    fi
+    e="${CRF_EST[$CRF]}"
+    crf_limit_check "$e" "$CRF_CEILING_BYTES" "${CRF_FLOOR_BYTES:-0}"
+    case "$CRF_LIMIT_KIND" in
+        over)  printf '  CRF %-4s %-26s %s\n' "$CRF" "+${CRF_LIMIT_GIB} GiB above ceiling" "lowest quality Base allows" ;;
+        below) printf '  CRF %-4s %-26s %s\n' "$CRF" "-${CRF_LIMIT_GIB} GiB below floor" \
+                   "$( [[ "${CRF_FLOOR_STATUS:-}" == limit ]] && echo "lowest CRF the floor may use" || echo "smaller file")" ;;
+        *)     printf '  CRF %-4s %s\n' "$CRF" "OK" ;;
+    esac
+    echo
+    echo "Automatic choice: CRF ${CRF}"
+    echo "(${CRF_GIB_PER_HOUR} GiB/h defines the Base ceiling, an upper limit; no CRF is aimed at that rate."
+    echo " Source video: ${SOURCE_VIDEO_MBPS:-N/A} Mb/s.)"
+}
+
+# _base_compare_grid CRF...  ->  the CRFs side by side: video, rate,
+# bitrate, ceiling, floor (when one applies), quality (two CRFs: the
+# lower CRF is the higher quality)
+_base_compare_grid() {
+    local c e line
+
+    line=$(printf '%-20s' "")
+    for c in "$@"; do line+=$(printf '%-19s' "CRF $c"); done
+    echo "${line%"${line##*[! ]}"}"
+
+    _base_grid_row "Video"   "$@"
+    _base_grid_row "Rate"    "$@"
+    _base_grid_row "Bitrate" "$@"
+    _base_grid_row "Ceiling" "$@"
+    (( ${CRF_FLOOR_BYTES:-0} > 0 )) && _base_grid_row "Floor" "$@"
+    if (( $# == 2 )); then
+        printf '%-20s%-19s%s\n' "Quality" "higher" "lower"
+    fi
+    return 0
+}
+
+# _base_grid_row LABEL CRF...  ->  one row of _base_compare_grid
+_base_grid_row() {
+    local label="$1" c e v line
+    shift
+
+    line=$(printf '%-20s' "$label")
+    for c in "$@"; do
+        e="${CRF_EST[$c]}"
+        case "$label" in
+            Video)   v="$(bytes_to_gib "$e") GiB" ;;
+            Rate)    v="$(video_gib_per_hour "$e" "$DURATION") GiB/h" ;;
+            Bitrate) v="$(bytes_to_mbps "$e" "$DURATION") Mb/s" ;;
+            Ceiling)
+                crf_limit_check "$e" "$CRF_CEILING_BYTES" 0
+                if [[ "$CRF_LIMIT_KIND" == over ]]; then
+                    v="+${CRF_LIMIT_GIB} GiB OVER"
+                else
+                    v="${CRF_LIMIT_ROOM} GiB under"
+                fi
+                ;;
+            Floor)
+                if (( e < CRF_FLOOR_BYTES )); then
+                    v="-$(awk -v a="$e" -v b="$CRF_FLOOR_BYTES" 'BEGIN { printf "%.2f", (b - a) / 1073741824 }') GiB BELOW"
+                else
+                    v="above"
+                fi
+                ;;
+        esac
+        line+=$(printf '%-19s' "$v")
+    done
+    echo "${line%"${line##*[! ]}"}"
 }
 
 # _base_crf_manual ESTIMATOR  ->  the manual CRF loop of base_crf_prompt:
@@ -1117,20 +1344,39 @@ _base_crf_manual() {
             e="$CRF_EST_RESULT"
         fi
 
+        crf_limit_check "$e" "$CRF_CEILING_BYTES" 0
         over=0
+        [[ "$CRF_LIMIT_KIND" == over ]] && over=1
         below=0
-        (( e > CRF_CEILING_BYTES )) && over=1
         crf_below_floor "$e" "$CRF_FLOOR_BYTES" && below=1
 
         echo
-        printf 'Manual Base CRF:   %s\n' "$m"
-        printf 'Estimated video:   %s GiB%s\n' "$(bytes_to_gib "$e")" "$( (( cached )) && echo " (already estimated)")"
-        printf 'Estimated bitrate: %s Mb/s\n' "$(bytes_to_mbps "$e" "$DURATION")"
-        printf 'Base ceiling:      %s GiB\n' "$CRF_CEILING_GIB"
-        if [[ "${CRF_FLOOR_BYTES:-0}" =~ ^[0-9]+$ ]] && (( CRF_FLOOR_BYTES > 0 )); then
-            printf 'Base floor:        %s Mb/s\n' "$CRF_FLOOR_MBPS"
+        printf '%-17s%s\n' "Manual Base CRF:" "$m"
+        printf '%-17s%s GiB%s\n' "Estimated video:" "$(bytes_to_gib "$e")" "$( (( cached )) && echo " (already estimated)")"
+        printf '%-17s%s GiB/h\n' "Rate:" "$(video_gib_per_hour "$e" "$DURATION")"
+        printf '%-17s%s Mb/s\n' "Bitrate:" "$(bytes_to_mbps "$e" "$DURATION")"
+        echo
+        echo "Base limits:"
+        printf '  %-15s%s GiB / %s Mb/s\n' "Ceiling:" "$CRF_CEILING_GIB" "$(bytes_to_mbps "$CRF_CEILING_BYTES" "$DURATION")"
+        if (( ${CRF_FLOOR_BYTES:-0} > 0 )); then
+            printf '  %-15s%s GiB / %s Mb/s\n' "Floor:" "$(bytes_to_gib "$CRF_FLOOR_BYTES")" "$(bytes_to_mbps "$CRF_FLOOR_BYTES" "$DURATION")"
         else
-            printf 'Base floor:        not applied (source video %s Mb/s)\n' "$SOURCE_VIDEO_MBPS"
+            printf '  %-15snot applied (source video %s Mb/s)\n' "Floor:" "${SOURCE_VIDEO_MBPS:-N/A}"
+        fi
+        echo
+        echo "Result:"
+        if (( over )); then
+            printf '  %-15s+%s GiB OVER\n' "Ceiling:" "$CRF_LIMIT_GIB"
+        else
+            printf '  %-15sOK (%s GiB under)\n' "Ceiling:" "$CRF_LIMIT_ROOM"
+        fi
+        if (( ${CRF_FLOOR_BYTES:-0} > 0 )); then
+            if (( below )); then
+                printf '  %-15s-%s GiB BELOW\n' "Floor:" \
+                    "$(awk -v a="$e" -v b="$CRF_FLOOR_BYTES" 'BEGIN { printf "%.2f", (b - a) / 1073741824 }')"
+            else
+                printf '  %-15sOK\n' "Floor:"
+            fi
         fi
         if (( over )); then
             echo

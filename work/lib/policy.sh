@@ -533,6 +533,39 @@ gib_per_hour_mbps() {
     awk -v r="$1" 'BEGIN { printf "%.3f", r * 1073741824 * 8 / 3600 / 1000000 }'
 }
 
+# video_gib_per_hour VIDEO_BYTES DURATION_SECONDS  ->  "1.38": the video
+# size per hour of runtime (GiB / runtime hours); "N/A" when unknown
+video_gib_per_hour() {
+    [[ "${1:-}" =~ ^[0-9]+$ && "${2:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] || { printf 'N/A'; return; }
+    awk -v b="$1" -v d="$2" 'BEGIN {
+        if (d > 0) printf "%.2f", b / 1073741824 / (d / 3600); else printf "N/A" }'
+}
+
+# crf_limit_check VIDEO_BYTES CEILING_BYTES [FLOOR_BYTES]  ->  sets
+# CRF_LIMIT_KIND: over (above the ceiling) | below (under the floor;
+# FLOOR_BYTES 0 / empty = none) | ok, CRF_LIMIT_GIB: the distance to the
+# limit missed ("0.31"; ok: "") and CRF_LIMIT_ROOM: the distance below
+# the ceiling ("0.57"; over: "")
+crf_limit_check() {
+    local e="$1" c="$2" f="${3:-0}"
+
+    [[ "$f" =~ ^[0-9]+$ ]] || f=0
+    CRF_LIMIT_KIND=ok
+    CRF_LIMIT_GIB=""
+    CRF_LIMIT_ROOM=""
+    if (( e > c )); then
+        CRF_LIMIT_KIND=over
+        CRF_LIMIT_GIB=$(awk -v a="$e" -v b="$c" 'BEGIN { printf "%.2f", (a - b) / 1073741824 }')
+        return 0
+    fi
+    CRF_LIMIT_ROOM=$(awk -v a="$e" -v b="$c" 'BEGIN { printf "%.2f", (b - a) / 1073741824 }')
+    if (( f > 0 && e < f )); then
+        CRF_LIMIT_KIND=below
+        CRF_LIMIT_GIB=$(awk -v a="$e" -v b="$f" 'BEGIN { printf "%.2f", (b - a) / 1073741824 }')
+    fi
+    return 0
+}
+
 # movie_floor_bytes FLOOR_MBPS DURATION_SECONDS  ->  whole bytes
 #
 # The movie Base video floor: FLOOR_MBPS x 1000000 / 8 x DURATION_SECONDS
