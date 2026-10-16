@@ -12,7 +12,8 @@
 # job script, the job's item logs and the sources (ffprobe). It never
 # writes, moves or signals anything a running job uses.
 #
-# Times shown per job:
+# Times shown per job (CURRENT: the item; JOB QUEUE, only for a job of
+# more than one item: the whole job):
 #   Item elapsed   since the current movie / episode attempt began (first
 #                  pass / step after its item_begin, from the item log)
 #   Item ETA       rest of the current encode: remaining runtime / speed
@@ -210,6 +211,7 @@ job_events() {
 #   R[total_eta]     whole job ("Unknown" when it cannot be estimated)
 #   R[total_basis]   what the total ETA is based on
 #   R[crf]           the CRF of the current encode, when the log has it
+#   ITEM_RUN_CRF[i]  the last encode CRF logged for item i (display only)
 # CUR / SPEED / ITEM_ETA: current encode progress ("-" / "" = none).
 job_estimates() {
     local now="$1" cur="$2" speed="$3" item_eta="$4"
@@ -225,6 +227,7 @@ job_estimates() {
     R[item_elapsed]="Unknown"
     R[total_eta]="Unknown"
     R[total_basis]=""
+    ITEM_RUN_CRF=()
 
     [[ "$item" =~ ^[0-9]+$ ]] || item=0
     [[ "$items" =~ ^[0-9]+$ ]] || items=0
@@ -242,6 +245,9 @@ job_estimates() {
             [[ "$first" == 1 ]] && item_start="$ts"
             [[ "$kind" == pass && "$label" == encode && "$crf" != "-" ]] && item_crf="$crf"
         fi
+
+        # each item's last logged encode CRF (the queue shows it for done items)
+        [[ "$kind" == pass && "$label" == encode && "$crf" != "-" ]] && ITEM_RUN_CRF[$idx]="$crf"
 
         [[ "$kind" == pass && "$label" =~ ^(encode|1/2|2/2)$ ]] || continue
 
@@ -367,49 +373,202 @@ status_text() {
     fi
 }
 
-# field LABEL VALUE
-field() {
-    printf '%-15s%s\n' "$1" "$2"
+# ------------------------------------------------------------
+# Layout
+#
+#   c1 — Movie
+#   ======================================================================
+#
+#   CURRENT: <file>
+#
+#     <tier> | CRF <n>[ (manual)] | <status>
+#     Progress:  0.8%   00:00:55 / 01:50:13   0.736x
+#     ETA:       <item ETA>    Elapsed: <item elapsed>
+#
+#   (more than one item:)
+#   JOB QUEUE
+#   ----------------------------------------------------------------------
+#
+#     ETA:       <total ETA>    Elapsed: <total elapsed>
+#
+#     [DONE] 1. <file>      <tier> | CRF <n>
+#     [NOW]  2. <file>      <tier> | CRF <n> | <status>
+#     [NEXT] 3. <file>      <tier> | CRF <n> (manual)
+#     [WAIT] 4. <file>      <tier> | CRF <n>
+#
+#     Completed: 1
+#     Remaining: 2 queued
+#   ======================================================================
+#
+# Queue metadata stays on the file's line when every row fits the
+# terminal width (COLUMNS, else tput cols, else 100); otherwise it goes
+# on an indented line below each file.
+# ------------------------------------------------------------
+
+RULE_WIDE="======================================================================"
+RULE_THIN="----------------------------------------------------------------------"
+
+# term_width  ->  columns of the terminal (COLUMNS, tput, else 100)
+term_width() {
+    local w="${COLUMNS:-}"
+    [[ "$w" =~ ^[0-9]+$ ]] || { [[ -t 1 ]] && w=$(tput cols 2>/dev/null); }
+    [[ "$w" =~ ^[0-9]+$ ]] && (( w >= 40 )) || w=100
+    printf '%s' "$w"
 }
 
-# print_job  ->  one job block from R[...]:
-#   session type item name tier crf status logs
-#   pct enc total speed item_eta item_elapsed total_eta total_basis
-#   total_elapsed   (empty = line left out; pct empty = no progress block)
+# meta_text TIER CRF MANUAL [STATUS]  ->  "Base | CRF 21 (manual) | Encoding"
+meta_text() {
+    local out="${1:-?}"
+    [[ -n "${2:-}" ]] && out+=" | CRF $2$( [[ "${3:-}" == 1 ]] && echo " (manual)")"
+    [[ -n "${4:-}" ]] && out+=" | $4"
+    printf '%s' "$out"
+}
+
+# script_item_meta SCRIPT  ->  fills ITEM_IN / ITEM_TIER / ITEM_CRF /
+# ITEM_MANUAL / ITEM_COPY per item index from the job script's item_begin
+# and item_expect lines (planned values; none for old job formats)
+script_item_meta() {
+    local line idx="" w crf
+    local -a words
+
+    ITEM_IN=() ITEM_TIER=() ITEM_CRF=() ITEM_MANUAL=() ITEM_COPY=()
+    [[ -f "$1" ]] || return 0
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ (^|[[:space:]])item_begin[[:space:]]+([0-9]+)[[:space:]] ]]; then
+            idx="${BASH_REMATCH[2]}"
+            [[ -z "${ITEM_IN[$idx]+x}" ]] || { idx=""; continue; }
+            mapfile -t words < <(xargs -n 1 2>/dev/null <<< "${line#*item_begin }")
+            ITEM_IN[$idx]="${words[1]:-}"
+            ITEM_TIER[$idx]="${words[3]:-}"
+        elif [[ -n "$idx" && "$line" == *item_expect* ]]; then
+            crf=""
+            [[ "$line" =~ [[:space:]]crf=([0-9.]+) ]] && crf="${BASH_REMATCH[1]}"
+            ITEM_CRF[$idx]="$crf"
+            [[ "$line" == *" down_mode=manual"* ]] && ITEM_MANUAL[$idx]=1
+            [[ "$line" == *" mode=copy"* ]] && ITEM_COPY[$idx]=1
+            idx=""
+        fi
+    done < <(grep -E 'item_(begin|expect) ' "$1" 2>/dev/null)
+}
+
+# print_header  ->  "c1 — Movie" and the wide rule
+print_header() {
+    printf '%s — %s\n' "${R[session]}" "${R[type]}"
+    echo "$RULE_WIDE"
+    echo
+}
+
+# print_current  ->  the CURRENT block from R[...]: name tier crf manual
+# status pct enc total speed item_eta item_elapsed logs note_crf
+print_current() {
+    echo "CURRENT: ${R[name]:-?}"
+    echo
+    echo "  $(meta_text "${R[tier]:-?}" "${R[crf]:-}" "${R[manual]:-}" "${R[status]:-?}")"
+    [[ -n "${R[pct]:-}" ]] &&
+        printf '  %-11s%s   %s / %s   %s\n' "Progress:" "${R[pct]}" "${R[enc]}" "${R[total]}" "${R[speed]}"
+    printf '  %-11s%s    Elapsed: %s\n' "ETA:" "${R[item_eta]:-Unknown}" "${R[item_elapsed]:-Unknown}"
+    [[ -n "${R[item_label]:-}" ]] && printf '  %-11s%s\n' "Item:" "${R[item_label]}"
+    [[ -n "${R[logs]:-}" ]] && printf '  %-11s%s\n' "Logs:" "${R[logs]}"
+    return 0
+}
+
+# print_queue CURRENT ITEMS  ->  the JOB QUEUE block (whole job, the
+# current item included) from ITEM_* / ITEM_RUN_CRF and R[...]
+print_queue() {
+    local cur="$1" items="$2" j tag name meta pre w namew=0 metaw=0 inline=1 dw done
+    local -a names=() metas=() tags=()
+
+    dw=${#items}
+    for ((j = 1; j <= items; j++)); do
+        if (( j < cur )); then
+            tag="[DONE]"
+        elif (( j == cur )); then
+            tag="[NOW]"
+        elif (( j == cur + 1 )); then
+            tag="[NEXT]"
+        else
+            tag="[WAIT]"
+        fi
+        name="${ITEM_IN[$j]:-}"
+        name="${name##*/}"
+        # a name the job script quoted as $'...' (non-UTF-8 locale) comes
+        # out of xargs with octal escapes: decode them for display
+        [[ "$name" =~ \\[0-7]{3} ]] && name=$(printf '%b' "${name//\\/\\0}")
+        (( j == cur )) && name="${R[name]:-$name}"
+        [[ -n "$name" ]] || name="?"
+        if (( j == cur )); then
+            meta=$(meta_text "${R[tier]:-?}" "${R[crf]:-}" "${R[manual]:-}" "${R[status]:-}")
+        elif [[ -n "${ITEM_COPY[$j]:-}" ]]; then
+            meta=$(meta_text "${ITEM_TIER[$j]:-?}" "" "" "source video kept")
+        elif (( j < cur )) && [[ -n "${ITEM_RUN_CRF[$j]:-}" ]]; then
+            meta=$(meta_text "${ITEM_TIER[$j]:-?}" "${ITEM_RUN_CRF[$j]}" "${ITEM_MANUAL[$j]:-}")
+        else
+            meta=$(meta_text "${ITEM_TIER[$j]:-?}" "${ITEM_CRF[$j]:-}" "${ITEM_MANUAL[$j]:-}")
+        fi
+        tags+=("$tag"); names+=("$name"); metas+=("$meta")
+        (( ${#name} > namew )) && namew=${#name}
+        (( ${#meta} > metaw )) && metaw=${#meta}
+    done
+
+    # "  [NEXT] 12. " + name + 2 spaces + meta must fit the terminal
+    pre=$(( 2 + 6 + 1 + dw + 2 ))
+    w=$(term_width)
+    (( pre + namew + 2 + metaw <= w )) || inline=0
+
+    echo
+    echo
+    echo "JOB QUEUE"
+    echo "$RULE_THIN"
+    echo
+    printf '  %-11s%s    Elapsed: %s\n' "ETA:" "${R[total_eta]:-Unknown}" "${R[total_elapsed]:-Unknown}"
+    echo
+    for ((j = 1; j <= items; j++)); do
+        if (( inline )); then
+            # padded by characters (printf pads by bytes: a multibyte name
+            # would shift the metadata column)
+            printf '  %-6s %*s. %s%*s  %s\n' "${tags[j-1]}" "$dw" "$j" "${names[j-1]}" \
+                "$(( namew - ${#names[j-1]} ))" "" "${metas[j-1]}"
+        else
+            printf '  %-6s %*s. %s\n' "${tags[j-1]}" "$dw" "$j" "${names[j-1]}"
+            printf '%*s%s\n' "$pre" "" "${metas[j-1]}"
+            (( j < items )) && echo
+        fi
+    done
+    echo
+    done=$(( cur - 1 ))
+    (( done < 0 )) && done=0
+    printf '  Completed: %s%s\n' "$done" "$( (( ${ST[failed]:-0} > 0 )) && echo " (${ST[failed]} failed)")"
+    printf '  Remaining: %s queued\n' "$(( items - cur > 0 ? items - cur : 0 ))"
+    [[ -n "${R[note_crf]:-}" ]] && echo "  Note: CRF retries/tests not yet started are excluded"
+    return 0
+}
+
+# print_job [CURRENT ITEMS]  ->  one job: header, CURRENT, and with more
+# than one item the JOB QUEUE (ITEM_* filled by script_item_meta)
 print_job() {
-    printf '%s — %s — %s\n' "${R[session]}" "${R[type]}" "${R[item]}"
-    echo "$RULE"
-    field "File:" "${R[name]:-?}"
-    field "Tier:" "${R[tier]:-?}"
-    [[ -n "${R[crf]:-}" ]] && field "CRF:" "${R[crf]}"
-    field "Status:" "${R[status]:-?}"
-    [[ -n "${R[logs]:-}" ]] && field "Logs:" "${R[logs]}"
+    local cur="${1:-0}" items="${2:-0}"
 
-    if [[ -n "${R[pct]:-}" ]]; then
-        echo
-        field "Progress:" "${R[pct]}"
-        field "Encoded:" "${R[enc]} / ${R[total]}"
-        field "Speed:" "${R[speed]}"
-    fi
-
-    if [[ -z "${R[ended]:-}" ]]; then
-        echo
-        field "Item ETA:" "${R[item_eta]:-Unknown}"
-        field "Item elapsed:" "${R[item_elapsed]:-Unknown}"
-        echo
-        field "Total ETA:" "${R[total_eta]:-Unknown}"
-        # basis: "; "-separated notes, one per line
-        local note rest="${R[total_basis]:-}"
-        while [[ -n "$rest" ]]; do
-            note="${rest%%; *}"
-            [[ "$rest" == *"; "* ]] && rest="${rest#*; }" || rest=""
-            [[ -n "$note" ]] && field "" "$note"
-        done
+    print_header
+    print_current
+    if [[ "$items" =~ ^[0-9]+$ && "$cur" =~ ^[0-9]+$ ]] && (( items > 1 && cur >= 1 )); then
+        print_queue "$cur" "$items"
     else
+        [[ -n "${R[note_crf]:-}" ]] && echo "  Note: CRF retries/tests not yet started are excluded"
         echo
     fi
-    field "Total elapsed:" "${R[total_elapsed]:-Unknown}"
-    echo "$RULE"
+    echo "$RULE_WIDE"
+    echo
+}
+
+# print_ended  ->  a job that is over while its session still waits
+print_ended() {
+    print_header
+    echo "${R[status]:-?}"
+    [[ -n "${R[logs]:-}" ]] && printf '  %-11s%s\n' "Logs:" "${R[logs]}"
+    printf '  %-11s%s\n' "Elapsed:" "${R[total_elapsed]:-Unknown}"
+    echo
+    echo "$RULE_WIDE"
     echo
 }
 
@@ -440,7 +599,7 @@ declare -A ST
 declare -A LIVE
 declare -A R
 declare -A DUR
-declare -A ITEM_IN
+declare -A ITEM_IN ITEM_TIER ITEM_CRF ITEM_MANUAL ITEM_COPY ITEM_RUN_CRF
 DUR_OUT=""
 shown=0
 
@@ -475,7 +634,6 @@ for entry in "${sessions[@]+"${sessions[@]}"}"; do
 
         read_state "$state_file"
 
-        R[item]=$(item_header "$type" "${ST[item]:-0}/${ST[items]:-?}")
         R[name]="${ST[name]:-?}"
         R[tier]="${ST[tier]:-?}"
         R[crf]="${ST[crf]:-}"
@@ -504,7 +662,7 @@ for entry in "${sessions[@]+"${sessions[@]}"}"; do
                 else
                     R[status]="Finished: ${ST[ok]:-0} ok"
                 fi
-                print_job
+                print_ended
                 ((shown++))
                 continue
                 ;;
@@ -544,9 +702,13 @@ for entry in "${sessions[@]+"${sessions[@]}"}"; do
         # High / Base / Quality may re-encode after the post-encode CRF
         # check (movie CRF - 1 test, series season retry / test pass)
         [[ "${ST[mode]:-}" == "crf" && "${R[tier]}" != "Custom" && "${R[total_eta]}" != "Unknown" ]] &&
-            R[total_basis]+="; CRF retries / tests not yet started are not included"
+            R[note_crf]=1
 
-        print_job
+        # the whole job's items (queue) from the job script
+        script_item_meta "$script"
+        R[manual]="${ITEM_MANUAL[${ST[item]:-0}]:-}"
+
+        print_job "${ST[item]:-0}" "${ST[items]:-0}"
         ((shown++))
         continue
     fi
@@ -605,7 +767,7 @@ for entry in "${sessions[@]+"${sessions[@]}"}"; do
     [[ -n "$tier" ]] || tier="?"
     [[ -n "$item" ]] || item="-"
 
-    R[item]=$(item_header "$type" "$item")
+    R[item_label]=$(item_header "$type" "$item")
     R[name]="$name"
     R[tier]="$tier"
     [[ "$created" =~ ^[0-9]+$ ]] && R[total_elapsed]=$(format_hms $(( now - created )))

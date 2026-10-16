@@ -2193,19 +2193,19 @@ printf 'out_time_us=30000000\nspeed=0.1x\nprogress=continue\n' > "$PH/compress/w
 sed -i "s/echo \"c8 $now\"; }/echo \"c8 $now\"; echo \"series9 $sstart\"; }/" "$PH/stub/tmux"
 
 HOME="$PH" PATH="$PH/stub:$PATH" bash "$PH/compress/progress-check.sh" > "$T/progress.out" 2>&1
-c7=$(sed -n '/^c7 /,/^Total elapsed:/p' "$T/progress.out"); c8=$(sed -n '/^c8 /,/^Total elapsed:/p' "$T/progress.out")
-s9=$(sed -n '/^series9 /,/^Total elapsed:/p' "$T/progress.out")
-check "21 CRF job: header, tier, CRF, status"    "grep -q '^c7 — Movie — Movie 1/1\$' <<< \"\$c7\" && grep -q '^Tier: *High\$' <<< \"\$c7\" && grep -q '^CRF: *21\$' <<< \"\$c7\" && grep -q '^Status: *Encoding\$' <<< \"\$c7\""
+# one job block: from "<session> — " to its closing wide rule
+pjob() { awk -v s="$1 — " 'index($0, s) == 1 { on = 1 } on { print } on && /^={70}$/ && ++r == 2 { exit }' "$T/progress.out"; }
+c7=$(pjob c7); c8=$(pjob c8); s9=$(pjob series9)
+check "21 CRF job: header, tier, CRF, status"    "grep -q '^c7 — Movie\$' <<< \"\$c7\" && grep -q '^CURRENT: c7.mkv\$' <<< \"\$c7\" && grep -q '^  High | CRF 21 | Encoding\$' <<< \"\$c7\""
 check "21 CRF job: no pass 1/2 or 2/2"           "! grep -q 'Pass' <<< \"\$c7\""
-check "21 CRF job: progress and item ETA"        "grep -q '^Progress: *50.0%\$' <<< \"\$c7\" && grep -q '^Encoded: *00:30:00 / 01:00:00\$' <<< \"\$c7\" && grep -q '^Item ETA: *00:15:00\$' <<< \"\$c7\""
-check "21 CRF job: last item, total ETA = item ETA" "grep -q '^Total ETA: *00:15:00\$' <<< \"\$c7\""
-check "20 two-pass job: still Pass 1/2, no CRF"  "grep -q '^Tier: *Test\$' <<< \"\$c8\" && grep -q '^Status: *Pass 1/2\$' <<< \"\$c8\" && ! grep -q '^CRF:' <<< \"\$c8\""
-check "series: header Episode 3/4"               "grep -q '^series9 — Series — Episode 3/4\$' <<< \"\$s9\""
-check "series: CRF of the running encode (log)"  "grep -q '^CRF: *19\$' <<< \"\$s9\""
-check "series: item elapsed from its log"        "grep -qE '^Item elapsed: +00:05:0[0-9]\$' <<< \"\$s9\""
-check "series: total elapsed from job start"     "grep -qE '^Total elapsed: +00:25:0[0-9]\$' <<< \"\$s9\""
+check "21 CRF job: progress and item ETA"        "grep -q '^  Progress:  50.0%   00:30:00 / 01:00:00   2.0x\$' <<< \"\$c7\" && grep -qE '^  ETA:       00:15:00    Elapsed: ' <<< \"\$c7\""
+check "21 CRF job: single item, no JOB QUEUE / second ETA" "! grep -q 'JOB QUEUE' <<< \"\$c7\" && [[ \$(grep -c '^  ETA:' <<< \"\$c7\") == 1 ]]"
+check "20 two-pass job: still Pass 1/2, no CRF"  "grep -q '^  Test | Pass 1/2\$' <<< \"\$c8\" && ! grep -q 'CRF' <<< \"\$c8\""
+check "series: queue, episode 3 of 4 now"        "grep -q '^series9 — Series\$' <<< \"\$s9\" && grep -q '^JOB QUEUE\$' <<< \"\$s9\" && grep -qE '^  \[NOW\]  3\. E03\.mkv +High \| CRF 19 \| Encoding\$' <<< \"\$s9\" && grep -qE '^  \[NEXT\] 4\. E04\.mkv +High\$' <<< \"\$s9\" && grep -q '^  Completed: 2\$' <<< \"\$s9\" && grep -q '^  Remaining: 1 queued\$' <<< \"\$s9\""
+check "series: CRF of the running encode (log)"  "grep -q '^  High | CRF 19 | Encoding\$' <<< \"\$s9\""
+check "series: item elapsed from its log"        "grep -qE '^  ETA:       [0-9:]+    Elapsed: 00:05:0[0-9]\$' <<< \"\$s9\""
 # item: 30 s left at 0.1x = 300 s; episode 4: 60 s at 0.1x = 600 s
-check "series: total ETA from completed episodes" "grep -q '^Total ETA: *00:15:00\$' <<< \"\$s9\" && grep -q 'based on 2 completed episodes at 0.100x overall' <<< \"\$s9\""
+check "series: total ETA from completed episodes, total elapsed from job start" "grep -qE '^  ETA:       00:15:00    Elapsed: 00:25:0[0-9]\$' <<< \"\$s9\""
 check "progress-check is read-only"              "[[ \$(cat '$PH/compress/work/series9.progress') == *'progress=continue'* ]] && [[ ! -e '$PH/compress/work/series9.state.tmp' ]]"
 check "21 sdrcrf job: own .sh / .state removed after success" "[[ ! -e '$WORK_DIR/sdrcrf.sh' && ! -e '$WORK_DIR/sdrcrf.state' ]]"
 
