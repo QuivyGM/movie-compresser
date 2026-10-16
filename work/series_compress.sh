@@ -65,7 +65,7 @@ cleanup_finished_jobs "$WORK_DIR"
 
 if ui_verbose; then
     echo "Policy: $(policy_conf_path)"
-    for t in High Base Custom; do
+    for t in High Base Compact Custom; do
         echo
         crf_policy_lines series "$t"
     done
@@ -443,23 +443,30 @@ if ui_verbose; then
     crf_tier_load series High
     echo "2) High        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_CEILING_GIB} GiB/episode (audio copied unchanged)"
     echo "3) Custom CRF  exactly the CRF you enter, any 0-${CRF_LIMIT} (no range or ceiling; audio copied unchanged)"
+    crf_tier_load series Compact
+    echo "4) Compact     CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of each episode's runtime (audio copied unchanged)"
 else
     crf_tier_load series Base
     printf '1) %-7s CRF %-7s <=%s GiB/episode\n' Base "${CRF_MIN}-${CRF_MAX}" "$CRF_CEILING_GIB"
     crf_tier_load series High
     printf '2) %-7s CRF %-7s <=%s GiB/episode\n' High "${CRF_MIN}-${CRF_MAX}" "$CRF_CEILING_GIB"
     printf '3) %-7s exact CRF (0-%s)\n' Custom "$CRF_LIMIT"
+    crf_tier_load series Compact
+    printf '4) %-7s CRF %-7s <=%s GiB/h\n' Compact "${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR"
 fi
 
 CUSTOM_CRF=""
 
+# Compact is 4 (after Custom) so the existing selections 1-3 keep their
+# meaning
 while true; do
     ui_verbose && echo
-    read -rp "Select [1-3]: " t
+    read -rp "Select [1-4]: " t
 
     case "$t" in
         1) TIER="Base"; break ;;
         2) TIER="High"; break ;;
+        4) TIER="Compact"; break ;;
         3)
             TIER="Custom"
             while true; do
@@ -474,6 +481,23 @@ while true; do
 done
 
 crf_tier_load series "$TIER" "$CUSTOM_CRF"
+
+# Compact: every episode's own ceiling from its exact runtime
+# (SERIES_EP_CEIL; empty for High / Base / Custom)
+if ! series_ep_ceilings "$TIER"; then
+    echo "$(ui_err "Episode runtime unknown"): no $TIER video ceiling can be calculated."
+    echo "Compression cancelled."
+    exit 1
+fi
+
+# ceil_phrase  ->  "the 1.5 GiB ceiling" | "the 0.40 GiB/h ceiling" (warnings)
+ceil_phrase() {
+    if (( ${#SERIES_EP_CEIL[@]} )); then
+        printf 'the %s GiB/h ceiling' "$CRF_GIB_PER_HOUR"
+    else
+        printf 'the %s GiB ceiling' "$CRF_CEILING_GIB"
+    fi
+}
 
 if ui_verbose; then
     echo
@@ -522,8 +546,15 @@ crf_series_estimate_shown() {
 
     echo
     printf '%-10s%s GiB\n' "Median:" "$(bytes_to_gib "$SB_MEDIAN")"
-    printf '%-10s%s GiB (%s, %s)\n' "Largest:" "$(bytes_to_gib "$SB_DECIDE")" \
-        "${EP_LABEL[$SB_DECIDE_IDX]}" "$(series_from_text "${ef[SB_DECIDE_IDX]}")"
+    if (( ${#SERIES_EP_CEIL[@]} )); then
+        # Compact: the episode with the least room under its own ceiling
+        printf '%-10s%s GiB / %s GiB (%s, %s)\n' "Decisive:" "$(bytes_to_gib "$SB_DECIDE_BYTES")" \
+            "$(bytes_to_gib "$(series_ep_ceil "$SB_DECIDE_IDX")")" \
+            "${EP_LABEL[$SB_DECIDE_IDX]}" "$(series_from_text "${ef[SB_DECIDE_IDX]}")"
+    else
+        printf '%-10s%s GiB (%s, %s)\n' "Largest:" "$(bytes_to_gib "$SB_DECIDE")" \
+            "${EP_LABEL[$SB_DECIDE_IDX]}" "$(series_from_text "${ef[SB_DECIDE_IDX]}")"
+    fi
     if (( CRF_CEILING_BYTES > 0 )); then
         if [[ -n "$SB_ISOLATED" ]]; then
             printf '%-10s%s ~%s GiB (above median +%s%%; must fit the shared season CRF)\n' "Outlier:" \
@@ -532,7 +563,11 @@ crf_series_estimate_shown() {
             printf '%-10s%d episodes above median +%s%% (season difficulty)\n' "Large:" \
                 "${#SB_OUTLIERS[@]}" "$SERIES_CRF_OUTLIER_PCT"
         fi
-        printf '%-10s%s GiB\n' "Ceiling:" "$(bytes_to_gib "$CRF_CEILING_BYTES")"
+        if (( ${#SERIES_EP_CEIL[@]} )); then
+            printf '%-10s%s GiB/h x each episode'"'"'s runtime (%d above)\n' "Ceiling:" "$CRF_GIB_PER_HOUR" "${#SB_ABOVE[@]}"
+        else
+            printf '%-10s%s GiB\n' "Ceiling:" "$(bytes_to_gib "$CRF_CEILING_BYTES")"
+        fi
     fi
 }
 
@@ -612,7 +647,7 @@ EST_MEDIAN="$SB_MEDIAN"
 # gets a CRF of its own, every episode above the ceiling counts
 if [[ "$TIER" != "Custom" ]]; then
     for i in "${!FILES[@]}"; do
-        (( EP_EST[i] > CRF_CEILING_BYTES )) && EP_OVER[$i]=1
+        (( EP_EST[i] > $(series_ep_ceil "$i") )) && EP_OVER[$i]=1
     done
 fi
 
@@ -620,9 +655,16 @@ fi
 if (( CRF_OVER_CEILING == 1 )); then
     echo
     echo "------------------------------------------------------------"
-    echo "$(ui_warn WARNING): the ${CRF_CEILING_GIB} GiB per-episode video ceiling cannot be met"
-    echo "within the allowed ${TIER} quality range: even CRF ${CRF_MAX} (the lowest quality ${TIER}"
-    echo "allows) gives a largest episode of ~$(bytes_to_gib "${CRF_EST[$CRF]}") GiB video, ~$(crf_oversize_gib "${CRF_EST[$CRF]}" "$CRF_CEILING_BYTES") GiB above the ceiling."
+    if (( ${#SERIES_EP_CEIL[@]} )); then
+        # Compact: the episode with the least room under its own ceiling
+        echo "$(ui_warn WARNING): the ${CRF_GIB_PER_HOUR} GiB/h per-episode video ceilings cannot be met"
+        echo "within the allowed ${TIER} quality range: even CRF ${CRF_MAX} (the lowest quality ${TIER}"
+        echo "allows) gives $(ep_name "$SB_DECIDE_IDX") ~$(bytes_to_gib "$SB_DECIDE_BYTES") GiB video, ~$(crf_oversize_gib "$SB_DECIDE_BYTES" "$(series_ep_ceil "$SB_DECIDE_IDX")") GiB above its $(bytes_to_gib "$(series_ep_ceil "$SB_DECIDE_IDX")") GiB ceiling."
+    else
+        echo "$(ui_warn WARNING): the ${CRF_CEILING_GIB} GiB per-episode video ceiling cannot be met"
+        echo "within the allowed ${TIER} quality range: even CRF ${CRF_MAX} (the lowest quality ${TIER}"
+        echo "allows) gives a largest episode of ~$(bytes_to_gib "${CRF_EST[$CRF]}") GiB video, ~$(crf_oversize_gib "${CRF_EST[$CRF]}" "$CRF_CEILING_BYTES") GiB above the ceiling."
+    fi
     echo "------------------------------------------------------------"
     echo "1) Encode every episode at CRF ${CRF_MAX} anyway"
     echo "2) Cancel"
@@ -645,9 +687,13 @@ episode_over_ceiling_prompt() {
 
     echo
     echo "------------------------------------------------------------"
-    echo "$(ui_warn WARNING): $(ep_name "$i") cannot meet the ${CRF_CEILING_GIB} GiB per-episode video ceiling"
+    if (( ${#SERIES_EP_CEIL[@]} )); then
+        echo "$(ui_warn WARNING): $(ep_name "$i") cannot meet its $(bytes_to_gib "$(series_ep_ceil "$i")") GiB video ceiling (${CRF_GIB_PER_HOUR} GiB/h)"
+    else
+        echo "$(ui_warn WARNING): $(ep_name "$i") cannot meet the ${CRF_CEILING_GIB} GiB per-episode video ceiling"
+    fi
     echo "within the allowed ${TIER} quality range: even CRF ${CRF_MAX} (the lowest quality ${TIER}"
-    echo "allows) is estimated at ~$(bytes_to_gib "${EP_EST[$i]}") GiB video, ~$(crf_oversize_gib "${EP_EST[$i]}" "$CRF_CEILING_BYTES") GiB above the ceiling."
+    echo "allows) is estimated at ~$(bytes_to_gib "${EP_EST[$i]}") GiB video, ~$(crf_oversize_gib "${EP_EST[$i]}" "$(series_ep_ceil "$i")") GiB above the ceiling."
     echo "------------------------------------------------------------"
     echo "1) Encode it anyway (the whole season at CRF ${CRF_MAX})"
     echo "2) Skip this episode"
@@ -685,7 +731,7 @@ if ui_verbose; then
     echo "  median episode video:  ~$(size_text "$EST_MEDIAN")"
     echo "  largest episode video: ~$(size_text "$EST_LARGEST")"
     if [[ "$TIER" != "Custom" ]]; then
-        echo "  ceiling:               ${CRF_CEILING_GIB} GiB/episode"
+        echo "  ceiling:               $(series_ceiling_text)"
     fi
 fi
 
@@ -695,21 +741,21 @@ fi
 if (( ${#ABOVE[@]} )); then
     echo
     if (( ${#ABOVE[@]} == 1 )); then
-        echo "$(ui_warn Warning): 1 episode is estimated above the ${CRF_CEILING_GIB} GiB ceiling at CRF ${CRF_MAX}."
+        echo "$(ui_warn Warning): 1 episode is estimated above $(ceil_phrase) at CRF ${CRF_MAX}."
     else
-        echo "$(ui_warn Warning): ${#ABOVE[@]} episodes are estimated above the ${CRF_CEILING_GIB} GiB ceiling at CRF ${CRF_MAX}."
+        echo "$(ui_warn Warning): ${#ABOVE[@]} episodes are estimated above $(ceil_phrase) at CRF ${CRF_MAX}."
     fi
     for i in "${ABOVE[@]}"; do
         if ui_verbose; then
             printf "  %-40.40s ~%s GiB video, +%s GiB (%s)%s\n" "$(basename "${FILES[$i]}")" \
                 "$(bytes_to_gib "${EP_EST[$i]}")" \
-                "$(crf_oversize_gib "${EP_EST[$i]}" "$CRF_CEILING_BYTES")" \
+                "$(crf_oversize_gib "${EP_EST[$i]}" "$(series_ep_ceil "$i")")" \
                 "$(series_from_text "${EP_FROM[$i]}")" \
                 "$( (( EP_CEIL_SKIP[$i] == 1 )) && echo "; skipped")"
         else
             printf "  %-*s  ~%s GiB video, +%s GiB (%s)%s\n" "$LABEL_W" "${EP_LABEL[$i]}" \
                 "$(bytes_to_gib "${EP_EST[$i]}")" \
-                "$(crf_oversize_gib "${EP_EST[$i]}" "$CRF_CEILING_BYTES")" \
+                "$(crf_oversize_gib "${EP_EST[$i]}" "$(series_ep_ceil "$i")")" \
                 "$(series_from_text "${EP_FROM[$i]}")" \
                 "$( (( EP_CEIL_SKIP[$i] == 1 )) && echo "; skipped")"
         fi
@@ -779,7 +825,7 @@ season_raise() {
             EP_FROM[$i]="sample"
         fi
         EP_OVER[$i]=0
-        (( EP_EST[i] > CRF_CEILING_BYTES )) && EP_OVER[$i]=1
+        (( EP_EST[i] > $(series_ep_ceil "$i") )) && EP_OVER[$i]=1
         [[ "${EP_VIDEO[$i]}" == crf:* ]] && EP_VIDEO[$i]="crf:$c"
     done
 
@@ -896,7 +942,7 @@ if ui_verbose; then
         echo "Video encode:         x265 CRF ${CRF}, single pass, every episode (entered CRF)"
     else
         echo "Video encode:         x265 CRF ${CRF}, single pass, every episode"
-        echo "                      (${TIER}: CRF ${CRF_MIN}-${CRF_MAX}, ${CRF_CEILING_GIB} GiB/episode video ceiling$( (( CRF_OVER_CEILING == 1 || ${#ABOVE[@]} > 0 )) && echo "; ceiling NOT met"))"
+        echo "                      (${TIER}: CRF ${CRF_MIN}-${CRF_MAX}, $(series_ceiling_text) video ceiling$( (( CRF_OVER_CEILING == 1 || ${#ABOVE[@]} > 0 )) && echo "; ceiling NOT met"))"
     fi
     echo "Resolution:           ${WIDTH}x${HEIGHT} -> ${OUT_WIDTH}x${OUT_HEIGHT}"
     echo "Dynamic range:        $(hdr_description)"
@@ -976,7 +1022,7 @@ if ui_verbose; then
     echo "  highest = not sampled (inferred); highest sampled video bitrate x its runtime"
     echo "  promoted = not in the sample set; sampled itself because it decided the season CRF"
     if [[ "$TIER" != "Custom" ]]; then
-        echo "  ABOVE CEILING = video estimate above ${CRF_CEILING_GIB} GiB even at CRF ${CRF_MAX}"
+        echo "  ABOVE CEILING = video estimate above $(ceil_phrase | sed 's/^the //; s/ ceiling$//') even at CRF ${CRF_MAX}"
     fi
 
     # Stream / title / chapter handling, shown for the first episode (the
@@ -1007,8 +1053,8 @@ if ui_verbose; then
     if [[ "$TIER" == "Custom" ]]; then
         printf "  Above ceiling:              n/a (Custom has no ceiling)\n"
     else
-        printf "  Above ceiling:              %d of %d episode(s) (%s GiB/episode)\n" \
-            "${#ABOVE[@]}" "$FILE_COUNT" "$CRF_CEILING_GIB"
+        printf "  Above ceiling:              %d of %d episode(s) (%s)\n" \
+            "${#ABOVE[@]}" "$FILE_COUNT" "$(series_ceiling_text)"
     fi
     printf "  Expected total video size:  ~%s GiB\n" "$P_VIDEO_GIB"
     printf "  Copied source audio size:   ~%s GiB\n" "$P_AUDIO_GIB"
@@ -1249,7 +1295,8 @@ JOB_FILE="$WORK_DIR/${SESSION}.sh"
 # per-episode retry, headroom or own CRF. Custom: no retry.
 # ep_retry_spec INDEX  ->  RETRY of emit_encode_item ("" = none)
 ep_retry_spec() {
-    series_season_retry_spec "$TIER" "$CRF_CEILING_BYTES" "$CRF_MAX" "$CRF_MIN"
+    # its own ceiling (series Compact: runtime x rate; one value for High / Base)
+    series_season_retry_spec "$TIER" "$(series_ep_ceil "$1")" "$CRF_MAX" "$CRF_MIN"
 }
 
 # one CRF for every encoded episode (anything else is a bug: never start

@@ -180,8 +180,8 @@ rm -f "$W/cache/crf_actual"
 echo "== Series / Quality / Custom untouched"
 
 M="$SRC_WORK/movie_compress.sh"
-check "menu: only High / Base build a fingerprint" \
-    "grep -qF 'if [[ ( \"\$TIER\" == High || \"\$TIER\" == Base ) && -z \"\$QUALITY_STATUS\" ]]; then' '$M'"
+check "menu: only High / Base / Compact build a fingerprint" \
+    "grep -qF 'if crf_ceiling_tier \"\$TIER\" && [[ -z \"\$QUALITY_STATUS\" ]]; then' '$M' && grep -qx '        High|Base|Compact) return 0 ;;' '$SRC_WORK/lib/policy.sh'"
 check "menu: Quality and Custom searches still sample (crf_title_estimate)"     "[[ \$(grep -c '\"\$SOURCE_VIDEO_BYTES\" crf_title_estimate crf_title_step_report' '$M') == 2 ]] && grep -qF 'crf_select_exact \"\$CUSTOM_CRF\" crf_title_estimate ||' '$M' && [[ \$(grep -c crf_title_estimate_actual '$M') == 1 ]]"
 check "series menu does not use the actual cache" \
     "! grep -qE 'crf_actual|crf_title_estimate_actual|actual_sig' '$SRC_WORK/series_compress.sh'"

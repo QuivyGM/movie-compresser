@@ -25,8 +25,9 @@ declare -a DV_POLICIES=() DV_MODES=() HDR10P_POLICIES=() QUALITY_SPECS=() CRF_ES
 
 # Compression policy: ~/compress/work/lib/compress.conf (loaded and validated
 # by work/lib/policy.sh). The policy math lives there as well
-# (crf_select_quality for Quality, crf_select_boundary for High / Base); the
-# sample encodes behind the CRF estimates are in encode_common.sh.
+# (crf_select_quality for Quality, crf_select_boundary for High / Base /
+# Compact); the sample encodes behind the CRF estimates are in
+# encode_common.sh.
 # Audio is always copied unchanged; audio compression is only done by
 # audio_compress_menu.sh.
 if ! load_policy; then
@@ -40,10 +41,10 @@ cleanup_finished_jobs "$WORK_DIR"
 # tool and sampling diagnostics (lib/ui.sh).
 if ui_verbose; then
     echo "Policy: $(policy_conf_path)"
-    for t in Quality High Base Custom; do
+    for t in Quality High Base Compact Custom; do
         printf "  %-8s %s\n" "$t" "$(movie_policy_line "$t")"
     done
-    for t in Quality High Base; do
+    for t in Quality High Base Compact; do
         echo
         movie_video_policy_lines "$t"
     done
@@ -253,32 +254,38 @@ while true; do
     echo "Compression tier:"
     if ui_verbose; then
         echo "1) Quality     CRF search (start ${MOVIE_QUALITY_CRF_START}, range ${MOVIE_QUALITY_CRF_MIN}-${MOVIE_QUALITY_CRF_MAX}), video $QUALITY_MENU_TEXT"
-        # High / Base: the ceiling scales with the runtime (GiB per hour);
-        # this movie's ceiling in parentheses
+        # High / Base / Compact: the ceiling scales with the runtime (GiB
+        # per hour); this movie's ceiling in parentheses
         crf_tier_load movie High "" "$DURATION" 2>/dev/null || true
         echo "2) High        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of runtime (${CRF_CEILING_GIB} GiB for this movie)"
         crf_tier_load movie Base "" "$DURATION" 2>/dev/null || true
         echo "3) Base        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of runtime (${CRF_CEILING_GIB} GiB for this movie)"
-        echo "4) Custom CRF  exactly the CRF you enter"
+        crf_tier_load movie Compact "" "$DURATION" 2>/dev/null || true
+        echo "4) Compact     CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of runtime (${CRF_CEILING_GIB} GiB for this movie)"
+        echo "5) Custom CRF  exactly the CRF you enter"
     else
         printf '1) %-8s %-11s %s\n' Quality "CRF search" "$QUALITY_MENU_TEXT"
         crf_tier_load movie High "" "$DURATION" 2>/dev/null || true
         printf '2) %-8s %-11s <=%s GiB/h  (%s GiB)\n' High "CRF ${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR" "$CRF_CEILING_GIB"
         crf_tier_load movie Base "" "$DURATION" 2>/dev/null || true
         printf '3) %-8s %-11s <=%s GiB/h  (%s GiB)\n' Base "CRF ${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR" "$CRF_CEILING_GIB"
-        printf '4) %-8s exact CRF (0-%s)\n' Custom "$CRF_LIMIT"
+        crf_tier_load movie Compact "" "$DURATION" 2>/dev/null || true
+        printf '4) %-8s %-11s <=%s GiB/h  (%s GiB)\n' Compact "CRF ${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR" "$CRF_CEILING_GIB"
+        printf '5) %-8s exact CRF (0-%s)\n' Custom "$CRF_LIMIT"
     fi
 
     CUSTOM_CRF=""
 
+    # tiers from the largest to the smallest video, then Custom
     while true; do
-        read -rp "Select [1-4]: " t
+        read -rp "Select [1-5]: " t
 
         case "$t" in
             1) TIER="Quality"; break ;;
             2) TIER="High";    break ;;
             3) TIER="Base";    break ;;
-            4)
+            4) TIER="Compact"; break ;;
+            5)
                 TIER="Custom"
                 while true; do
                     read -rp "Custom CRF: " CUSTOM_CRF
@@ -365,7 +372,7 @@ while true; do
     else
 
         # ====================================================
-        # CRF TIERS: High / Base choose the lowest CRF of CRF_MIN..CRF_MAX
+        # CRF TIERS: High/Base/Compact choose the lowest CRF of CRF_MIN..CRF_MAX
         # whose sampled video estimate fits the ceiling, searched from
         # CRF_START (crf_select_boundary: upward with +1 / +2 steps when
         # CRF_START is too large, else downward one CRF at a time; the CRF
@@ -375,13 +382,13 @@ while true; do
         # with the same boundary search, else the one closest to the
         # target (crf_select_quality);
         # Custom uses the entered CRF. Audio is not part of the decision.
-        # High / Base: the video ceiling is this movie's exact runtime x
+        # High/Base/Compact: the video ceiling is this movie's exact runtime x
         # MOVIE_*_VIDEO_GIB_PER_HOUR (policy.sh movie_ceiling_bytes), the
         # one value the search and the post-encode retry (RETRY_SPEC) use.
         # ====================================================
 
         if ! crf_tier_load movie "$TIER" "$CUSTOM_CRF" "$DURATION" ||
-           [[ ( "$TIER" == High || "$TIER" == Base ) && ! "$CRF_CEILING_BYTES" =~ ^[1-9][0-9]*$ ]]; then
+           { crf_ceiling_tier "$TIER" && [[ ! "$CRF_CEILING_BYTES" =~ ^[1-9][0-9]*$ ]]; }; then
             echo
             echo "Runtime of $BASENAME unknown (\"$DURATION\"): no $TIER video ceiling; nothing queued for this movie."
             skip_movie && continue
@@ -416,14 +423,14 @@ while true; do
         CRF_TITLE_DURATION="$DURATION"
         CRF_TITLE_POINTS="$MOVIE_CRF_SAMPLE_POINTS"
 
-        # High / Base: actual results of earlier encodes of this movie with
+        # High/Base/Compact: actual results of earlier encodes of this movie with
         # the same encode settings (encode_common.sh crf_actual_sig) replace
         # the sample estimate of exactly their CRF; the job saves every
         # completed attempt under this fingerprint ("" = not cached).
         # Quality / Custom never use it.
         CRF_ACTUAL_SIG=""
         declare -gA CRF_ACTUAL_HIT=()
-        if [[ ( "$TIER" == High || "$TIER" == Base ) && -z "$QUALITY_STATUS" ]]; then
+        if crf_ceiling_tier "$TIER" && [[ -z "$QUALITY_STATUS" ]]; then
             CRF_ACTUAL_SIG=$(crf_actual_sig "$IN" "$VIDX" "$FILTER" "$OUT_WIDTH" "$OUT_HEIGHT" "$DURATION" \
                 "${DV_POLICY:-none}" "${DV_MODE:-}" "${HDR10P_POLICY:-none}") || CRF_ACTUAL_SIG=""
         fi
@@ -436,7 +443,7 @@ while true; do
             printf 'Estimating %s at %sx%s...\n' \
                 "$( [[ "$TIER" == "Custom" ]] && echo "CRF $CUSTOM_CRF" || echo "$TIER")" "$OUT_WIDTH" "$OUT_HEIGHT"
         fi
-        if [[ "$TIER" == High || "$TIER" == Base ]]; then
+        if crf_ceiling_tier "$TIER"; then
             printf '%-16s%s\n' "Runtime:" "$(format_hms "$DURATION")"
             printf '%-16s%s GiB/hour\n' "Size rate:" "$CRF_GIB_PER_HOUR"
             printf '%-16s%s GiB\n' "Video ceiling:" "$CRF_CEILING_GIB"
@@ -486,7 +493,7 @@ while true; do
         EXPECTED_VIDEO_GIB=$(bytes_to_gib "$EST_VIDEO_BYTES")
         VIDEO_SPEC="crf:$CRF"
 
-        # High / Base: re-encoded at CRF + 1 when the actual video is above
+        # High/Base/Compact: re-encoded at CRF + 1 when the actual video is above
         # the ceiling; once an attempt fits, CRF - 1 is encoded ONCE
         # ("boundary": no headroom or predicted-fit gate, the estimate of
         # CRF - 1 does not block it) unless CRF - 1 is CRF_MIN - 1 (the
@@ -835,7 +842,7 @@ while true; do
             "$( [[ "$VIDEO_SPEC" == crf:* ]] && (( ${CRF_OVER_CEILING:-0} == 1 )) && echo " | $(ui_warn "ceiling not met")")"
         printf '  %-8s%s -> ~%s GiB  (video ~%s, audio %s)\n' "Size:" "$SOURCE_TOTAL_GIB" \
             "$(awk -v t="$EXPECTED_TOTAL_GIB" 'BEGIN { printf "%.2f", t }')" "$EXPECTED_VIDEO_GIB" "$SOURCE_AUDIO_GIB"
-        if [[ "$VIDEO_SPEC" == crf:* && ( "$TIER" == High || "$TIER" == Base ) ]]; then
+        if [[ "$VIDEO_SPEC" == crf:* ]] && crf_ceiling_tier "$TIER"; then
             printf '  %-8s%s GiB video  (%s GiB/h x %s)\n' "Ceiling:" "$CRF_CEILING_GIB" \
                 "$CRF_GIB_PER_HOUR" "$(format_hms "$DURATION")"
             printf '  %-8sCRF %s-%s, video <= %s Mb/s average\n' "Limits:" "$CRF_MIN" "$CRF_MAX" \

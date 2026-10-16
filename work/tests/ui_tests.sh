@@ -251,7 +251,7 @@ sed 's/^/  | /' "$L"
 check "no policy dump"                   "! grep -qE 'Policy:|video policy|^Audio:\$' '$L'"
 check "analysis line"                    "grep -qE '^Analyzing source\\.\\.\\. OK    Source stats: (scanned|scanned \\+ refreshed)\$' '$L'"
 check "header"                           "grep -qE '^Source: +Film.mkv\$' '$L' && grep -qE '^Runtime: +00:00:02\$' '$L' && grep -qE '^Video: +320x180 H264 8-bit +[0-9.]+ Mb/s   [0-9.]+ GiB\$' '$L' && grep -qE '^Dynamic range: +SDR\$' '$L' && grep -qE '^Audio: +1 track, [0-9.]+ GiB, copied unchanged\$' '$L'"
-check "tier menu"                        "grep -qE '^1\\) Quality  CRF search  <=[0-9.]+ GiB \\(source-limited\\)\$' '$L' && grep -qE '^2\\) High     CRF 10-23 +<=$MHRATE GiB/h  \\($FCEILGIB GiB\\)\$' '$L' && grep -qE '^3\\) Base     CRF 18-29 +<=$MBRATE GiB/h  \\($FBCEILGIB GiB\\)\$' '$L' && grep -q '^4) Custom   exact CRF' '$L'"
+check "tier menu"                        "grep -qE '^1\\) Quality  CRF search  <=[0-9.]+ GiB \\(source-limited\\)\$' '$L' && grep -qE '^2\\) High     CRF 10-23 +<=$MHRATE GiB/h  \\($FCEILGIB GiB\\)\$' '$L' && grep -qE '^3\\) Base     CRF 18-29 +<=$MBRATE GiB/h  \\($FBCEILGIB GiB\\)\$' '$L' && grep -qE '^4\\) Compact  CRF 20-34 +<=0.40 GiB/h  \\(' '$L' && grep -q '^5) Custom   exact CRF' '$L'"
 check "estimating: runtime, rate, ceiling" \
     "[[ \"\$(grep -A3 '^Estimating High at 320x180' '$L' | tail -n 3 | tr '\\n' '|')\" == 'Runtime:        00:00:02|Size rate:      $MHRATE GiB/hour|Video ceiling:  $FCEILGIB GiB|' ]]"
 check "estimating + samples"             "grep -q '^Estimating High at 320x180\\.\\.\\.\$' '$L' && grep -qE '^  CRF 12   ~[0-9.]+ GiB\$' '$L' && grep -q '^           fits -> trying CRF 11\$' '$L' && ! grep -q 'sampling CRF' '$L'"

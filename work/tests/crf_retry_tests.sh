@@ -351,7 +351,7 @@ check "f3 says why"                           "grep -q '^Headroom large, but CRF
 movie_job f4 High 9 "$FLOOR" "[9]='$(gib 5.2) 0' [10]='$(gib 4.8) 0'"
 eq    "f4 below CRF_START, over: up to 10 as usual" "$(encoded f4)/$(awk '{print $3}' "$T/out/M.mkv")" "1:9 1:10 /10"
 check "menus pass CRF_MIN (the search floor), not CRF_START, as the retry floor" \
-    "grep -qF 'RETRY_SPEC=\"\$CRF_CEILING_BYTES:\$CRF_MAX:\$CRF_MIN:' '$SRC_WORK/movie_compress.sh' && grep -qF 'series_season_retry_spec \"\$TIER\" \"\$CRF_CEILING_BYTES\" \"\$CRF_MAX\" \"\$CRF_MIN\"' '$SRC_WORK/series_compress.sh' && ! grep -q 'RETRY_SPEC=.*CRF_START' '$SRC_WORK/movie_compress.sh'"
+    "grep -qF 'RETRY_SPEC=\"\$CRF_CEILING_BYTES:\$CRF_MAX:\$CRF_MIN:' '$SRC_WORK/movie_compress.sh' && grep -qF 'series_season_retry_spec \"\$TIER\" \"\$(series_ep_ceil \"\$1\")\" \"\$CRF_MAX\" \"\$CRF_MIN\"' '$SRC_WORK/series_compress.sh' && ! grep -q 'RETRY_SPEC=.*CRF_START' '$SRC_WORK/movie_compress.sh'"
 check "crf_tier_load: CRF_MIN is the search floor" \
     "( for l in ui bitrate policy; do source '$W/lib/'\$l.sh; done; COMPRESS_CONF='$SRC_WORK/lib/compress.conf' load_policy 2>/dev/null; crf_tier_load movie High; [[ \$CRF_MIN == \$MOVIE_HIGH_CRF_SEARCH_MIN && \$CRF_START == \$MOVIE_HIGH_CRF_START ]] && (( CRF_MIN < CRF_START )) )"
 

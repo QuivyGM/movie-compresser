@@ -202,7 +202,7 @@ movie_job s2 High 18 "$S" "[18]='$(gib 3) 0' [17]='$(gib 3.4) 0' [16]='$(gib 3.8
 eq    "5 headroom: one lower CRF (down_max 1)"    "$(encoded s2)/$(final)" "18 17 /17"
 check "5 old log wording"                         "logs s2 'Headroom large -> trying CRF 17' && logs s2 'Result: accepted'"
 check "5 series menu spec: shared season batch, no boundary mode" \
-    "grep -qF 'series_season_retry_spec \"\$TIER\" \"\$CRF_CEILING_BYTES\" \"\$CRF_MAX\" \"\$CRF_MIN\"' '$SRC_WORK/series_compress.sh' && ! grep -q boundary <(sed -n '/^ep_retry_spec() {/,/^}/p' '$SRC_WORK/series_compress.sh') && ! grep -q boundary <(sed -n '/^series_season_retry_spec() {/,/^}/p' '$SRC_WORK/lib/policy.sh')"
+    "grep -qF 'series_season_retry_spec \"\$TIER\" \"\$(series_ep_ceil \"\$1\")\" \"\$CRF_MAX\" \"\$CRF_MIN\"' '$SRC_WORK/series_compress.sh' && ! grep -q boundary <(sed -n '/^ep_retry_spec() {/,/^}/p' '$SRC_WORK/series_compress.sh') && ! grep -q boundary <(sed -n '/^series_season_retry_spec() {/,/^}/p' '$SRC_WORK/lib/policy.sh')"
 
 echo "== movie Quality unchanged (band)"
 

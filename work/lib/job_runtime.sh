@@ -966,12 +966,15 @@ record_crf_estimate() {
 #            discarded and the accepted encode is kept. The accepted
 #            encode is renamed to "<output>.accepted-crf<N>.part" first
 #            and only deleted after a lower attempt has fitted.
-#            down_mode=boundary (movie High / Base): CRF - 1 is tested
+#            down_mode=boundary (movie High / Base / Compact): CRF - 1 is tested
 #            exactly once after the first fit, whatever the headroom or
 #            its estimate (down_headroom_pct / down_max / down_fit_pct
 #            ignored); not below crf_min, never a CRF an actual encode
 #            already found above the ceiling. The result is the lowest
 #            CRF that fits next to one that does not (or crf_min).
+#            The actual size is measured strictly (item_video_bytes_checked):
+#            an attempt that cannot be measured counts as failed, never
+#            as fitting.
 # The ceiling is a hard upper bound: an attempt above it is never
 # chosen over one that fits.
 # ------------------------------------------------------------
@@ -987,8 +990,9 @@ item_retry_enabled() {
 # item_video_bytes FILE  ->  actual main video bytes (packet scan; audio,
 # subtitles, attachments and container overhead are not counted). 0
 # when nothing could be read; the status is not checked by its callers
-# (item_crf_encode: movie High / Base / Quality, series Custom and the
-# per-episode series items of earlier job scripts, unchanged).
+# (item_crf_encode: movie Quality, series Custom and the
+# per-episode series items of earlier job scripts, unchanged; movie
+# High / Base / Compact use item_video_bytes_checked).
 item_video_bytes() {
     local v a
     read -r v a <<< "$(media_stream_totals "$1")"
@@ -1002,7 +1006,8 @@ item_video_bytes() {
 # scan could undercount), the result is a whole number and above 0 (an
 # encoded video stream is never empty). Otherwise 1 and nothing printed:
 # the size is UNKNOWN, which is neither "fits" nor "over the ceiling"
-# (series season batch, job_crf_batch).
+# (series season batch, job_crf_batch; movie High / Base / Compact,
+# item_crf_encode down_mode=boundary).
 item_video_bytes_checked() {
     local t v a
 
@@ -1230,8 +1235,9 @@ item_crf_encode() {
         thr=$(( ITEM_EXP[down_below_vbytes] - 1 ))
         why="Below the acceptable band"
     fi
-    # movie High / Base: one CRF - 1 test after the first fit; the
-    # estimates chose the CRF, the actual encode decides
+    # movie High / Compact: one CRF - 1 test after the first fit; Base:
+    # CRF - 1, - 2, ... while each fits. The estimates chose the CRF, the
+    # actual encode decides
     if [[ "${ITEM_EXP[down_mode]:-}" == boundary ]]; then
         boundary=1
         thr="$ceil"
@@ -1261,6 +1267,15 @@ item_crf_encode() {
         fi
         (( ok == 1 )) && { "$fn" && item_part_complete || ok=0; }
 
+        # High / Base / Compact: a size that cannot be measured is never
+        # "fits" (nor "over"): the attempt counts as failed
+        if (( ok == 1 && boundary )) && ! act=$(item_video_bytes_checked "$ITEM_PART"); then
+            ok=0
+            ITEM_FAIL_REASON="video-size measurement failed"
+            echo
+            echo "CRF $c: video-size measurement failed; the result cannot be checked against the ceiling"
+        fi
+
         if (( ok == 0 )); then
             [[ -z "$prev" ]] && return 1
 
@@ -1280,7 +1295,7 @@ item_crf_encode() {
         fi
 
         JOB_DONE_PARTS[$ITEM_PART]=1
-        act=$(item_video_bytes "$ITEM_PART")
+        (( boundary )) || act=$(item_video_bytes "$ITEM_PART")
         item_actual_save "$c" "$act"
 
         echo
@@ -1382,6 +1397,12 @@ item_crf_encode() {
         item_attempt_part "$nc" || ok=0
         (( ok == 1 )) && { "$fn" && item_part_complete || ok=0; }
 
+        # High / Base / Compact: an unmeasurable CRF - 1 is discarded
+        if (( ok == 1 && boundary )) && ! a2=$(item_video_bytes_checked "$ITEM_PART"); then
+            ok=0
+            ITEM_FAIL_REASON="video-size measurement failed"
+        fi
+
         if (( ok == 0 )); then
             [[ "$ITEM_PART" != "$acc" ]] && rm -f -- "$ITEM_PART"
             item_attempt_note "$nc" 0 FAILED "${ITEM_FAIL_REASON:-encode failed}; keep CRF $c"
@@ -1393,7 +1414,7 @@ item_crf_encode() {
         fi
 
         JOB_DONE_PARTS[$ITEM_PART]=1
-        a2=$(item_video_bytes "$ITEM_PART")
+        (( boundary )) || a2=$(item_video_bytes "$ITEM_PART")
         item_actual_save "$nc" "$a2"
 
         echo
@@ -1462,7 +1483,7 @@ _batch_note() {
 
     [[ "$crf" == "$BATCH_PLANNED" ]] && est="${BATCH_EST[$id]:-}"
     BATCH_ROWS[$id]+="$crf$_RS$est$_RS$act$_RS$result$_RS$reason"$'\n'
-    { attempt_line "$BATCH_TIER" "$crf" "$est" "$act" "$BATCH_CEIL" "$result" "$reason"; echo; } \
+    { attempt_line "$BATCH_TIER" "$crf" "$est" "$act" "$(_bceil "$id")" "$result" "$reason"; echo; } \
         >> "$JOB_LOG_DIR/item-$id.log"
 }
 
@@ -1479,6 +1500,13 @@ _batch_notes_fit() {
             _batch_note "$id" "$1" "${_vb[$id]}" ACCEPTED-CANDIDATE
         fi
     done
+}
+
+# _bceil ID  ->  episode ID's own video ceiling (item_expect
+# ceiling_vbytes; series Compact: its runtime x the rate), BATCH_CEIL
+# when it has none (High / Base: the same value for every episode)
+_bceil() {
+    printf '%s' "${bceil[$1]:-$BATCH_CEIL}"
 }
 
 # _batch_season CRF  ->  every active episode encoded at CRF into its
@@ -1558,11 +1586,11 @@ _season_lines() {
     echo
     echo "Season CRF $1 actual results:"
     for id in "${active[@]}"; do
-        if (( _sv[$id] > BATCH_CEIL )); then
+        if (( _sv[$id] > $(_bceil "$id") )); then
             ((SEASON_OVER += 1))
-            printf '  %-*s %s GiB / %s GiB -> over ceiling\n' "$w" "${lbl[$id]}" "$(_gib "${_sv[$id]}")" "$(_gib "$BATCH_CEIL")"
+            printf '  %-*s %s GiB / %s GiB -> over ceiling\n' "$w" "${lbl[$id]}" "$(_gib "${_sv[$id]}")" "$(_gib "$(_bceil "$id")")"
         else
-            printf '  %-*s %s GiB / %s GiB -> fits\n' "$w" "${lbl[$id]}" "$(_gib "${_sv[$id]}")" "$(_gib "$BATCH_CEIL")"
+            printf '  %-*s %s GiB / %s GiB -> fits\n' "$w" "${lbl[$id]}" "$(_gib "${_sv[$id]}")" "$(_gib "$(_bceil "$id")")"
         fi
     done
 }
@@ -1575,7 +1603,7 @@ _season_notes() {
     local id
 
     for id in "${active[@]}"; do
-        if (( _sn[$id] > BATCH_CEIL )); then
+        if (( _sn[$id] > $(_bceil "$id") )); then
             _batch_note "$id" "$1" "${_sn[$id]}" "$3" "$4"
         else
             _batch_note "$id" "$1" "${_sn[$id]}" "$5" "${6:-}"
@@ -1595,7 +1623,8 @@ _season_notes() {
 # batch_mode=season (series High / Base jobs, retry field ":season"):
 #   strict shared season CRF. EVERY episode's actual main video bytes
 #   must be at or below the per-episode ceiling (no median, average or
-#   total). Any episode above it: the whole season is re-encoded at
+#   total). Each episode is checked against its OWN ceiling_vbytes
+#   (series Compact: its runtime x the rate; High / Base: one value). Any episode above it: the whole season is re-encoded at
 #   CRF + 1, up to crf_max (at crf_max still above: kept with a warning,
 #   only the episodes above it are reported over the ceiling). Once the
 #   season fits, CRF - 1 is tested ONCE for the whole season (not below
@@ -1620,7 +1649,7 @@ job_crf_batch() {
     local id c="" max="" min="" med m2 fits=0 nc fail_id why n_above
     local thr="" down_max=0 downs=0 acc strict=0
     local -a active=()
-    local -A part=() vb=() npart=() nvb=() over=() outp=() lbl=()
+    local -A part=() vb=() npart=() nvb=() over=() outp=() lbl=() bceil=()
 
     declare -gA BATCH_ROWS=() BATCH_EST=()
     BATCH_PLANNED="" BATCH_CEIL="" BATCH_TIER=""
@@ -1651,6 +1680,8 @@ job_crf_batch() {
         ITEM_EXP[crf_planned]="$BATCH_PLANNED"
         BATCH_EST[$id]="${ITEM_EXP[est_vbytes]:-}"
         lbl[$id]="${ITEM_EXP[ep_label]:-$ITEM_NAME}"
+        # every episode's own ceiling (series Compact: runtime-scaled)
+        bceil[$id]="${ITEM_EXP[ceiling_vbytes]:-}"
 
         if ! "item_encode_$id" || ! item_part_complete; then
             item_failed
@@ -1697,7 +1728,11 @@ job_crf_batch() {
         over[$c]=1
         if (( c >= max )); then
             echo "$SEASON_OVER episode(s) over the ceiling at CRF $c; CRF $max is the $BATCH_TIER limit"
-            echo "WARNING: the $(_gib "$BATCH_CEIL") GiB per-episode video ceiling cannot be met within the"
+            if (( $(printf '%s\n' "${bceil[@]}" | sort -u | grep -c .) > 1 )); then
+                echo "WARNING: the per-episode video ceilings (runtime-scaled) cannot be met within the"
+            else
+                echo "WARNING: the $(_gib "$BATCH_CEIL") GiB per-episode video ceiling cannot be met within the"
+            fi
             echo "         $BATCH_TIER CRF range ($min-$max); keeping CRF $max for every episode."
             _season_notes "$c" vb "OVER CEILING" "kept: CRF $max is the $BATCH_TIER limit" \
                 ACCEPTED-CANDIDATE "season kept at CRF $max"
@@ -1923,7 +1958,7 @@ job_crf_batch() {
         ITEM_PART="${part[$id]}"
         if (( strict )); then
             # season mode: only the episodes actually above the ceiling
-            (( vb[$id] > BATCH_CEIL )) && ITEM_OVER_CEILING=1
+            (( vb[$id] > $(_bceil "$id") )) && ITEM_OVER_CEILING=1
         elif [[ -n "$BATCH_CEIL" ]] && (( fits == 0 )); then
             ITEM_OVER_CEILING=1
         fi

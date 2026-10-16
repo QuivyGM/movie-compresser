@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Compression policy: loads and validates compress.conf and holds the
 # policy math that uses it (CRF tier selection for movie Quality, High,
-# Base and Custom and series High, Base and Custom; audio-menu rates).
+# Base, Compact and Custom and series High, Base, Compact and Custom;
+# audio-menu rates).
 # Sourced, not executed. Needs bitrate.sh.
 #
 # Movie and series compression copy every audio track unchanged; audio
@@ -14,8 +15,8 @@
 
 POLICY_KEYS_POSITIVE=(
     MOVIE_QUALITY_TARGET_VIDEO_GIB MOVIE_QUALITY_ACCEPT_MIN_GIB MOVIE_QUALITY_ACCEPT_MAX_GIB
-    MOVIE_HIGH_VIDEO_GIB_PER_HOUR MOVIE_BASE_VIDEO_GIB_PER_HOUR
-    SERIES_HIGH_VIDEO_SIZE_CEILING_GIB SERIES_BASE_VIDEO_SIZE_CEILING_GIB
+    MOVIE_HIGH_VIDEO_GIB_PER_HOUR MOVIE_BASE_VIDEO_GIB_PER_HOUR MOVIE_COMPACT_VIDEO_GIB_PER_HOUR
+    SERIES_HIGH_VIDEO_SIZE_CEILING_GIB SERIES_BASE_VIDEO_SIZE_CEILING_GIB SERIES_COMPACT_VIDEO_GIB_PER_HOUR
     SERIES_CRF_OUTLIER_PCT
     CRF_SAMPLE_SECONDS
     AUDIO_HIGH_TRIGGER_KBPS AUDIO_COMPACT_TRIGGER_GIB AUDIO_COMPACT_LIMIT_GIB
@@ -31,13 +32,15 @@ POLICY_KEYS_CRF=(
     MOVIE_QUALITY_CRF_MIN MOVIE_QUALITY_CRF_START MOVIE_QUALITY_CRF_MAX
     MOVIE_HIGH_CRF_SEARCH_MIN MOVIE_HIGH_CRF_START MOVIE_HIGH_CRF_MAX
     MOVIE_BASE_CRF_SEARCH_MIN MOVIE_BASE_CRF_START MOVIE_BASE_CRF_MAX
+    MOVIE_COMPACT_CRF_SEARCH_MIN MOVIE_COMPACT_CRF_START MOVIE_COMPACT_CRF_MAX
     SERIES_HIGH_CRF_SEARCH_MIN SERIES_HIGH_CRF_START SERIES_HIGH_CRF_MAX
     SERIES_BASE_CRF_SEARCH_MIN SERIES_BASE_CRF_START SERIES_BASE_CRF_MAX
     MOVIE_BASE_FLOOR_CRF_MIN
+    SERIES_COMPACT_CRF_SEARCH_MIN SERIES_COMPACT_CRF_START SERIES_COMPACT_CRF_MAX
 )
 
-# High / Base tiers (*_CRF_START / *_CRF_SEARCH_MIN / *_CRF_MAX)
-POLICY_CRF_TIERS=(MOVIE_HIGH MOVIE_BASE SERIES_HIGH SERIES_BASE)
+# High / Base / Compact tiers (*_CRF_START / *_CRF_SEARCH_MIN / *_CRF_MAX)
+POLICY_CRF_TIERS=(MOVIE_HIGH MOVIE_BASE MOVIE_COMPACT SERIES_HIGH SERIES_BASE SERIES_COMPACT)
 
 # Former High / Base *_CRF_MIN: search start and hard floor in one. A
 # config that sets only it keeps the former behaviour (START = SEARCH_MIN
@@ -422,7 +425,7 @@ movie_policy_line() (
                 "$MOVIE_QUALITY_CRF_MIN" "$MOVIE_QUALITY_CRF_MAX" "$MOVIE_QUALITY_CRF_START" \
                 "$MOVIE_QUALITY_ACCEPT_MIN_GIB" "$MOVIE_QUALITY_ACCEPT_MAX_GIB" "$MOVIE_QUALITY_TARGET_VIDEO_GIB"
             ;;
-        High|Base)
+        High|Base|Compact)
             crf_tier_load movie "$1" "" "${2:-}" || return 1
             printf 'CRF %s-%s, search starts at %s [lowest CRF with the video estimate at or below %s GiB per hour of runtime%s]' \
                 "$CRF_MIN" "$CRF_MAX" "$CRF_START" "$CRF_GIB_PER_HOUR" \
@@ -454,7 +457,11 @@ movie_video_policy_lines() {
 }
 
 # ------------------------------------------------------------
-# CRF tiers (movie / series High, Base; Custom)
+# CRF tiers (movie / series High, Base, Compact; Custom)
+#
+# Compact is Base with its own CRF range and a lower ceiling (its own
+# MOVIE_COMPACT_* / SERIES_COMPACT_* settings); everything below applies
+# to it unchanged.
 #
 # Lower CRF = higher quality. Three separate bounds per tier:
 #   CRF_START  the first CRF estimated (*_CRF_START); not a bound
@@ -492,6 +499,15 @@ _gib_bytes() {
 crf_valid() {
     [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
         awk -v c="$1" -v l="$CRF_LIMIT" 'BEGIN { exit !(c >= 0 && c <= l) }'
+}
+
+# crf_ceiling_tier TIER  ->  0 for the tiers that search the boundary
+# around a video ceiling (High / Base / Compact; not Quality / Custom)
+crf_ceiling_tier() {
+    case "${1:-}" in
+        High|Base|Compact) return 0 ;;
+    esac
+    return 1
 }
 
 # movie_ceiling_bytes GIB_PER_HOUR DURATION_SECONDS  ->  whole bytes
@@ -540,22 +556,26 @@ movie_floor_source_exempt() {
 
 # crf_tier_load SCOPE TIER [CUSTOM_CRF [DURATION]]
 #
-# SCOPE: movie | series. TIER: High | Base | Custom (| Quality, movie).
+# SCOPE: movie | series. TIER: High | Base | Compact | Custom (| Quality,
+# movie).
 # Sets CRF_START (first CRF estimated) CRF_MIN (absolute lowest CRF:
 # search and post-encode retry floor) CRF_MAX CRF_CEILING_GIB
 # CRF_CEILING_BYTES CRF_GIB_PER_HOUR.
-# Movie High / Base: the ceiling scales with the runtime:
+# Movie High / Base / Compact: the ceiling scales with the runtime:
 # CRF_GIB_PER_HOUR = MOVIE_*_VIDEO_GIB_PER_HOUR and, with DURATION (the
 # movie's runtime in seconds), CRF_CEILING_BYTES = movie_ceiling_bytes
 # and CRF_CEILING_GIB its GiB ("7.00"). Without DURATION (menu text)
 # both ceiling values are empty; an unusable DURATION returns 1.
 # Series High / Base: the fixed SERIES_*_VIDEO_SIZE_CEILING_GIB per
-# episode (CRF_GIB_PER_HOUR empty).
+# episode (CRF_GIB_PER_HOUR empty). Series Compact: CRF_GIB_PER_HOUR =
+# SERIES_COMPACT_VIDEO_GIB_PER_HOUR, CRF_CEILING_BYTES the ceiling of one
+# hour of runtime, CRF_CEILING_GIB the rate; the episodes' own ceilings
+# come from series_ep_ceilings.
 # Movie Base also: CRF_FLOOR_MBPS (MOVIE_BASE_VIDEO_FLOOR_MBPS) and
 # CRF_FLOOR_CRF_MIN (MOVIE_BASE_FLOOR_CRF_MIN), and with DURATION
-# CRF_FLOOR_BYTES (movie_floor_bytes; 0 = no floor). Every other tier:
-# all three empty / 0 (no floor). The source exemption is the menu's
-# (movie_floor_source_exempt).
+# CRF_FLOOR_BYTES (movie_floor_bytes; 0 = no floor). Every other tier
+# (movie High / Compact included): all three empty / 0 (no floor). The
+# source exemption is the menu's (movie_floor_source_exempt).
 # Custom: CRF_START = CRF_MIN = CRF_MAX = CUSTOM_CRF, no ceiling
 # (CRF_CEILING_BYTES=0).
 crf_tier_load() {
@@ -567,7 +587,7 @@ crf_tier_load() {
     CRF_FLOOR_BYTES=0
 
     case "$tier" in
-        High|Base)
+        High|Base|Compact)
             u="${tier^^}"
             local a="${scope}_${u}_CRF_SEARCH_MIN" s="${scope}_${u}_CRF_START"
             local b="${scope}_${u}_CRF_MAX"
@@ -594,6 +614,16 @@ crf_tier_load() {
                         CRF_FLOOR_BYTES=$(movie_floor_bytes "$CRF_FLOOR_MBPS" "$4") || CRF_FLOOR_BYTES=0
                     fi
                 fi
+            elif series_rate_tier "$tier"; then
+                # series Compact: every episode's ceiling is its runtime x
+                # the rate (series_ep_ceilings -> SERIES_EP_CEIL);
+                # CRF_CEILING_BYTES is the ceiling of one hour, the
+                # reference the season search compares against
+                # (series_batch_stats scales every episode to it)
+                local r="SERIES_${u}_VIDEO_GIB_PER_HOUR"
+                CRF_GIB_PER_HOUR="${!r}"
+                CRF_CEILING_GIB="$CRF_GIB_PER_HOUR"
+                CRF_CEILING_BYTES=$(movie_ceiling_bytes "$CRF_GIB_PER_HOUR" 3600)
             else
                 local c="${scope}_${u}_VIDEO_SIZE_CEILING_GIB"
                 CRF_CEILING_GIB="${!c}"
@@ -669,7 +699,11 @@ crf_policy_lines() (
         fi
     elif [[ "$scope" == series ]]; then
         echo "  CRF range: ${CRF_MIN}-${CRF_MAX}, search starts at ${CRF_START} (lowest CRF at which every episode fits)"
-        echo "  video ceiling: ${CRF_CEILING_GIB} GiB/episode"
+        if series_rate_tier "$tier"; then
+            echo "  video ceiling: ${CRF_GIB_PER_HOUR} GiB per hour of each episode's runtime (every episode its own ceiling)"
+        else
+            echo "  video ceiling: ${CRF_CEILING_GIB} GiB/episode"
+        fi
         echo "  one shared season CRF for every encoded episode; an outlier (> median +${SERIES_CRF_OUTLIER_PCT}%) can raise it, never gets a CRF of its own"
     else
         echo "  CRF range: ${CRF_MIN}-${CRF_MAX}, search starts at ${CRF_START} (lowest CRF that fits the ceiling)"
@@ -1389,6 +1423,69 @@ series_crf_shared() {
     [[ "${SERIES_CRF_SHARED:-0}" == 1 ]]
 }
 
+# ------------------------------------------------------------
+# Runtime-scaled series ceilings (series Compact)
+#
+# High / Base have one fixed ceiling for every episode. Compact gives
+# every episode its own: exact runtime (EP_DUR) x CRF_GIB_PER_HOUR, in
+# SERIES_EP_CEIL (EP_DUR order; empty for High / Base, so everything
+# below behaves exactly as with one ceiling). The season search still
+# compares ONE number per CRF with CRF_CEILING_BYTES (one hour of
+# runtime): series_batch_stats scales each episode's estimate by
+# CRF_CEILING_BYTES / its own ceiling, so the season fits only when every
+# episode fits its own ceiling. Still one shared season CRF.
+# ------------------------------------------------------------
+SERIES_EP_CEIL=()
+
+# series_rate_tier TIER  ->  0 for a series tier whose per-episode
+# ceiling scales with the runtime (Compact)
+series_rate_tier() {
+    [[ "${1:-}" == Compact ]]
+}
+
+# series_ep_ceilings TIER  ->  SERIES_EP_CEIL from EP_DUR and
+# CRF_GIB_PER_HOUR (crf_tier_load series TIER first); emptied for the
+# other tiers. Returns 1 when an episode runtime is unusable.
+series_ep_ceilings() {
+    local i b
+
+    SERIES_EP_CEIL=()
+    series_rate_tier "$1" || return 0
+    for i in "${!EP_DUR[@]}"; do
+        if ! b=$(movie_ceiling_bytes "$CRF_GIB_PER_HOUR" "${EP_DUR[$i]}"); then
+            SERIES_EP_CEIL=()
+            return 1
+        fi
+        SERIES_EP_CEIL[$i]="$b"
+    done
+}
+
+# _series_ceil_of INDEX CEILING_BYTES  ->  the ceiling of episode INDEX:
+# its own (SERIES_EP_CEIL) when there is one and CEILING_BYTES is a
+# ceiling (> 0), else CEILING_BYTES
+_series_ceil_of() {
+    if [[ -n "${SERIES_EP_CEIL[$1]:-}" ]] && (( ${2:-0} > 0 )); then
+        printf '%s' "${SERIES_EP_CEIL[$1]}"
+    else
+        printf '%s' "${2:-0}"
+    fi
+}
+
+# series_ep_ceil INDEX  ->  episode INDEX's ceiling (CRF_CEILING_BYTES
+# when the tier has one ceiling for every episode)
+series_ep_ceil() {
+    _series_ceil_of "$1" "${CRF_CEILING_BYTES:-0}"
+}
+
+# series_ceiling_text  ->  "1.5 GiB/episode" | "0.40 GiB/h" (menu text)
+series_ceiling_text() {
+    if [[ -n "${CRF_GIB_PER_HOUR:-}" ]]; then
+        printf '%s GiB/h' "$CRF_GIB_PER_HOUR"
+    else
+        printf '%s GiB/episode' "$CRF_CEILING_GIB"
+    fi
+}
+
 # series_batch_stats CEILING_BYTES VIDEO_BYTES...
 #
 # Season figures for one CRF. VIDEO_BYTES: estimated video bytes per
@@ -1411,10 +1508,18 @@ series_crf_shared() {
 #   SB_DECIDE_IDX index of that episode (the first one on a tie)
 #   SB_ABOVE      indexes of the episodes above the ceiling
 #   SB_FITS       1 when SB_DECIDE fits the ceiling (always 1 without one)
+#   SB_DECIDE_BYTES  video bytes of the SB_DECIDE_IDX episode
+# With per-episode ceilings (SERIES_EP_CEIL, series Compact; CEILING_BYTES
+# is then the reference of one hour): SB_ABOVE uses each episode's own
+# ceiling, and the decision is made on each estimate scaled to the
+# reference (bytes x CEILING_BYTES / own ceiling, kept at or below
+# CEILING_BYTES exactly when the episode fits its own ceiling): SB_DECIDE
+# is the largest scaled value (the episode with the least room), so
+# SB_FITS = 1 only when every deciding episode fits its own ceiling.
 series_batch_stats() {
-    local ceil="$1" i
+    local ceil="$1" i ci
     shift
-    local vb=("$@")
+    local vb=("$@") cmp=()
 
     SB_ABOVE=()
     SB_OUTLIERS=()
@@ -1427,7 +1532,16 @@ series_batch_stats() {
 
     for i in "${!vb[@]}"; do
         (( vb[i] > SB_LIMIT )) && SB_OUTLIERS+=("$i")
-        (( ceil > 0 && vb[i] > ceil )) && SB_ABOVE+=("$i")
+        ci=$(_series_ceil_of "$i" "$ceil")
+        (( ceil > 0 && vb[i] > ci )) && SB_ABOVE+=("$i")
+        cmp[i]="${vb[i]}"
+        if (( ceil > 0 && ci != ceil )); then
+            cmp[i]=$(awk -v b="${vb[i]}" -v c="$ceil" -v e="$ci" 'BEGIN {
+                n = sprintf("%.0f", b * c / e) + 0
+                if (b <= e && n > c) n = c
+                if (b > e && n <= c) n = c + 1
+                printf "%.0f", n }')
+        fi
     done
     if (( ${#vb[@]} >= 3 && ${#SB_OUTLIERS[@]} == 1 )); then
         SB_ISOLATED="${SB_OUTLIERS[0]}"
@@ -1436,11 +1550,12 @@ series_batch_stats() {
     SB_DECIDE=0
     for i in "${!vb[@]}"; do
         [[ "$i" == "$SB_ISOLATED" ]] && ! series_crf_shared && continue
-        if [[ -z "$SB_DECIDE_IDX" ]] || (( vb[i] > SB_DECIDE )); then
-            SB_DECIDE="${vb[i]}"
+        if [[ -z "$SB_DECIDE_IDX" ]] || (( cmp[i] > SB_DECIDE )); then
+            SB_DECIDE="${cmp[i]}"
             SB_DECIDE_IDX="$i"
         fi
     done
+    SB_DECIDE_BYTES="${vb[SB_DECIDE_IDX]:-0}"
 
     SB_FITS=0
     (( ceil <= 0 || SB_DECIDE <= ceil )) && SB_FITS=1
@@ -1501,7 +1616,7 @@ series_decisive_inferred() {
     n=${#SC_EP_BYTES[@]}
     for i in "${!SC_EP_BYTES[@]}"; do
         series_from_sampled "${SC_EP_FROM[$i]:-}" || continue
-        (( SC_EP_BYTES[i] > ceil )) && ((over += 1))
+        (( SC_EP_BYTES[i] > $(_series_ceil_of "$i" "$ceil") )) && ((over += 1))
     done
     (( over >= 2 || (over >= 1 && n < 3) )) && return 1
     series_crf_shared && (( over >= 1 )) && return 1
@@ -1542,16 +1657,20 @@ series_decisive_inferred() {
 # Otherwise 1: SKIPPED is sampled. Reads CRF_SERIES_RATES[NEXT]
 # (crf_series_estimate; "-" = not sampled) and EP_DUR.
 series_crf_certify_over() {
-    local next="$2" ceil="$3" shared=0
+    local next="$2" ceil="$3" shared=0 i cl=""
 
     [[ -n "${CRF_SERIES_RATES[$next]:-}" ]] || return 1
     series_crf_shared && shared=1
-    awk -v r="${CRF_SERIES_RATES[$next]}" -v d="${EP_DUR[*]}" -v c="$ceil" -v sh="$shared" 'BEGIN {
+    # each episode against its own ceiling (one value for High / Base)
+    for i in "${!EP_DUR[@]}"; do
+        cl+="$(_series_ceil_of "$i" "$ceil") "
+    done
+    awk -v r="${CRF_SERIES_RATES[$next]}" -v d="${EP_DUR[*]}" -v cl="$cl" -v sh="$shared" 'BEGIN {
         n = split(r, rate, " ")
-        if (n == 0 || split(d, dur, " ") != n) exit 1
+        if (n == 0 || split(d, dur, " ") != n || split(cl, c, " ") != n) exit 1
         over = 0
         for (i = 1; i <= n; i++)
-            if (rate[i] != "-" && sprintf("%.0f", rate[i] * dur[i]) + 0 > c) over++
+            if (rate[i] != "-" && sprintf("%.0f", rate[i] * dur[i]) + 0 > c[i] + 0) over++
         exit !(over >= 2 || (over >= 1 && (n < 3 || sh == 1)))
     }'
 }
@@ -1696,12 +1815,13 @@ series_late_ceiling() {
     (( ${CRF_CEILING_BYTES:-0} > 0 )) || return 0
 
     for i in ${GUARD_SAMPLED[@]+"${GUARD_SAMPLED[@]}"}; do
-        (( EP_EST[i] > CRF_CEILING_BYTES )) || continue
+        (( EP_EST[i] > $(series_ep_ceil "$i") )) || continue
         if (( ${#LATE[@]} == 0 )); then
             echo
             echo "Ceiling check (own sample above the ceiling at its CRF):"
         fi
-        series_episode_crf "$i" "${EP_CRF[$i]}" "$CRF_MAX" "$CRF_CEILING_BYTES" "$est" "$report" || return 1
+        # its own ceiling (series Compact: its runtime x the rate)
+        series_episode_crf "$i" "${EP_CRF[$i]}" "$CRF_MAX" "$(series_ep_ceil "$i")" "$est" "$report" || return 1
         EP_CRF[$i]="$EPC_CRF"
         EP_EST[$i]="$EPC_BYTES"
         EP_OVER[$i]="$EPC_OVER"
@@ -1738,7 +1858,7 @@ series_crf_analysis_lines() {
             echo "    ${#SB_OUTLIERS[@]} episodes above median +${SERIES_CRF_OUTLIER_PCT}% (season difficulty, not outliers)"
         fi
         if (( ${CRF_CEILING_BYTES:-0} > 0 )); then
-            echo "    ceiling:         ${CRF_CEILING_GIB} GiB/episode"
+            echo "    ceiling:         $(series_ceiling_text)"
             printf '    -> %s; %d of %d episode(s) above the ceiling\n' \
                 "$( if series_crf_shared; then (( SB_FITS == 1 )) && echo "every episode fits" || echo "an episode is above the ceiling"
                     else (( SB_FITS == 1 )) && echo "regular episodes fit" || echo "regular episode above the ceiling"; fi)" \
