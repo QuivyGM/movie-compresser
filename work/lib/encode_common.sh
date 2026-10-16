@@ -1017,6 +1017,154 @@ crf_episode_step_report() {
 }
 
 # ------------------------------------------------------------
+# Movie Base: no CRF inside both limits (prompt)
+# ------------------------------------------------------------
+
+# base_crf_prompt ESTIMATOR
+#
+# Movie Base, when the search found no CRF that fits the ceiling AND
+# reaches the video floor: CRF_FLOOR_STATUS gap / limit (policy.sh
+# crf_floor_extend) or CRF_OVER_CEILING=1 (even CRF_MAX above the
+# ceiling). Warns, then asks:
+#   1) encode at the automatic CRF (CRF) anyway
+#   2) adjust the CRF manually: a whole x265 CRF 0-51 (not limited to
+#      the Base search range; empty = the automatic CRF), estimated with
+#      ESTIMATOR through the search's CRF_EST (a CRF already estimated is
+#      shown, not estimated again; sample encodes only, never the final
+#      encode), shown against the ceiling and the floor with a warning
+#      for each limit it misses, then: encode at it / choose another CRF
+#      / skip
+#   3) skip this movie
+# Reads CRF CRF_EST CRF_MAX CRF_OVER_CEILING CRF_FLOOR_STATUS
+# CRF_BOUNDARY_LOW CRF_CEILING_BYTES CRF_CEILING_GIB CRF_FLOOR_BYTES
+# CRF_FLOOR_MBPS DURATION SOURCE_VIDEO_MBPS. Sets BASE_PICK (auto |
+# manual | skip; end of input: skip) and BASE_PICK_CRF (the CRF to
+# encode). Always returns 0.
+base_crf_prompt() {
+    local est="$1" sel e
+
+    BASE_PICK=""
+    BASE_PICK_CRF="$CRF"
+    e="${CRF_EST[$CRF]:-}"
+
+    echo
+    echo "------------------------------------------------------------"
+    if (( ${CRF_OVER_CEILING:-0} == 1 )); then
+        echo "$(ui_warn WARNING): the ${CRF_CEILING_GIB} GiB video ceiling cannot be met within the"
+        echo "Base CRF range: even CRF ${CRF_MAX} (the lowest quality Base allows) is"
+        echo "estimated at ~$(bytes_to_gib "$e") GiB video, ~$(crf_oversize_gib "$e" "$CRF_CEILING_BYTES") GiB above the ceiling."
+    else
+        echo "$(ui_warn WARNING): Base CRF ${CRF} is estimated at ~$(bytes_to_mbps "$e" "$DURATION") Mb/s (~$(bytes_to_gib "$e") GiB video),"
+        echo "below the ${CRF_FLOOR_MBPS} Mb/s Base video floor ($(bytes_to_gib "$CRF_FLOOR_BYTES") GiB; source video ${SOURCE_VIDEO_MBPS} Mb/s)."
+        if [[ "$CRF_FLOOR_STATUS" == gap ]]; then
+            echo "CRF ${CRF_BOUNDARY_LOW}, the next higher quality, is estimated above the ${CRF_CEILING_GIB} GiB ceiling."
+        else
+            echo "CRF ${CRF} is the lowest CRF the floor may use (MOVIE_BASE_FLOOR_CRF_MIN)."
+        fi
+    fi
+    echo "------------------------------------------------------------"
+
+    while true; do
+        echo
+        if (( ${CRF_OVER_CEILING:-0} == 1 )); then
+            echo "1) Encode at CRF ${CRF} anyway (above the ceiling)"
+        else
+            echo "1) Encode at CRF ${CRF} anyway (below the floor)"
+        fi
+        echo "2) Adjust CRF manually"
+        echo "3) Skip this movie"
+        if ! read -rp "Select [1-3]: " sel; then
+            BASE_PICK=skip
+            return 0
+        fi
+        case "$sel" in
+            1) BASE_PICK=auto; return 0 ;;
+            2) _base_crf_manual "$est"; [[ -n "$BASE_PICK" ]] && return 0 ;;
+            3) BASE_PICK=skip; return 0 ;;
+            *) echo "Invalid selection." ;;
+        esac
+    done
+}
+
+# _base_crf_manual ESTIMATOR  ->  the manual CRF loop of base_crf_prompt:
+# sets BASE_PICK manual (BASE_PICK_CRF) or skip (also at end of input)
+_base_crf_manual() {
+    local est="$1" cur="$CRF" in m e cached sel over below
+
+    while true; do
+        if ! read -rp "Manual Base CRF (0-$CRF_LIMIT) [$cur]: " in; then
+            BASE_PICK=skip
+            return 0
+        fi
+        in="${in//[[:space:]]/}"
+        [[ -z "$in" ]] && in="$cur"
+        if [[ ! "$in" =~ ^[0-9]+$ ]] || (( 10#$in > CRF_LIMIT )); then
+            echo "Enter a whole x265 CRF from 0 to $CRF_LIMIT (lower = higher quality), e.g. $CRF"
+            continue
+        fi
+        m=$((10#$in))
+
+        cached=0
+        if [[ -n "${CRF_EST[$m]+x}" ]]; then
+            cached=1
+            e="${CRF_EST[$m]}"
+        else
+            echo "Estimating CRF $m (sample encodes only)..."
+            if ! _CRF_SELECT_EST="$est" _crf_select_probe "$m"; then
+                echo "$(ui_warn "Could not estimate CRF $m") (sample encode error above); choose another CRF."
+                continue
+            fi
+            e="$CRF_EST_RESULT"
+        fi
+
+        over=0
+        below=0
+        (( e > CRF_CEILING_BYTES )) && over=1
+        crf_below_floor "$e" "$CRF_FLOOR_BYTES" && below=1
+
+        echo
+        printf 'Manual Base CRF:   %s\n' "$m"
+        printf 'Estimated video:   %s GiB%s\n' "$(bytes_to_gib "$e")" "$( (( cached )) && echo " (already estimated)")"
+        printf 'Estimated bitrate: %s Mb/s\n' "$(bytes_to_mbps "$e" "$DURATION")"
+        printf 'Base ceiling:      %s GiB\n' "$CRF_CEILING_GIB"
+        if [[ "${CRF_FLOOR_BYTES:-0}" =~ ^[0-9]+$ ]] && (( CRF_FLOOR_BYTES > 0 )); then
+            printf 'Base floor:        %s Mb/s\n' "$CRF_FLOOR_MBPS"
+        else
+            printf 'Base floor:        not applied (source video %s Mb/s)\n' "$SOURCE_VIDEO_MBPS"
+        fi
+        if (( over )); then
+            echo
+            echo "$(ui_warn WARNING): estimated video exceeds the Base ceiling by $(crf_oversize_gib "$e" "$CRF_CEILING_BYTES") GiB."
+        fi
+        if (( below )); then
+            echo
+            echo "$(ui_warn WARNING): estimated bitrate is below the ${CRF_FLOOR_MBPS} Mb/s Base floor."
+        fi
+
+        echo
+        if (( over || below )); then
+            echo "1) Encode at CRF $m anyway"
+        else
+            echo "1) Encode at CRF $m"
+        fi
+        echo "2) Choose another CRF"
+        echo "3) Skip this movie"
+        while true; do
+            if ! read -rp "Select [1-3]: " sel; then
+                BASE_PICK=skip
+                return 0
+            fi
+            case "$sel" in
+                1) BASE_PICK=manual; BASE_PICK_CRF="$m"; return 0 ;;
+                2) cur="$m"; break ;;
+                3) BASE_PICK=skip; return 0 ;;
+                *) echo "Invalid selection." ;;
+            esac
+        done
+    done
+}
+
+# ------------------------------------------------------------
 # Metadata helpers
 # ------------------------------------------------------------
 
@@ -1736,8 +1884,11 @@ emit_failed_item() {
 #           once; Base: CRF_LIMIT, i.e. until one is above the ceiling or
 #           CRF_MIN is reached; job_runtime.sh). FLOOR_BYTES /
 #           FLOOR_CRF_MIN (movie Base): the video floor (0 = none) and the
-#           lowest CRF a result below it may go to. "" = no retry
-#           (Custom).
+#           lowest CRF a result below it may go to. DOWN_MODE "manual"
+#           (movie Base manual CRF, base_crf_prompt): one encode at
+#           exactly the planned CRF, no CRF retry; its actual video is
+#           checked against the ceiling / floor and a violation flagged.
+#           "" = no retry (Custom).
 #           CRF_EST "CRF=BYTES:..." the pre-encode estimates per CRF (for
 #           the FIT_PCT prediction).
 #           ACTUAL_SIG (movie High / Base): the encode fingerprint
@@ -1916,9 +2067,13 @@ emit_encode_item() {
     # movie High / Base: one CRF - 1 test after the first fit (job_runtime.sh)
     [[ "$mode" == "crf" && "$rdmode" == boundary ]] &&
         expect+=' down_mode=boundary'
+    # movie Base manual CRF (base_crf_prompt): encoded once at exactly that
+    # CRF, only checked and reported (job_runtime.sh)
+    [[ "$mode" == "crf" && "$rdmode" == manual ]] &&
+        expect+=' down_mode=manual'
     # movie Base: the video floor (bytes; 0 = none / source exempt) and the
     # lowest CRF the post-encode retry may use to reach it (job_runtime.sh)
-    [[ "$mode" == "crf" && "$rdmode" == boundary && "$rfloor" =~ ^[0-9]+$ ]] &&
+    [[ "$mode" == "crf" && ( "$rdmode" == boundary || "$rdmode" == manual ) && "$rfloor" =~ ^[0-9]+$ ]] &&
         expect+=$(printf ' floor_vbytes=%q floor_crf_min=%q' "$rfloor" "$rfloormin")
     # series High / Base: strict shared season CRF (job_runtime.sh job_crf_batch)
     if [[ "$mode" == "crf" && "$rbatch" == season ]]; then

@@ -192,6 +192,28 @@ movie_job f7 Base 10 "${BF/floor_vbytes=$(gib 7.5)/floor_vbytes=0}" "[10]='$(gib
 eq    "19 floor 0 (source exempt): never below crf_min" "$(encoded f7)/$(final)" "10 /10"
 check "19 no flag" "! below_floor f7"
 
+echo "== movie Base manual CRF (down_mode=manual): one encode at exactly that CRF"
+
+# the menu's manual spec: "CEIL:CRF:CRF:0:0:::manual:FLOOR_BYTES:CRF"
+BM="ceiling_vbytes=$(gib 8.35) crf_min=21 crf_max=21 down_headroom_pct=0 down_max=0 down_mode=manual floor_vbytes=$(gib 5) floor_crf_min=21"
+over_ceiling() { grep -q '^Above the video ceiling' "$T/$1.log"; }
+
+movie_job m1 Base 21 "$BM" "[21]='$(gib 7) 0' [20]='$(gib 7.5) 0' [22]='$(gib 6) 0'"
+eq    "20 manual CRF inside both limits: encoded once, no CRF - 1 test" "$(encoded m1)/$(final)/$(verified m1)" "21 /21/21 "
+check "20 log names the manual CRF" "logs m1 'Base manual CRF 21 (chosen in the menu; no automatic CRF retry)' && logs m1 'Result: accepted (Base manual CRF 21)'"
+check "20 no flags" "! below_floor m1 && ! over_ceiling m1"
+
+movie_job m2 Base 21 "$BM" "[21]='$(gib 9) 0' [22]='$(gib 8) 0'"
+eq    "21 manual CRF above the ceiling: kept, not retried at CRF + 1" "$(encoded m2)/$(final)" "21 /21"
+check "21 flagged above the ceiling" "logs m2 'WARNING: Base manual CRF 21 is above the 8.35 GiB video ceiling; kept as chosen.' && over_ceiling m2"
+
+movie_job m3 Base 21 "$BM" "[21]='$(gib 4) 0' [20]='$(gib 4.5) 0'"
+eq    "22 manual CRF below the floor: kept, not retried lower" "$(encoded m3)/$(final)" "21 /21"
+check "22 flagged below the floor" "grep -q '^WARNING: Base manual CRF 21 actual video .* Mb/s is below the .* Mb/s video floor; kept as chosen.\$' '$T/m3.log' && below_floor m3"
+
+movie_job m4 Base 21 "$BM" "[21]=fail"
+eq    "23 manual CRF encode fails: item fails (no fallback CRF)" "$(encoded m4)/$(final)" "21 /"
+
 echo "== per-episode headroom retry unchanged (no down_mode: headroom + predicted-fit gate;"
 echo "   the series items of earlier job scripts, compatibility)"
 

@@ -411,6 +411,7 @@ while true; do
             CRF_FLOOR_BYTES=0
         fi
         CRF_FLOOR_STATUS=off
+        BASE_MANUAL=0
 
         if ui_verbose; then
             echo
@@ -573,7 +574,7 @@ while true; do
                 "$(bytes_to_gib "$(crf_total_bytes "$EST_VIDEO_BYTES" "$SOURCE_AUDIO_BYTES" "$OTHER_BYTES")")"
         fi
 
-        if (( CRF_OVER_CEILING == 1 )); then
+        if (( CRF_OVER_CEILING == 1 )) && [[ "$TIER" != Base ]]; then
             echo
             echo "------------------------------------------------------------"
             echo "$(ui_warn WARNING): the ${CRF_CEILING_GIB} GiB video ceiling cannot be met within the"
@@ -601,32 +602,36 @@ while true; do
         fi
 
         # Base: no CRF estimated inside ceiling AND floor (crf_floor_extend
-        # gap / limit): never accepted silently
-        if [[ "$CRF_FLOOR_STATUS" == gap || "$CRF_FLOOR_STATUS" == limit ]]; then
-            echo
-            echo "------------------------------------------------------------"
-            echo "$(ui_warn WARNING): Base CRF ${CRF} is estimated at ~$(bytes_to_mbps "$EST_VIDEO_BYTES" "$DURATION") Mb/s (~${EXPECTED_VIDEO_GIB} GiB video),"
-            echo "below the ${CRF_FLOOR_MBPS} Mb/s Base video floor ($(bytes_to_gib "$CRF_FLOOR_BYTES") GiB; source video ${SOURCE_VIDEO_MBPS} Mb/s)."
-            if [[ "$CRF_FLOOR_STATUS" == gap ]]; then
-                echo "CRF ${CRF_BOUNDARY_LOW}, the next higher quality, is estimated above the ${CRF_CEILING_GIB} GiB ceiling."
-            else
-                echo "CRF ${CRF} is the lowest CRF the floor may use (MOVIE_BASE_FLOOR_CRF_MIN)."
-            fi
-            echo "------------------------------------------------------------"
-            echo "1) Encode at CRF ${CRF} anyway (below the floor)"
-            echo "2) Skip this movie"
+        # gap / limit, or even CRF_MAX above the ceiling): never accepted
+        # silently. Encode the automatic CRF anyway, choose a CRF manually
+        # (estimated first, any CRF 0-51; still a Base encode) or skip
+        # (encode_common.sh base_crf_prompt).
+        if [[ "$TIER" == Base ]] &&
+           { (( CRF_OVER_CEILING == 1 )) || [[ "$CRF_FLOOR_STATUS" == gap || "$CRF_FLOOR_STATUS" == limit ]]; }; then
+            base_crf_prompt crf_title_estimate_actual
 
-            while true; do
-                read -rp "Select [1-2]: " fc
-                case "$fc" in
-                    1|2) break ;;
-                    *) echo "Invalid selection." ;;
-                esac
-            done
-
-            if [[ "$fc" == "2" ]]; then
+            if [[ "$BASE_PICK" == skip ]]; then
                 skip_movie && continue
                 break
+            fi
+
+            if [[ "$BASE_PICK" == manual ]]; then
+                # the CRF the user chose is encoded as it is: one attempt,
+                # checked and reported against the ceiling / floor, never
+                # replaced by a retry (job_runtime.sh down_mode=manual)
+                BASE_MANUAL=1
+                CRF="$BASE_PICK_CRF"
+                EST_VIDEO_BYTES="${CRF_EST[$CRF]}"
+                EXPECTED_VIDEO_GIB=$(bytes_to_gib "$EST_VIDEO_BYTES")
+                VIDEO_SPEC="crf:$CRF"
+                CRF_OVER_CEILING=0
+                (( EST_VIDEO_BYTES > CRF_CEILING_BYTES )) && CRF_OVER_CEILING=1
+                RETRY_SPEC="$CRF_CEILING_BYTES:$CRF:$CRF:0:0:::manual:$CRF_FLOOR_BYTES:$CRF"
+                echo
+                printf '%-10s%s\n' "Selected:" "$(ui_bold "Base manual CRF $CRF") (~${EXPECTED_VIDEO_GIB} GiB video)"
+            elif (( CRF_OVER_CEILING == 1 )); then
+                # CRF_MAX above the ceiling accepted: nothing left to retry
+                RETRY_SPEC=""
             fi
         fi
 
@@ -768,8 +773,10 @@ while true; do
                         "$TIER" "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_GIB" "$CRF_GIB_PER_HOUR" "$(format_hms "$DURATION")" \
                         "$(bytes_to_mbps "$CRF_CEILING_BYTES" "$DURATION")" \
                         "$( (( CRF_OVER_CEILING == 1 )) && echo "; ceiling NOT met" )"
+                    (( ${BASE_MANUAL:-0} == 1 )) &&
+                        printf "                     (Base manual CRF %s: chosen in the menu, no automatic CRF retry)\n" "$CRF"
                 fi
-                printf "  Video size:        ~%s -> ~%s GiB (estimated from %s sampled CRF%s)\n" \
+                printf "  Video size:      ~%s -> ~%s GiB (estimated from %s sampled CRF%s)\n" \
                     "$SOURCE_VIDEO_GIB" "$EXPECTED_VIDEO_GIB" \
                     "${#CRF_TRIED[@]}" "$( (( ${#CRF_TRIED[@]} == 1 )) || echo s)"
                 printf "  Video bitrate:     %s -> ~%s Mb/s\n" \
@@ -831,7 +838,7 @@ while true; do
         echo "------------------------------------------------------------"
     else
         case "$VIDEO_SPEC" in
-            crf:*) VIDEO_TEXT=$(ui_bold "CRF $CRF") ;;
+            crf:*) VIDEO_TEXT=$(ui_bold "CRF $CRF$( (( ${BASE_MANUAL:-0} == 1 )) && echo " (manual)")") ;;
             copy)  VIDEO_TEXT="source video kept" ;;
         esac
 

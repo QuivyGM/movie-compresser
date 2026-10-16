@@ -1224,6 +1224,45 @@ item_crf_encode() {
     max="${ITEM_EXP[crf_max]}"
     min="${ITEM_EXP[crf_min]:-}"
     [[ "$min" =~ ^[0-9]+$ ]] || min="$planned"
+
+    # movie Base manual CRF (down_mode=manual, chosen in the menu): one
+    # encode at exactly that CRF, never replaced by a CRF retry; the
+    # actual video is checked against the ceiling / floor like any Base
+    # attempt and a violation is flagged (ITEM_OVER_CEILING /
+    # ITEM_BELOW_FLOOR), not corrected
+    if [[ "${ITEM_EXP[down_mode]:-}" == manual ]]; then
+        floor="${ITEM_EXP[floor_vbytes]:-0}"
+        [[ "$floor" =~ ^[0-9]+$ ]] || floor=0
+        echo "$ITEM_TIER manual CRF $planned (chosen in the menu; no automatic CRF retry)"
+        "$fn" && item_part_complete || return 1
+        if ! act=$(item_video_bytes_checked "$ITEM_PART"); then
+            ITEM_FAIL_REASON="video-size measurement failed"
+            echo
+            echo "CRF $planned: video-size measurement failed; the result cannot be checked against the ceiling"
+            return 1
+        fi
+        JOB_DONE_PARTS[$ITEM_PART]=1
+        item_actual_save "$planned" "$act"
+        echo
+        echo "CRF $planned actual: $(_gib "$act") GiB / $(_gib "$ceil") GiB ceiling"
+        if (( act > ceil )); then
+            ITEM_OVER_CEILING=1
+            echo "WARNING: $ITEM_TIER manual CRF $planned is above the $(_gib "$ceil") GiB video ceiling; kept as chosen."
+            item_attempt_note "$planned" "$act" "OVER CEILING" "kept: $ITEM_TIER manual CRF"
+            return 0
+        fi
+        if (( floor > 0 && act < floor )); then
+            ITEM_BELOW_FLOOR=1
+            echo "WARNING: $ITEM_TIER manual CRF $planned actual video $(_mbps_of "$act") Mb/s is below the $(_mbps_of "$floor") Mb/s video floor; kept as chosen."
+            item_attempt_note "$planned" "$act" ACCEPTED-CANDIDATE "$ITEM_TIER manual CRF; below the video floor"
+        else
+            echo "Result: accepted ($ITEM_TIER manual CRF $planned)"
+            item_attempt_note "$planned" "$act" ACCEPTED-CANDIDATE "$ITEM_TIER manual CRF"
+        fi
+        item_rows_final "$planned"
+        return 0
+    fi
+
     down_max="${ITEM_EXP[down_max]:-0}"
     [[ "$down_max" =~ ^[0-9]+$ ]] || down_max=0
     thr=$(_down_threshold "$ceil" "${ITEM_EXP[down_headroom_pct]:-}")
