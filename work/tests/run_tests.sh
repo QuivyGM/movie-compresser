@@ -47,6 +47,12 @@
 #     CRF (movie High / Base / Quality retries, series shared CRF,
 #     Custom), source tags kept, none for copy / two-pass, verification
 #     report incl. "not recorded" (compression_tag_tests.sh)
+# 16. audio pipeline: layout planning (Opus / E-AC-3 / AAC; surround
+#     relabels by explicit channelmap; layouts that would change
+#     channels copied), source -> output audio index, one codec option
+#     per stream, audio menu jobs incl. The Raid 2 DTS 5.1(side) case,
+#     per-channel tone identity, verification failures
+#     (audio_pipeline_tests.sh)
 #
 # Runs in a temporary copy of work/ so real logs/jobs are untouched.
 # Everything here is synthetic: it proves the mechanics, not behaviour
@@ -776,6 +782,7 @@ common_checks() {
     check "$n: output written"                 "[[ -s '$T/out/$n.mkv' ]]"
     check "$n: no .part left"                  "[[ ! -e '$T/out/$n.mkv.part' ]]"
     check "$n: job reported success"           "grep -q 'All encodes finished: 1 ok, 0 failed' '$T/$n.log'"
+    check "$n: one codec option per stream"    "! grep -q 'Multiple -codec' '$T/$n.log'"
     check "$n: report printed"                 "grep -q '^Metadata preservation:' '$T/$n.log'"
     check "$n: audio tracks 2 -> 2"            "report_has $n 'Audio tracks: +2 -> 2'"
     check "$n: subtitle tracks 3 -> 3"         "report_has $n 'Subtitle tracks: +3 -> 3'"
@@ -1481,12 +1488,16 @@ if [[ -s "$MH/compress/in/Multi.mkv" ]]; then
     check "acopy 8: commentary kept"                  "[[ \$(ffprobe -v error -select_streams a:3 -show_entries stream_disposition=comment -of default=nw=1:nk=1 '$mout') == 1 ]] && grep -q 'Audio track 4: *COPIED (AAC stereo' '$AC/movie_run.log'"
     check "acopy: titles / languages kept"            "grep -q 'Languages: *MATCH' '$AC/movie_run.log' && grep -q 'Track titles: *MATCH' '$AC/movie_run.log'"
     check "acopy: job succeeded"                      "grep -q 'All encodes finished: 1 ok, 0 failed' '$AC/movie_run.log'"
+    check "acopy: no blanket -c copy, one codec option per stream" \
+        "! grep -q -- ' -c copy ' '$AC/movie_Quality_job.sh' && grep -q -- '-c:a copy' '$AC/movie_Quality_job.sh' && ! grep -q 'Multiple -codec' '$AC/movie_run.log'"
+    check "acopy: movie job carries the audio index map" "grep -q 'atrans= ahash=1 amap=0:0\\\\,1:1\\\\,2:2\\\\,3:3' '$AC/movie_Quality_job.sh'"
 
     # 23 the High (CRF) job: all tracks identical, estimate reported
     bash "$AC/movie_High_job.sh" < /dev/null > "$AC/movie_high_run.log" 2>&1
     hout="$MH/compress/out/Multi HEVC High.mkv"
     check "movie naming unchanged: out/<name> HEVC <Tier>.mkv" "[[ -f '$hout' && -f '$mout' && '$(basename "$mout")' == 'Multi HEVC Quality.mkv' ]]"
     check "23 movie High job succeeded"              "grep -q 'All encodes finished: 1 ok, 0 failed' '$AC/movie_high_run.log'"
+    check "23 movie High: no 'Multiple -codec' warning" "! grep -q 'Multiple -codec' '$AC/movie_high_run.log'"
     eq    "23 movie High: payload identical (all tracks)" "$(_audio_payload_md5 "$hout" | tr '\n' ' ')" "$(_audio_payload_md5 "$MH/compress/in/Multi.mkv" | tr '\n' ' ')"
     check "23 movie High: Atmos PRESERVED"           "grep -q 'Audio 1 object: *Dolby Atmos PRESERVED (stream copy)' '$AC/movie_high_run.log'"
     check "25 movie High: estimate vs actual"        "grep -q 'Selected CRF: *19' '$AC/movie_high_run.log' && grep -q 'Estimated video size: ' '$AC/movie_high_run.log' && grep -qE 'Estimate error: +[-+][0-9.]+%' '$AC/movie_high_run.log'"
@@ -1550,6 +1561,8 @@ if [[ -s "$MH/compress/in/Multi.mkv" ]]; then
     eq    "acopy 15: track 1 re-encoded at 256k"      "$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,bit_rate -of csv=p=0 "$aout")" "eac3,256000"
     eq    "acopy 15: other tracks copied"             "$(_audio_payload_md5 "$aout" | tail -n +2 | tr '\n' ' ')" "$(_audio_payload_md5 "$MH/compress/out/Multi.mkv" | tail -n +2 | tr '\n' ' ')"
     check "acopy 15: audio job succeeded"             "grep -q 'All encodes finished: 1 ok, 0 failed' '$AC/arun.log'"
+    check "acopy 15: no 'Multiple -codec' warning"    "! grep -q 'Multiple -codec' '$AC/arun.log'"
+    check "acopy 15: E-AC-3 plan, copied tracks hash-verified" "grep -q 'Layout: 5.1(side) kept' '$AC/amenu.log' && grep -q 'Audio track 2: *COPIED (TrueHD 5.1(side), 48000 Hz, payload MD5 MATCH)' '$AC/arun.log'"
 else
     SKIPPED+=("audio copy end-to-end (ffmpeg cannot write the E-AC-3/TrueHD/DTS fixture: $(head -1 "$AC/mk.err"))")
 fi
@@ -2236,6 +2249,14 @@ bash "$SRC_WORK/tests/hdr_init_tests.sh" > "$T/hdr_init.out" 2>&1
 grep -E '^  (ok|FAIL|skipped:) ' "$T/hdr_init.out"
 PASS=$((PASS + $(grep -c '^  ok ' "$T/hdr_init.out")))
 FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/hdr_init.out")))
+
+echo
+echo "== audio pipeline: layout planning, mapping, audio menu jobs, verification (audio_pipeline_tests.sh)"
+bash "$SRC_WORK/tests/audio_pipeline_tests.sh" > "$T/audio_pipeline.out" 2>&1
+grep -E '^  (ok|FAIL) ' "$T/audio_pipeline.out"
+PASS=$((PASS + $(grep -c '^  ok ' "$T/audio_pipeline.out")))
+FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/audio_pipeline.out")))
+while IFS= read -r s; do SKIPPED+=("${s#skipped: }"); done < <(grep '^skipped: ' "$T/audio_pipeline.out")
 
 echo
 echo "== COMPRESSION_CRF / COMPRESSION_TIER output tags (compression_tag_tests.sh)"

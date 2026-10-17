@@ -1026,14 +1026,14 @@ item_verify_output() {
             if [[ -n "${S_AH[$i]:-}" && "${S_AH[$i]}" == "${O_AH[$i]:-}" ]]; then
                 h=", payload MD5 MATCH"
             else
-                h=", payload CHECK REQUIRED"
-                warns+=("audio $((i + 1)) payload differs from the source although it was copied")
+                h=", payload MD5 MISMATCH"
+                fails+=("audio $((i + 1)) payload differs from the source although it was copied")
             fi
         fi
 
         _rep "Audio track $((i + 1))" "COPIED ($(audio_track_label "${sv[0]}" "${sv[1]}" "${sv[2]}" "${sv[10]}"), ${sv[13]} Hz$h)" >&3
-        [[ "$h" == *CHECK* ]] &&
-            _rep "Audio $((i + 1)) payload" "CHECK REQUIRED: packet data differs from the source" >&3
+        [[ "$h" == *MISMATCH* ]] &&
+            _rep "Audio $((i + 1)) payload" "CHANGED: packet data differs from the source" >&3
 
         so=$(audio_object_kind "${sv[0]}" "${sv[1]}" "${sv[9]}")
         if [[ -n "$so" ]]; then
@@ -1057,12 +1057,51 @@ item_verify_output() {
     _rep "Audio tracks" "$line" >&3
     (( ${#S_A[@]} == ${#O_A[@]} )) || fails+=("audio track count changed ($line)")
 
-    # movie / series encodes copy all audio: compare the packet payload
+    # copied audio: compare the packet payload (transcoded tracks are
+    # skipped below)
     local S_AH=() O_AH=()
     if [[ "${ITEM_EXP[ahash]:-0}" == "1" ]] && (( ${#S_A[@]} )); then
         echo "Hashing copied audio..."
         mapfile -t S_AH < <(_audio_payload_md5 "$src")
         mapfile -t O_AH < <(_audio_payload_md5 "$out")
+    fi
+
+    # amap=src:out,...: the output audio index of every source audio
+    # track (build_stream_map). O_A / O_AH are put into source order, so
+    # every comparison below (tracks, flags, titles) pairs a source track
+    # with its own output track. Jobs without amap: the same order.
+    if [[ -n "${ITEM_EXP[amap]:-}" ]] && (( ${#S_A[@]} == ${#O_A[@]} )); then
+        local -a om=() ohm=() pairs=()
+        local si oi
+        IFS=, read -ra pairs <<< "${ITEM_EXP[amap]}"
+        for v in "${pairs[@]}"; do
+            si="${v%%:*}" oi="${v#*:}"
+            if [[ "$si" =~ ^[0-9]+$ && "$oi" =~ ^[0-9]+$ ]] && (( si < ${#S_A[@]} && oi < ${#O_A[@]} )); then
+                om[$si]="${O_A[$oi]}"
+                (( ${#O_AH[@]} )) && ohm[$si]="${O_AH[$oi]:-}"
+            fi
+        done
+        if (( ${#om[@]} == ${#O_A[@]} )); then
+            O_A=("${om[@]}")
+            (( ${#O_AH[@]} )) && O_AH=("${ohm[@]}")
+        else
+            _rep "Audio mapping" "DOES NOT MATCH the output (amap ${ITEM_EXP[amap]})" >&3
+            fails+=("audio track mapping does not match the output")
+        fi
+    fi
+
+    # aplan=src:codec:channels:layout:sample_rate,... (audio menu): the
+    # planned result of every transcoded track (audio_plan.sh)
+    local -A p_codec=() p_ch=() p_layout=() p_sr=()
+    if [[ -n "${ITEM_EXP[aplan]:-}" ]]; then
+        local -a plans=()
+        local pi pc pch pl psr
+        IFS=, read -ra plans <<< "${ITEM_EXP[aplan]}"
+        for v in "${plans[@]}"; do
+            IFS=: read -r pi pc pch pl psr <<< "$v"
+            [[ "$pi" =~ ^[0-9]+$ ]] || continue
+            p_codec[$pi]="$pc" p_ch[$pi]="$pch" p_layout[$pi]="$pl" p_sr[$pi]="$psr"
+        done
     fi
 
     for ((i = 0; i < ${#S_A[@]}; i++)); do
@@ -1104,7 +1143,42 @@ item_verify_output() {
             _rep "DTS:X metadata" "DROPPED (audio transcoded; channel-based ${och}ch kept)" >&3
         fi
 
-        if [[ "$sl" != "$ol" && "$sl" != "-" ]]; then
+        # a transcode never adds or removes channels (no downmix)
+        if [[ -n "$och" && "$och" != "$sch" ]]; then
+            _rep "Audio $((i + 1)) channels" "CHANGED: $sch -> $och" >&3
+            fails+=("audio $((i + 1)) channel count changed ($sch -> $och)")
+        fi
+
+        if [[ -n "${p_codec[$i]+x}" ]]; then
+            local ssr osr
+            ssr=$(_field "${S_A[$i]}" 14)
+            osr=""
+            (( i < ${#O_A[@]} )) && osr=$(_field "${O_A[$i]}" 14)
+
+            if [[ "$oc" != "${p_codec[$i]}" ]]; then
+                _rep "Audio $((i + 1)) codec" "NOT AS PLANNED: ${oc:-missing} (planned ${p_codec[$i]})" >&3
+                fails+=("audio $((i + 1)) codec is ${oc:-missing}, planned ${p_codec[$i]}")
+            fi
+            if [[ "$och" == "$sch" && "$och" != "${p_ch[$i]}" ]]; then
+                _rep "Audio $((i + 1)) channels" "NOT AS PLANNED: $och (planned ${p_ch[$i]})" >&3
+                fails+=("audio $((i + 1)) has $och channels, planned ${p_ch[$i]}")
+            fi
+            if [[ "$ol" != "${p_layout[$i]}" ]]; then
+                _rep "Audio $((i + 1)) layout" "NOT AS PLANNED: ${ol/#-/unknown} (planned ${p_layout[$i]}, source $sl)" >&3
+                fails+=("audio $((i + 1)) layout is ${ol/#-/unknown}, planned ${p_layout[$i]}")
+            elif [[ "$sl" != "$ol" ]]; then
+                _rep "Audio $((i + 1)) layout" "${sl/#-/${sch}ch} -> $ol AS PLANNED (same channels; surround positions relabelled, no remix)" >&3
+            fi
+            # Opus always encodes at 48 kHz: a planned rate change is no
+            # warning
+            if [[ -n "${p_sr[$i]}" && "$osr" != "${p_sr[$i]}" ]]; then
+                _rep "Audio $((i + 1)) sample rate" "UNEXPECTED: ${osr:-?} Hz (planned ${p_sr[$i]} Hz)" >&3
+                warns+=("audio $((i + 1)) sample rate ${osr:-?} Hz, planned ${p_sr[$i]} Hz")
+            elif [[ -n "$osr" && "$osr" != "$ssr" ]]; then
+                _rep "Audio $((i + 1)) sample rate" "$ssr -> $osr Hz AS PLANNED ($(_codec_label "$oc" -) encodes at $osr Hz)" >&3
+            fi
+        elif [[ "$sl" != "$ol" && "$sl" != "-" ]]; then
+            # jobs without aplan
             if [[ "$oc" == "aac" && ( "$ol" == "unknown" || "$ol" == "-" ) ]]; then
                 _rep "Audio $((i + 1)) layout" "$sl -> stored in an AAC PCE (ffprobe cannot name it; ${och} channels kept)" >&3
             else

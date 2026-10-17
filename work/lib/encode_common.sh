@@ -1678,11 +1678,13 @@ audio_title_plan() {
 
 # audio_title_args FILE AUDIO_ARGS  ->  shell-quoted -metadata:s:a:N
 # title=... for re-encoded tracks whose title would become false.
+# AUDIO_ARGS name source audio indexes; N is the output audio index
+# (MAP_AUDIO_OUT of build_stream_map; the same index without it).
 audio_title_args() {
     local i old new a=()
 
     while IFS=$'\t' read -r i old new; do
-        [[ "$old" != "$new" ]] && a+=("-metadata:s:a:$i" "title=$new")
+        [[ "$old" != "$new" ]] && a+=("-metadata:s:a:${MAP_AUDIO_OUT[$i]:-$i}" "title=$new")
     done < <(audio_title_plan "$1" "$2")
 
     (( ${#a[@]} )) && printf '%q ' "${a[@]}"
@@ -1884,31 +1886,53 @@ matroska_mux_args() {
 #   - data streams / unsupported subtitles -> not mapped (MKV cannot
 #     store them); listed in MAP_NOTES
 # MP4/MOV track names stored only as handler_name are copied into the
-# MKV track title.
+# MKV track title. MAIN_VIDEO_INDEX "" (no video): nothing is output
+# video #0; other video streams are copied from output video #0 on.
+#
+# Codec options: every output stream must match exactly one -c option
+# (ffmpeg warns "Multiple -codec/-c/... options specified for stream N"
+# and silently takes the last one otherwise). So there is no blanket
+# "-c copy": MAP_CODEC_ARGS holds one option per extra video, subtitle
+# and attachment stream; the caller adds the main video (-c:v:0 ...)
+# and the audio (-c:a copy, or one -c:a:N per output audio stream).
 #
 # Sets:
 #   MAP_ARGS        shell-quoted "-map ..." tokens
 #   MAP_OTHER_ARGS  the same without the main video map
-#   MAP_CODEC_ARGS  shell-quoted per-stream codec overrides
+#   MAP_CODEC_ARGS  shell-quoted codec options of every mapped stream
+#                   except the main video and the audio
 #   MAP_META_ARGS   shell-quoted per-stream metadata (titles)
 #   MAP_COVERS      array of "index<TAB>filename<TAB>mimetype"
 #   MAP_NOTES       array of human-readable notes
 #   MAP_AUDIO_COUNT number of mapped audio streams
+#   MAP_AUDIO_OUT   source audio index (a:N of the source) -> output
+#                   audio index (a:N of the output): the index every
+#                   -c:a:N / -b:a:N / -filter:a:N / -metadata:s:a:N for
+#                   that track must use
+#   MAP_AMAP        the same as "src:out,src:out,..." (item_expect amap=)
 build_stream_map() {
     local file="$1"
     local vidx="$2"
     local idx type codec att rest name mime
-    local sub_n=0
-    local out_n=1
-    local maps=(-map "0:$vidx")
+    local sub_n=0 vid_n=0 att_n=0 aud_src=0
+    local out_n=0
+    local maps=()
     local codecs=()
     local metas=()
+    local amap=()
     local -A handler=()
     local h_idx h_type h_title h_handler
 
     MAP_NOTES=()
     MAP_COVERS=()
     MAP_AUDIO_COUNT=0
+    MAP_AUDIO_OUT=()
+
+    if [[ -n "$vidx" ]]; then
+        maps=(-map "0:$vidx")
+        out_n=1
+        vid_n=1
+    fi
 
     case "${file,,}" in
         *.mp4|*.m4v|*.mov)
@@ -1921,7 +1945,7 @@ build_stream_map() {
     esac
 
     while IFS=$'\t' read -r idx type codec att rest; do
-        [[ "$idx" == "$vidx" ]] && continue
+        [[ -n "$vidx" && "$idx" == "$vidx" ]] && continue
 
         if [[ -n "${handler[$idx]:-}" && ( "$type" == "audio" || "$type" == "subtitle" ) ]] &&
            [[ "$type" != "subtitle" || "$(mkv_subtitle_action "$codec")" != "drop" ]]; then
@@ -1952,12 +1976,16 @@ build_stream_map() {
                 else
                     maps+=(-map "0:$idx")
                     ((out_n += 1))
+                    codecs+=("-c:v:$vid_n" copy)
+                    ((vid_n += 1))
                     MAP_NOTES+=("stream $idx: extra video ($codec) copied, not re-encoded")
                 fi
                 ;;
             audio)
                 maps+=(-map "0:$idx")
                 ((out_n += 1))
+                MAP_AUDIO_OUT[$aud_src]=$MAP_AUDIO_COUNT
+                amap+=("$aud_src:$MAP_AUDIO_COUNT")
                 ((MAP_AUDIO_COUNT += 1))
                 ;;
             subtitle)
@@ -1965,6 +1993,7 @@ build_stream_map() {
                     copy)
                         maps+=(-map "0:$idx")
                         ((out_n += 1))
+                        codecs+=("-c:s:$sub_n" copy)
                         ((sub_n += 1))
                         ;;
                     srt)
@@ -1982,6 +2011,8 @@ build_stream_map() {
             attachment)
                 maps+=(-map "0:$idx")
                 ((out_n += 1))
+                codecs+=("-c:t:$att_n" copy)
+                ((att_n += 1))
                 ;;
             data)
                 MAP_NOTES+=("stream $idx: data stream ($codec) cannot be stored in MKV, DROPPED")
@@ -1990,15 +2021,18 @@ build_stream_map() {
                 MAP_NOTES+=("stream $idx: $type ($codec) skipped")
                 ;;
         esac
+        [[ "$type" == "audio" ]] && ((aud_src += 1))
     done < <(stream_info "$file")
 
-    MAP_ARGS=$(printf '%q ' "${maps[@]}")
+    MAP_ARGS=""
+    (( ${#maps[@]} )) && MAP_ARGS=$(printf '%q ' "${maps[@]}")
     MAP_OTHER_ARGS=""
-    (( ${#maps[@]} > 2 )) && MAP_OTHER_ARGS=$(printf '%q ' "${maps[@]:2}")
+    [[ -n "$vidx" ]] && (( ${#maps[@]} > 2 )) && MAP_OTHER_ARGS=$(printf '%q ' "${maps[@]:2}")
     MAP_CODEC_ARGS=""
     (( ${#codecs[@]} )) && MAP_CODEC_ARGS=$(printf '%q ' "${codecs[@]}")
     MAP_META_ARGS=""
     (( ${#metas[@]} )) && MAP_META_ARGS=$(printf '%q ' "${metas[@]}")
+    MAP_AMAP=$(IFS=,; printf '%s' "${amap[*]-}")
     return 0
 }
 
@@ -2294,13 +2328,14 @@ emit_encode_item() {
     begin=$(printf 'item_begin %q %q %q %q %q %q' \
         "$index" "$in" "$out" "$tier" "$overwrite" "$passlog")
     # atrans= (empty): no audio track is transcoded; ahash=1: the copied
-    # audio payload is hash-compared with the source. ceiling_vbytes /
-    # crf_min / crf_max: the CRF retry (High / Base; empty = none).
-    expect=$(printf 'item_expect vidx=%q mode=%q crf=%q kbps=%q est_vbytes=%q dv=%q dv_profile=%q dv_compat=%q hdr10p=%q scaled=%q copyts=%q atrans= ahash=1' \
+    # audio payload is hash-compared with the source; amap: source ->
+    # output audio index (build_stream_map). ceiling_vbytes / crf_min /
+    # crf_max: the CRF retry (High / Base; empty = none).
+    expect=$(printf 'item_expect vidx=%q mode=%q crf=%q kbps=%q est_vbytes=%q dv=%q dv_profile=%q dv_compat=%q hdr10p=%q scaled=%q copyts=%q atrans= ahash=1 amap=%q' \
         "$vidx" "$mode" "$crf" "$kbps" "$est" \
         "$( (( HDR_DV == 1 )) && echo "$dv_policy" || echo none)" \
         "$dv_out_profile" "$dv_out_compat" "$h10p_policy" "$scaled" \
-        "$( [[ "$dv_policy" == "preserve" ]] && echo 1 || echo 0)")
+        "$( [[ "$dv_policy" == "preserve" ]] && echo 1 || echo 0)" "${MAP_AMAP:-}")
     [[ "$mode" == "crf" ]] &&
         expect+=$(printf ' ceiling_vbytes=%q crf_min=%q crf_max=%q down_headroom_pct=%q down_max=%q' "$rceil" "$rmin" "$rmax" "$rdpct" "$rdmax")
     [[ "$mode" == "crf" && -n "$qtarget" ]] &&
@@ -2411,12 +2446,14 @@ _emit_final_encode() {
 
         printf '   item_run mux ffmpeg -y -copyts -i %q -i "$ITEM_TMP/video_dv.mkv" \\\n' "$in"
         printf '      -map 1:0 %s\\\n' "$MAP_OTHER_ARGS"
-        printf '      -c copy %s-c:a copy \\\n' "$MAP_CODEC_ARGS"
+        printf '      -c:v:0 copy -c:a copy %s\\\n' "$MAP_CODEC_ARGS"
         printf '      %s\\\n' "$(source_video_tag_args "$in" "$vidx")"
     else
+        # one codec option per output stream: -c:v:0 libx265 (below),
+        # all audio copied, MAP_CODEC_ARGS for the rest
         printf '   item_run %s ffmpeg -y -i %q \\\n' "$label" "$in"
         printf '      %s\\\n' "$MAP_ARGS"
-        printf '      -c copy %s-c:a copy \\\n' "$MAP_CODEC_ARGS"
+        printf '      -c:a copy %s\\\n' "$MAP_CODEC_ARGS"
         [[ -n "$vf" ]] && printf '      %s\\\n' "$vf"
         _emit_x265_lines "$rate" "$dv" "$pq" "$color"
     fi
@@ -2450,10 +2487,10 @@ emit_copy_item() {
 
     printf '# ---- item %s  (source video kept: stream copy)\n' "$index"
     printf 'if item_begin %q %q %q %q %q "" &&\n' "$index" "$in" "$out" "$tier" "$overwrite"
-    printf '   item_expect vidx=%q video=copy mode=copy dv=none hdr10p=none scaled=0 copyts=0 atrans= ahash=1 &&\n' "$vidx"
+    printf '   item_expect vidx=%q video=copy mode=copy dv=none hdr10p=none scaled=0 copyts=0 atrans= ahash=1 amap=%q &&\n' "$vidx" "${MAP_AMAP:-}"
     printf '   item_run mux ffmpeg -y -i %q \\\n' "$in"
     printf '      %s\\\n' "$MAP_ARGS"
-    printf '      -c copy %s-c:a copy \\\n' "$MAP_CODEC_ARGS"
+    printf '      -c:v:0 copy -c:a copy %s\\\n' "$MAP_CODEC_ARGS"
     [[ -n "$MAP_META_ARGS" ]] && printf '      %s\\\n' "$MAP_META_ARGS"
     printf '      -map_metadata 0 -map_chapters 0 -max_muxing_queue_size 4096 %s\\\n' "$(matroska_mux_args)"
     emit_part_and_covers "$in"

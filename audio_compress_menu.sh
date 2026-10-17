@@ -12,6 +12,7 @@ source "$WORK_DIR/lib/bitrate.sh"
 source "$WORK_DIR/lib/encode_common.sh"
 source "$WORK_DIR/lib/hdr_dovi.sh"
 source "$WORK_DIR/lib/policy.sh"
+source "$WORK_DIR/lib/audio_plan.sh"
 
 # Policy values: ~/compress/work/lib/compress.conf (AUDIO_* settings)
 if ! load_policy; then
@@ -209,6 +210,8 @@ declare -a \
     PROFILE \
     CHANNELS \
     LAYOUT \
+    LAYOUT_RAW \
+    SAMPLE_RATE \
     LANGUAGE \
     TITLE \
     BITDEPTH \
@@ -287,6 +290,19 @@ for ((i=0; i<AUDIO_COUNT; i++)); do
         head -1
     )
 
+    SAMPLE_RATE[$i]=$(
+        ffprobe -v error \
+            -select_streams "a:$i" \
+            -show_entries stream=sample_rate \
+            -of default=nw=1:nk=1 "$IN" 2>/dev/null |
+        head -1
+    )
+
+    # the layout as ffprobe names it ("-" = none) for audio_encode_plan;
+    # LAYOUT is the display text
+    LAYOUT_RAW[$i]="${LAYOUT[$i]:--}"
+    [[ "${LAYOUT_RAW[$i]}" == "unknown" ]] && LAYOUT_RAW[$i]="-"
+
     [[ -n "${LANGUAGE[$i]}" ]] || LANGUAGE[$i]="und"
     [[ -n "${LAYOUT[$i]}" ]] || LAYOUT[$i]="${CHANNELS[$i]}ch"
 
@@ -353,6 +369,15 @@ declare -A ACTION
 declare -A TARGET_CODEC
 declare -A TARGET_KBPS
 declare -A TARGET_TIER
+# audio_encode_plan result of a transcoded track: -filter:a:N value
+# ("-" = none), the encoded layout / channels / sample rate, and the
+# layout note; COPY_REASON: why a compressing tier copies instead
+declare -A TARGET_FILTER
+declare -A TARGET_LAYOUT
+declare -A TARGET_CH
+declare -A TARGET_SR
+declare -A TARGET_NOTE
+declare -A COPY_REASON
 
 show_tracks() {
     echo
@@ -454,11 +479,36 @@ while true; do
         HIGH_DOES_COMPRESS=1
     fi
 
+    # exact size (TRACK_GIB is rounded for display)
     COMPACT_DOES_COMPRESS=$(
-        awk -v s="${TRACK_GIB[$idx]}" -v t="$AUDIO_COMPACT_TRIGGER_GIB" 'BEGIN {
-            print (s >= t) ? 1 : 0
+        awk -v b="${TRACK_BYTES[$idx]}" -v t="$AUDIO_COMPACT_TRIGGER_GIB" 'BEGIN {
+            print (b / 1073741824 >= t) ? 1 : 0
         }'
     )
+
+    # ========================================================
+    # LAYOUT PLAN (audio_plan.sh): a tier only transcodes when its
+    # encoder keeps every channel; otherwise it copies (reason shown)
+    # ========================================================
+
+    H_STATUS="copy" H_FILTER="-" H_OLAYOUT="-" H_OCH="-" H_OSR="-" H_NOTE=""
+    C_STATUS="copy" C_FILTER="-" C_OLAYOUT="-" C_OCH="-" C_OSR="-" C_NOTE=""
+
+    if (( HIGH_DOES_COMPRESS == 1 )); then
+        if ! IFS=$'\t' read -r H_STATUS H_FILTER H_OLAYOUT H_OCH H_OSR H_NOTE < <(
+                audio_encode_plan "$H_CODEC" "$H_KBPS" "${LAYOUT_RAW[$idx]}" \
+                    "${CHANNELS[$idx]}" "${SAMPLE_RATE[$idx]}"); then
+            H_STATUS="copy" H_NOTE="the layout check could not run"
+        fi
+    fi
+
+    if (( COMPACT_DOES_COMPRESS == 1 )); then
+        if ! IFS=$'\t' read -r C_STATUS C_FILTER C_OLAYOUT C_OCH C_OSR C_NOTE < <(
+                audio_encode_plan "$C_CODEC" "$C_KBPS" "${LAYOUT_RAW[$idx]}" \
+                    "${CHANNELS[$idx]}" "${SAMPLE_RATE[$idx]}"); then
+            C_STATUS="copy" C_NOTE="the layout check could not run"
+        fi
+    fi
 
     # ========================================================
     # MENU
@@ -474,8 +524,13 @@ while true; do
 
     echo "2) High"
 
-    if (( HIGH_DOES_COMPRESS == 1 )); then
+    if (( HIGH_DOES_COMPRESS == 1 )) && [[ "$H_STATUS" == ok ]]; then
         echo "   $H_CODEC_NAME | ${H_KBPS} kb/s -> ~${H_SIZE} GiB"
+        echo "   Layout: $H_NOTE"
+    elif (( HIGH_DOES_COMPRESS == 1 )); then
+        echo "   $H_CODEC_NAME not possible without changing channels; copy unchanged"
+        echo "   Reason: $H_NOTE"
+        echo "   ${TRACK_KBPS[$idx]} kb/s -> ${TRACK_GIB[$idx]} GiB"
     else
         echo "   Source is not oversized; copy unchanged"
         echo "   ${TRACK_KBPS[$idx]} kb/s -> ${TRACK_GIB[$idx]} GiB"
@@ -484,9 +539,14 @@ while true; do
     echo
     echo "3) Compact"
 
-    if (( COMPACT_DOES_COMPRESS == 1 )); then
+    if (( COMPACT_DOES_COMPRESS == 1 )) && [[ "$C_STATUS" == ok ]]; then
         echo "   $C_CODEC_NAME | ${C_KBPS} kb/s -> ~${C_SIZE} GiB"
         echo "   Target: < ${AUDIO_COMPACT_LIMIT_GIB} GiB"
+        echo "   Layout: $C_NOTE"
+    elif (( COMPACT_DOES_COMPRESS == 1 )); then
+        echo "   $C_CODEC_NAME not possible without changing channels; copy unchanged"
+        echo "   Reason: $C_NOTE"
+        echo "   ${TRACK_KBPS[$idx]} kb/s -> ${TRACK_GIB[$idx]} GiB"
     else
         echo "   Below ${AUDIO_COMPACT_TRIGGER_GIB} GiB; copy unchanged"
         echo "   ${TRACK_KBPS[$idx]} kb/s -> ${TRACK_GIB[$idx]} GiB"
@@ -505,21 +565,30 @@ while true; do
                 TARGET_TIER[$idx]="Quality"
                 TARGET_CODEC[$idx]="copy"
                 TARGET_KBPS[$idx]="${TRACK_KBPS[$idx]}"
+                COPY_REASON[$idx]=""
                 break
                 ;;
 
             2)
                 SELECTED[$idx]=1
                 TARGET_TIER[$idx]="High"
+                COPY_REASON[$idx]=""
 
-                if (( HIGH_DOES_COMPRESS == 1 )); then
+                if (( HIGH_DOES_COMPRESS == 1 )) && [[ "$H_STATUS" == ok ]]; then
                     ACTION[$idx]="encode"
                     TARGET_CODEC[$idx]="$H_CODEC"
                     TARGET_KBPS[$idx]="$H_KBPS"
+                    TARGET_FILTER[$idx]="$H_FILTER"
+                    TARGET_LAYOUT[$idx]="$H_OLAYOUT"
+                    TARGET_CH[$idx]="$H_OCH"
+                    TARGET_SR[$idx]="$H_OSR"
+                    TARGET_NOTE[$idx]="$H_NOTE"
                 else
                     ACTION[$idx]="copy"
                     TARGET_CODEC[$idx]="copy"
                     TARGET_KBPS[$idx]="${TRACK_KBPS[$idx]}"
+                    (( HIGH_DOES_COMPRESS == 1 )) &&
+                        COPY_REASON[$idx]="$H_CODEC_NAME not possible: $H_NOTE"
                 fi
 
                 break
@@ -528,15 +597,23 @@ while true; do
             3)
                 SELECTED[$idx]=1
                 TARGET_TIER[$idx]="Compact"
+                COPY_REASON[$idx]=""
 
-                if (( COMPACT_DOES_COMPRESS == 1 )); then
+                if (( COMPACT_DOES_COMPRESS == 1 )) && [[ "$C_STATUS" == ok ]]; then
                     ACTION[$idx]="encode"
                     TARGET_CODEC[$idx]="$C_CODEC"
                     TARGET_KBPS[$idx]="$C_KBPS"
+                    TARGET_FILTER[$idx]="$C_FILTER"
+                    TARGET_LAYOUT[$idx]="$C_OLAYOUT"
+                    TARGET_CH[$idx]="$C_OCH"
+                    TARGET_SR[$idx]="$C_OSR"
+                    TARGET_NOTE[$idx]="$C_NOTE"
                 else
                     ACTION[$idx]="copy"
                     TARGET_CODEC[$idx]="copy"
                     TARGET_KBPS[$idx]="${TRACK_KBPS[$idx]}"
+                    (( COMPACT_DOES_COMPRESS == 1 )) &&
+                        COPY_REASON[$idx]="$C_CODEC_NAME not possible: $C_NOTE"
                 fi
 
                 break
@@ -554,12 +631,14 @@ while true; do
     if [[ "${ACTION[$idx]}" == "copy" ]]; then
         echo "  ${DISPLAY_NAME[$idx]}"
         echo "  -> copied unchanged"
+        [[ -n "${COPY_REASON[$idx]:-}" ]] && echo "  Reason: ${COPY_REASON[$idx]}"
     else
         target_name=$(display_encoder "${TARGET_CODEC[$idx]}")
 
         echo "  ${DISPLAY_NAME[$idx]}"
         echo "  ${TRACK_KBPS[$idx]} kb/s / ${TRACK_GIB[$idx]} GiB"
         echo "  -> $target_name ${TARGET_KBPS[$idx]} kb/s / ~$(size_from_kbps "${TARGET_KBPS[$idx]}" "$DURATION") GiB"
+        echo "  Layout: ${TARGET_NOTE[$idx]}"
 
         # ffmpeg reports object audio in the profile ("Dolby TrueHD +
         # Dolby Atmos", "Dolby Digital Plus + Dolby Atmos", "DTS-HD MA +
@@ -627,6 +706,7 @@ for ((i=0; i<AUDIO_COUNT; i++)); do
 
     if [[ "${ACTION[$i]}" == "copy" ]]; then
         echo "  Result: copied unchanged"
+        [[ -n "${COPY_REASON[$i]:-}" ]] && echo "  Reason: ${COPY_REASON[$i]}"
     else
         target_name=$(display_encoder "${TARGET_CODEC[$i]}")
 
@@ -637,6 +717,7 @@ for ((i=0; i<AUDIO_COUNT; i++)); do
             "$target_name" \
             "${TARGET_KBPS[$i]}" \
             "$(size_from_kbps "${TARGET_KBPS[$i]}" "$DURATION")"
+        printf "  Layout: %s\n" "${TARGET_NOTE[$i]}"
     fi
 
     echo
@@ -679,28 +760,45 @@ JOB_TIER=$(
 )
 
 # Streams: everything kept; cover art is re-added as an MKV attachment
-# (see build_stream_map). Audio-relative indexes match the source.
+# (see build_stream_map). The output audio index of source audio track
+# i is MAP_AUDIO_OUT[i]: every per-track option uses that index.
 VIDX=$(main_video_index "$IN")
-STREAM_MAP_ARGS=$(printf '%q ' -map 0)
-MAP_CODEC_ARGS=""
-MAP_META_ARGS=""
-MAP_COVERS=()
+build_stream_map "$IN" "$VIDX"
+STREAM_MAP_ARGS="$MAP_ARGS"
 
-if [[ -n "$VIDX" ]]; then
-    build_stream_map "$IN" "$VIDX"
-    STREAM_MAP_ARGS="$MAP_ARGS"
+if (( MAP_AUDIO_COUNT != AUDIO_COUNT )); then
+    echo "Internal error: $AUDIO_COUNT audio track(s) found, $MAP_AUDIO_COUNT mapped."
+    echo "Nothing started."
+    exit 1
 fi
 
+# One codec option per output stream (no blanket -c copy): the main
+# video, every audio track (copy or its encoder), MAP_CODEC_ARGS for the
+# rest. A transcoded track gets its bitrate and, when its layout needs
+# the surround relabel, its channelmap (-filter:a:N) on the same index.
 # Stale statistics of the re-encoded tracks (refreshed after the mux)
 # and their titles (codec / object-audio claims that are no longer true).
+# AUDIO_SPEC: "-c:a:<source index> encoder" for audio_title_args;
+# ATRANS / APLAN: source indexes (item_verify_output).
+CODEC_ARGS=()
+[[ -n "$VIDX" ]] && CODEC_ARGS+=(-c:v:0 copy)
 STALE_ARGS=""
 AUDIO_SPEC=""
 ATRANS=""
+APLAN=""
 for ((i=0; i<AUDIO_COUNT; i++)); do
+    o="${MAP_AUDIO_OUT[$i]}"
     if [[ "${ACTION[$i]:-}" == "encode" ]]; then
-        STALE_ARGS+=$(stale_stats_args "a:$i")
+        CODEC_ARGS+=("-c:a:$o" "${TARGET_CODEC[$i]}" "-b:a:$o" "${TARGET_KBPS[$i]}k")
+        mapfile -t ENC_OPTS < <(audio_encoder_opts "${TARGET_CODEC[$i]}" "${TARGET_CH[$i]}" "$o")
+        CODEC_ARGS+=("${ENC_OPTS[@]+"${ENC_OPTS[@]}"}")
+        [[ "${TARGET_FILTER[$i]}" != "-" ]] && CODEC_ARGS+=("-filter:a:$o" "${TARGET_FILTER[$i]}")
+        STALE_ARGS+=$(stale_stats_args "a:$o")
         AUDIO_SPEC+="-c:a:$i ${TARGET_CODEC[$i]} "
         ATRANS+="${ATRANS:+,}$i"
+        APLAN+="${APLAN:+,}$i:$(encoder_codec "${TARGET_CODEC[$i]}"):${TARGET_CH[$i]}:${TARGET_LAYOUT[$i]}:${TARGET_SR[$i]}"
+    else
+        CODEC_ARGS+=("-c:a:$o" copy)
     fi
 done
 TITLE_ARGS=$(audio_title_args "$IN" "$AUDIO_SPEC")
@@ -713,27 +811,13 @@ TITLE_ARGS=$(audio_title_args "$IN" "$AUDIO_SPEC")
     emit_job_header "$SESSION" audio 1
 
     printf 'if item_begin 1 %q %q %q 0 "" &&\n' "$IN" "$OUT" "Audio ${JOB_TIER}"
-    printf '   item_expect vidx=%q video=copy atrans=%q &&\n' "$VIDX" "$ATRANS"
+    # atrans / aplan: what is transcoded and its planned result; ahash=1:
+    # the copied tracks are payload-hashed; amap: source -> output index
+    printf '   item_expect vidx=%q video=copy atrans=%q aplan=%q ahash=1 amap=%q &&\n' \
+        "$VIDX" "$ATRANS" "$APLAN" "$MAP_AMAP"
     printf '   item_run mux ffmpeg -y -i %q \\\n' "$IN"
     printf '      %s\\\n' "$STREAM_MAP_ARGS"
-    printf '      -c copy %s\\\n' "$MAP_CODEC_ARGS"
-
-    for ((i=0; i<AUDIO_COUNT; i++)); do
-
-        if [[ -z "${SELECTED[$i]+x}" ]]; then
-            continue
-        fi
-
-        if [[ "${ACTION[$i]}" != "encode" ]]; then
-            continue
-        fi
-
-        codec="${TARGET_CODEC[$i]}"
-        bitrate="${TARGET_KBPS[$i]}"
-
-        printf '      -c:a:%d %q -b:a:%d %sk \\\n' \
-            "$i" "$codec" "$i" "$bitrate"
-    done
+    printf '      %s%s\\\n' "$(printf '%q ' "${CODEC_ARGS[@]}")" "$MAP_CODEC_ARGS"
 
     [[ -n "$MAP_META_ARGS" ]] && printf '      %s\\\n' "$MAP_META_ARGS"
     [[ -n "$TITLE_ARGS" ]] && printf '      %s\\\n' "$TITLE_ARGS"
