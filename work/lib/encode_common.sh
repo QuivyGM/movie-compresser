@@ -122,6 +122,270 @@ _compression_tags_canon() {
         /^<\/?(Tag|Simple)>$/ || /^<[A-Za-z]+>.*<\/[A-Za-z]+>$/ { print }'
 }
 
+# ------------------------------------------------------------
+# FFmpeg stream -> Matroska track mapping (MKVToolNix identification)
+#
+# mkvpropedit addresses tracks by Matroska track number; FFmpeg numbers
+# streams its own way (attachments become streams, tracks it cannot read
+# are left out). The two are never assumed to line up: every FFmpeg
+# stream is matched to the tracks of `mkvmerge -J` by its properties.
+# ------------------------------------------------------------
+
+# mkv_identify_tracks FILE  ->  one line per Matroska track:
+#   id  type  number  codec_id  channels  sample_rate  WxH  language
+#   name  default  forced                    (tab-separated, "-" = none)
+# from `mkvmerge -J` (a small JSON reader in awk: no jq / python needed).
+# Non-zero when mkvmerge is missing or cannot read FILE.
+mkv_identify_tracks() {
+    local json
+
+    command -v mkvmerge >/dev/null 2>&1 || return 3
+    json=$(mkvmerge -J "$1" 2>/dev/null) || return 4
+    [[ "$json" == *'"tracks"'* ]] || return 4
+
+    # C locale: bytes, the same in gawk / mawk / busybox awk; raw UTF-8 in
+    # the JSON passes through unchanged
+    LC_ALL=C awk '
+        BEGIN { RS = "\001" }
+        { s = s $0 }
+        END {
+            n = length(s); nt = 0; i = 1
+            while (i <= n) {
+                c = substr(s, i, 1)
+                if (c ~ /[ \t\r\n]/) { i++; continue }
+                if (c ~ /[{}\[\]:,]/) { tok[++nt] = c; i++; continue }
+                if (c == "\"") {
+                    v = ""; i++
+                    while (i <= n) {
+                        c = substr(s, i, 1)
+                        if (c == "\\") {
+                            e = substr(s, i + 1, 1)
+                            if (e == "n" || e == "t" || e == "r") v = v " "
+                            else if (e == "b") v = v sprintf("%c", 8)
+                            else if (e == "f") v = v sprintf("%c", 12)
+                            else if (e == "u") {
+                                cp = hex(substr(s, i + 2, 4)); i += 4
+                                # surrogate pair: one code point
+                                if (cp >= 55296 && cp <= 56319 && substr(s, i + 2, 2) == "\\u") {
+                                    lo = hex(substr(s, i + 4, 4))
+                                    if (lo >= 56320 && lo <= 57343) {
+                                        cp = 65536 + (cp - 55296) * 1024 + (lo - 56320); i += 6
+                                    }
+                                }
+                                v = v utf8(cp)
+                            }
+                            else v = v e
+                            i += 2; continue
+                        }
+                        if (c == "\"") { i++; break }
+                        v = v c; i++
+                    }
+                    gsub(/[\t\r\n]/, " ", v)
+                    tok[++nt] = "S"; val[nt] = v; continue
+                }
+                v = ""
+                while (i <= n && substr(s, i, 1) !~ /[ \t\r\n{}\[\]:,]/) { v = v substr(s, i, 1); i++ }
+                tok[++nt] = "V"; val[nt] = v
+            }
+            p = 1
+            if (nt) value("")
+            for (k = 0; k in T_id; k++)
+                printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                    T_id[k], g(k, "type"), g(k, "number"), g(k, "codec_id"),
+                    g(k, "audio_channels"), g(k, "audio_sampling_frequency"),
+                    g(k, "pixel_dimensions"), g(k, "language"), g(k, "track_name"),
+                    g(k, "default_track"), g(k, "forced_track")
+        }
+        function g(k, key) { return ((k, key) in F && F[k, key] != "") ? F[k, key] : "-" }
+        function hex(h,    i, d, n) {
+            n = 0; h = tolower(h)
+            for (i = 1; i <= length(h); i++) {
+                d = index("0123456789abcdef", substr(h, i, 1))
+                if (!d) return 65533
+                n = n * 16 + d - 1
+            }
+            return n
+        }
+        # code point -> UTF-8 bytes (awk runs with LC_ALL=C: %c is a byte);
+        # a lone surrogate becomes U+FFFD
+        function utf8(c) {
+            if (c >= 55296 && c <= 57343) c = 65533
+            if (c < 128)   return sprintf("%c", c)
+            if (c < 2048)  return sprintf("%c%c", 192 + int(c / 64), 128 + c % 64)
+            if (c < 65536) return sprintf("%c%c%c", 224 + int(c / 4096), 128 + int(c / 64) % 64, 128 + c % 64)
+            return sprintf("%c%c%c%c", 240 + int(c / 262144), 128 + int(c / 4096) % 64,
+                128 + int(c / 64) % 64, 128 + c % 64)
+        }
+        function value(path,    key, k) {
+            if (tok[p] == "{") {
+                p++
+                if (tok[p] == "}") { p++; return }
+                while (p <= nt) {
+                    key = val[p]; p += 2            # key, ":"
+                    value(path "/" key)
+                    if (tok[p] == ",") { p++; continue }
+                    p++; return
+                }
+                return
+            }
+            if (tok[p] == "[") {
+                p++; k = 0
+                if (tok[p] == "]") { p++; return }
+                while (p <= nt) {
+                    value(path "/" k); k++
+                    if (tok[p] == ",") { p++; continue }
+                    p++; return
+                }
+                return
+            }
+            scalar(path, val[p]); p++
+        }
+        function scalar(path, v,    a, m) {
+            m = split(path, a, "/")
+            if (a[2] != "tracks") return
+            if (m == 4) {
+                F[a[3], a[4]] = v
+                if (a[4] == "id") T_id[a[3]] = v
+            } else if (m == 5 && a[4] == "properties") {
+                F[a[3], a[5]] = v
+            }
+        }' <<< "$json"
+}
+
+# _mkv_codec_ok FFMPEG_CODEC MKV_CODEC_ID  ->  0 when they can be the
+# same track (an FFmpeg codec not listed here is not compared)
+_mkv_codec_ok() {
+    local f="$1" m="$2"
+
+    case "$f" in
+        ac3)            [[ "$m" == A_AC3* ]] ;;
+        eac3)           [[ "$m" == A_EAC3* ]] ;;
+        aac)            [[ "$m" == A_AAC* ]] ;;
+        dts)            [[ "$m" == A_DTS* ]] ;;
+        truehd|mlp)     [[ "$m" == A_TRUEHD* || "$m" == A_MLP* ]] ;;
+        flac)           [[ "$m" == A_FLAC* ]] ;;
+        opus)           [[ "$m" == A_OPUS* ]] ;;
+        vorbis)         [[ "$m" == A_VORBIS* ]] ;;
+        mp3)            [[ "$m" == A_MPEG/L3* ]] ;;
+        mp2)            [[ "$m" == A_MPEG/L2* ]] ;;
+        alac)           [[ "$m" == A_ALAC* ]] ;;
+        pcm_*)          [[ "$m" == A_PCM* ]] ;;
+        h264)           [[ "$m" == V_MPEG4/ISO/AVC* ]] ;;
+        hevc)           [[ "$m" == V_MPEGH/ISO/HEVC* ]] ;;
+        av1)            [[ "$m" == V_AV1* ]] ;;
+        vp9)            [[ "$m" == V_VP9* ]] ;;
+        vp8)            [[ "$m" == V_VP8* ]] ;;
+        mpeg4)          [[ "$m" == V_MPEG4/ISO/* || "$m" == V_MS/VFW/FOURCC* ]] ;;
+        mpeg2video)     [[ "$m" == V_MPEG2* ]] ;;
+        mpeg1video)     [[ "$m" == V_MPEG1* ]] ;;
+        subrip)         [[ "$m" == S_TEXT/UTF8* || "$m" == S_TEXT/ASCII* ]] ;;
+        ass|ssa)        [[ "$m" == S_TEXT/ASS* || "$m" == S_TEXT/SSA* || "$m" == S_ASS* || "$m" == S_SSA* ]] ;;
+        hdmv_pgs_subtitle) [[ "$m" == S_HDMV/PGS* ]] ;;
+        dvd_subtitle)   [[ "$m" == S_VOBSUB* ]] ;;
+        webvtt)         [[ "$m" == S_TEXT/WEBVTT* || "$m" == D_WEBVTT* ]] ;;
+        *)              return 0 ;;
+    esac
+}
+
+# mkv_track_map FILE  ->  "ffmpeg_index<TAB>number[,number...]" for every
+# FFmpeg video (not cover art) / audio / subtitle stream of an MKV: the
+# Matroska track number(s) it can be. Several numbers: tracks that are
+# identical in every compared property (the caller must treat them
+# alike). Prints "ERR<TAB>reason" and returns 1 when the mapping is not
+# certain: track counts differ, a stream matches no track, or the
+# candidate sets overlap. Compared: type, codec, channels, sample rate
+# (or half of it: AAC SBR), dimensions, track name, default / forced
+# flags, and the language when both name a real one.
+mkv_track_map() {
+    local file="$1" t line k w h sr2
+    local -a tr f
+    local -A dims=() fcount=() tcount=() setof=() setsize=() claim=()
+
+    if ! mapfile -t tr < <(mkv_identify_tracks "$file") || (( ${#tr[@]} == 0 )); then
+        printf 'ERR\t%s\n' "MKVToolNix (mkvmerge) cannot identify the tracks"
+        return 1
+    fi
+
+    while IFS=, read -r k w h; do
+        [[ "$k" =~ ^[0-9]+$ ]] && dims[$k]="${w%$'\r'}x${h%$'\r'}"
+    done < <(ffprobe -v error -show_entries stream=index,width,height -of csv=p=0 "$file" 2>/dev/null)
+
+    local -a mt=()
+    for line in "${tr[@]}"; do
+        IFS=$'\t' read -r -a t <<< "$line"
+        case "${t[1]}" in video|audio|subtitles) ;; *) continue ;; esac
+        [[ "${t[2]}" =~ ^[0-9]+$ ]] || { printf 'ERR\t%s\n' "a track has no track number"; return 1; }
+        [[ -z "${tcount[n${t[2]}]:-}" ]] || { printf 'ERR\t%s\n' "track number ${t[2]} is not unique"; return 1; }
+        tcount[n${t[2]}]=1
+        tcount[${t[1]}]=$(( ${tcount[${t[1]}]:-0} + 1 ))
+        mt+=("$line")
+    done
+
+    local out=() idx type nums lang
+    while IFS=$'\t' read -r -a f; do
+        type="${f[1]}"
+        case "$type" in
+            video)    [[ "${f[11]}" == 1 ]] && continue ;;    # cover art: an attachment
+            audio)    ;;
+            subtitle) type=subtitles ;;
+            *)        continue ;;
+        esac
+        idx="${f[0]}"
+        fcount[$type]=$(( ${fcount[$type]:-0} + 1 ))
+        nums=""
+        for line in "${mt[@]}"; do
+            IFS=$'\t' read -r -a t <<< "$line"
+            [[ "${t[1]}" == "$type" ]] || continue
+            _mkv_codec_ok "${f[2]}" "${t[3]}" || continue
+            if [[ "$type" == audio ]]; then
+                [[ "${t[4]}" == "${f[4]}" ]] || continue
+                sr2="-"
+                [[ "${t[5]}" =~ ^[0-9]+$ ]] && sr2=$(( t[5] * 2 ))
+                [[ "${t[5]}" == "${f[17]}" || "$sr2" == "${f[17]}" ]] || continue
+            fi
+            [[ "$type" != video || "${t[6]}" == "${dims[$idx]:-}" ]] || continue
+            [[ "${t[8]}" == "${f[13]}" ]] || continue
+            [[ "${t[9]}" == "$( [[ "${f[6]}" == 1 ]] && echo true || echo false)" ]] || continue
+            [[ "${t[10]}" == "$( [[ "${f[7]}" == 1 ]] && echo true || echo false)" ]] || continue
+            lang="${f[12]}"
+            if [[ "$lang" != - && "$lang" != und && "${t[7]}" != - && "${t[7]}" != und ]]; then
+                [[ "${t[7]}" == "$lang" ]] || continue
+            fi
+            nums+="${nums:+,}${t[2]}"
+        done
+        if [[ -z "$nums" ]]; then
+            printf 'ERR\t%s\n' "FFmpeg stream $idx ($type ${f[2]}) matches no Matroska track"
+            return 1
+        fi
+        claim[$nums]=$(( ${claim[$nums]:-0} + 1 ))
+        out+=("$idx"$'\t'"$nums")
+    done < <(stream_meta "$file")
+
+    for type in video audio subtitles; do
+        if [[ "${fcount[$type]:-0}" != "${tcount[$type]:-0}" ]]; then
+            printf 'ERR\t%s\n' "FFmpeg sees ${fcount[$type]:-0} $type stream(s), MKVToolNix ${tcount[$type]:-0}"
+            return 1
+        fi
+    done
+
+    # every candidate set must be claimed by exactly as many streams as
+    # it has tracks, and the sets must not overlap
+    local -A seen=()
+    for nums in "${!claim[@]}"; do
+        IFS=, read -ra t <<< "$nums"
+        if (( ${#t[@]} != claim[$nums] )); then
+            printf 'ERR\t%s\n' "tracks $nums cannot be told apart from the FFmpeg streams"
+            return 1
+        fi
+        for k in "${t[@]}"; do
+            [[ -z "${seen[$k]:-}" ]] || { printf 'ERR\t%s\n' "track $k matches several different FFmpeg streams"; return 1; }
+            seen[$k]=1
+        done
+    done
+
+    printf '%s\n' "${out[@]+"${out[@]}"}"
+}
+
 # mkv_set_compression_tags FILE CRF TIER WORKDIR
 #
 # Writes the global Matroska tags COMPRESSION_CRF=CRF and (when TIER is
@@ -1517,10 +1781,17 @@ codec_title_label() {
 #   added.
 # MODE check: prints the claims in TITLE that are false for a track of
 #   CODEC with PROFILE and CHANNELS (empty = accurate).
+# MODE residue: TITLE with every codec / object-audio / bitrate / bit-
+#   depth / sample-rate / channel claim (true or false) and the track's
+#   own language (LANG: regex of its name and codes) removed: the
+#   descriptive rest ("Director's Commentary"), for audio_std_title.
 # Case-insensitive; plain POSIX awk (mawk compatible).
 _audio_title_awk() {
-    awk -v mode="$1" -v t="$2" -v codec="$3" -v label="$4" -v ch="$5" -v prof="$6" '
+    # the title is passed in the environment: awk -v would turn its
+    # backslashes into escape sequences
+    AT_TITLE="$2" awk -v mode="$1" -v codec="$3" -v label="$4" -v ch="$5" -v prof="$6" -v lang="${7:-}" '
         BEGIN {
+            t = ENVIRON["AT_TITLE"]
             # pattern, class (order matters: longest / most specific first)
             n = 0
             P[++n] = "dolby atmos";                       C[n] = "atmos"
@@ -1562,6 +1833,11 @@ _audio_title_awk() {
             P[++n] = "4\\.0|quad";                        C[n] = "ch4"
             P[++n] = "2\\.0|stereo";                      C[n] = "ch2"
             P[++n] = "1\\.0|mono";                        C[n] = "ch1"
+            # residue only (kept by rewrite / check): any other channel
+            # notation, and the track language
+            P[++n] = "[0-9]+\\.[0-9](\\.[0-9])?";          C[n] = "chx"
+            P[++n] = "[0-9]+ ?(ch|channels?)";            C[n] = "chx"
+            if (lang != "") { P[++n] = lang;              C[n] = "lang" }
 
             lc = tolower(t); out = t; first = 1; stale = ""
 
@@ -1594,7 +1870,7 @@ _audio_title_awk() {
 
                     rep = ""
                     # DTS:X also names the codec (DTS); Atmos alone does not
-                    if ((is_codec(C[i]) || C[i] == "dtsx") && first) { rep = "\001"; first = 0 }
+                    if ((is_codec(C[i]) || C[i] == "dtsx") && first && mode != "residue") { rep = "\001"; first = 0 }
                     lc  = substr(lc, 1, s - 1) rep substr(lc, s + l)
                     out = substr(out, 1, s - 1) rep substr(out, s + l)
                     pos = s + length(rep)
@@ -1621,6 +1897,8 @@ _audio_title_awk() {
         }
         function is_codec(c) { return c ~ /^(truehd|eac3|ac3|dts|pcm|flac|alac|aac|opus|mp3|vorbis)$/ }
         function is_false(c) {
+            if (mode == "residue") return 1
+            if (c == "chx" || c == "lang") return 0
             if (is_codec(c)) return c != codec
             if (c == "dolby")    return codec !~ /^(ac3|eac3|truehd)$/
             if (c == "lossless") return codec !~ /^(flac|alac|pcm|truehd)$/
@@ -1657,38 +1935,426 @@ _audio_rows() {
     done
 }
 
-# audio_title_plan FILE AUDIO_ARGS
-#   ->  "index<TAB>old title<TAB>new title" for every re-encoded track
-#       that has a title (new == old when it is still accurate)
-audio_title_plan() {
-    local file="$1"
-    local -a rows f
-    local i enc codec
+# ------------------------------------------------------------
+# Standard audio track titles: "Language | Codec | Channels[ | Type]"
+#   "English | AC-3 | 5.1", "English | TrueHD Atmos | 7.1",
+#   "English | AC-3 | 2.0 | Commentary"
+# Built from the properties of the OUTPUT track (codec, profile,
+# channels, layout, language tag, dispositions); the old title only
+# contributes its descriptive rest (commentary, mix names, ...), never a
+# codec, channel or object-audio claim. Unknown parts are left out
+# (language "und"), or say only what is known ("6ch" for 6 channels
+# without a speaker layout); nothing is invented.
+# ------------------------------------------------------------
 
-    mapfile -t rows < <(_audio_rows "$file")
+# ISO 639-2 (B and T) / 639-1 codes -> English language name
+declare -gA AUDIO_LANG_NAMES=(
+    [eng]=English [en]=English [jpn]=Japanese [ja]=Japanese
+    [fre]=French [fra]=French [fr]=French [ger]=German [deu]=German [de]=German
+    [spa]=Spanish [es]=Spanish [ita]=Italian [it]=Italian
+    [por]=Portuguese [pt]=Portuguese [rus]=Russian [ru]=Russian
+    [chi]=Chinese [zho]=Chinese [zh]=Chinese [cmn]=Mandarin [yue]=Cantonese
+    [kor]=Korean [ko]=Korean [hin]=Hindi [hi]=Hindi [ara]=Arabic [ar]=Arabic
+    [dut]=Dutch [nld]=Dutch [nl]=Dutch [swe]=Swedish [sv]=Swedish
+    [nor]=Norwegian [no]=Norwegian [nob]="Norwegian Bokmal" [nb]="Norwegian Bokmal"
+    [nno]="Norwegian Nynorsk" [nn]="Norwegian Nynorsk"
+    [dan]=Danish [da]=Danish [fin]=Finnish [fi]=Finnish [pol]=Polish [pl]=Polish
+    [cze]=Czech [ces]=Czech [cs]=Czech [slo]=Slovak [slk]=Slovak [sk]=Slovak
+    [hun]=Hungarian [hu]=Hungarian [gre]=Greek [ell]=Greek [el]=Greek
+    [tur]=Turkish [tr]=Turkish [heb]=Hebrew [he]=Hebrew [tha]=Thai [th]=Thai
+    [vie]=Vietnamese [vi]=Vietnamese [ind]=Indonesian [id]=Indonesian
+    [may]=Malay [msa]=Malay [ms]=Malay [fil]=Filipino [tgl]=Tagalog [tl]=Tagalog
+    [tam]=Tamil [ta]=Tamil [tel]=Telugu [te]=Telugu [ben]=Bengali [bn]=Bengali
+    [mar]=Marathi [mr]=Marathi [kan]=Kannada [kn]=Kannada [mal]=Malayalam [ml]=Malayalam
+    [pan]=Punjabi [pa]=Punjabi [guj]=Gujarati [gu]=Gujarati [urd]=Urdu [ur]=Urdu
+    [per]=Persian [fas]=Persian [fa]=Persian [ukr]=Ukrainian [uk]=Ukrainian
+    [rum]=Romanian [ron]=Romanian [ro]=Romanian [bul]=Bulgarian [bg]=Bulgarian
+    [hrv]=Croatian [hr]=Croatian [srp]=Serbian [sr]=Serbian [slv]=Slovenian [sl]=Slovenian
+    [bos]=Bosnian [bs]=Bosnian [mac]=Macedonian [mkd]=Macedonian [mk]=Macedonian
+    [est]=Estonian [et]=Estonian [lav]=Latvian [lv]=Latvian [lit]=Lithuanian [lt]=Lithuanian
+    [ice]=Icelandic [isl]=Icelandic [is]=Icelandic [cat]=Catalan [ca]=Catalan
+    [baq]=Basque [eus]=Basque [eu]=Basque [glg]=Galician [gl]=Galician
+    [gle]=Irish [ga]=Irish [wel]=Welsh [cym]=Welsh [cy]=Welsh
+    [afr]=Afrikaans [af]=Afrikaans [swa]=Swahili [sw]=Swahili [zul]=Zulu [zu]=Zulu
+    [lat]=Latin [la]=Latin [mul]=Multiple
+)
 
-    while read -r i enc; do
-        [[ -n "$i" && -n "${rows[$i]:-}" ]] || continue
-        IFS=$'\t' read -r -a f <<< "${rows[$i]}"
-        [[ "${f[13]}" != "-" ]] || continue
-        codec=$(encoder_codec "$enc")
-        printf '%s\t%s\t%s\n' "$i" "${f[13]}" "$(audio_title_rewrite "${f[13]}" "$codec" "${f[4]}")"
-    done < <(audio_transcoded_codecs "$2" "${#rows[@]}")
+# audio_lang_name CODE  ->  "English"; "" for none / und / zxx / mis;
+# an unlisted code is shown as it is (never guessed)
+audio_lang_name() {
+    local c="${1,,}"
+
+    c="${c%%[-_]*}"                       # en-US -> en
+    case "$c" in
+        ""|-|und|zxx|mis) return 0 ;;
+    esac
+    printf '%s' "${AUDIO_LANG_NAMES[$c]:-$1}"
 }
 
-# audio_title_args FILE AUDIO_ARGS  ->  shell-quoted -metadata:s:a:N
-# title=... for re-encoded tracks whose title would become false.
-# AUDIO_ARGS name source audio indexes; N is the output audio index
-# (MAP_AUDIO_OUT of build_stream_map; the same index without it).
-audio_title_args() {
+# audio_codec_name CODEC PROFILE OBJECT  ->  "AC-3", "TrueHD Atmos",
+# "DTS-HD MA", ... OBJECT: audio_object_kind of the track ("" = none)
+audio_codec_name() {
+    local codec="$1" profile="${2:-}" object="${3:-}" l
+
+    [[ "$profile" == "-" || "$profile" == unknown ]] && profile=""
+    case "$codec" in
+        ""|-|unknown) return 0 ;;
+        dts)
+            # FFmpeg's profile names the DTS kind: "DTS-HD MA", "DTS-HD
+            # MA + DTS:X", "DTS-ES", "DTS 96/24", "DTS Express"
+            if [[ "$profile" == DTS* ]]; then l="$profile"; else l=DTS; fi
+            [[ "$object" == DTS:X* && "$l" != *DTS:X* ]] && l+=" + DTS:X"
+            ;;
+        aac)
+            case "$profile" in
+                HE-AACv2) l="HE-AAC v2" ;;
+                HE-AAC)   l="HE-AAC" ;;
+                *)        l="AAC" ;;
+            esac
+            ;;
+        *)  l=$(codec_title_label "$codec") ;;
+    esac
+    [[ "$object" == "Dolby Atmos"* && "$codec" =~ ^(truehd|eac3)$ ]] && l+=" Atmos"
+    printf '%s' "$l"
+}
+
+# audio_channel_notation LAYOUT CHANNELS  ->  "5.1", "2.0", "7.1.4";
+# "6ch" when the layout is unknown or does not have CHANNELS channels
+audio_channel_notation() {
+    local l="${1:-}" n="${2:-}" r="" c
+    local -a list=()
+    local main=0 lfe=0 h=0
+
+    case "$l" in
+        mono)                                   r=1.0 ;;
+        stereo|downmix|binaural)                r=2.0 ;;
+        2.1)                                    r=2.1 ;;
+        3.0|"3.0(back)")                        r=3.0 ;;
+        4.0|quad|"quad(side)")                  r=4.0 ;;
+        3.1)                                    r=3.1 ;;
+        5.0|"5.0(side)")                        r=5.0 ;;
+        4.1)                                    r=4.1 ;;
+        5.1|"5.1(side)")                        r=5.1 ;;
+        6.0|"6.0(front)"|hexagonal)             r=6.0 ;;
+        6.1|"6.1(back)"|"6.1(front)")           r=6.1 ;;
+        7.0|"7.0(front)")                       r=7.0 ;;
+        7.1|"7.1(wide)"|"7.1(wide-side)")       r=7.1 ;;
+        octagonal)                              r=8.0 ;;
+        3.1.2|5.1.2|5.1.4|7.1.2|7.1.4|7.2.3|9.1.4|9.1.6|22.2) r="$l" ;;
+        "5.1.2(back)"|"5.1.4(back)"|"7.1.2(wide)"|"7.1.4(back)") r="${l%%(*}" ;;
+        cube)                                   r=4.0.4 ;;
+        hexadecagonal)                          r=16.0 ;;
+        *)
+            # "6 channels (FL+FR+...)" / "FL+FR+...": count the speakers
+            [[ "$l" =~ \(([A-Z0-9+]+)\)$ ]] && l="${BASH_REMATCH[1]}"
+            if [[ "$l" =~ ^[A-Z0-9]+(\+[A-Z0-9]+)*$ ]]; then
+                IFS=+ read -ra list <<< "$l"
+                for c in "${list[@]}"; do
+                    case "$c" in
+                        LFE|LFE2|LFE3)                      ((lfe += 1)) ;;
+                        TFL|TFR|TFC|TC|TBL|TBR|TBC|TSL|TSR) ((h += 1)) ;;
+                        *)                                  ((main += 1)) ;;
+                    esac
+                done
+                r="$main.$lfe"
+                (( h > 0 )) && r+=".$h"
+            fi
+            ;;
+    esac
+
+    # the notation must add up to the channel count
+    if [[ -n "$r" && "$n" =~ ^[0-9]+$ ]]; then
+        c=0
+        IFS=. read -ra list <<< "$r"
+        for main in "${list[@]}"; do ((c += main)); done
+        (( c == n )) || r=""
+    fi
+    if [[ -z "$r" && "$n" =~ ^[1-9][0-9]*$ ]]; then
+        r="${n}ch"
+    fi
+    printf '%s' "$r"
+}
+
+# audio_title_description TITLE LANG_CODE COMMENT HI VI  ->  the Type
+# part(s): the descriptive rest of TITLE (no codec / channel / language
+# / rate claims), plus what the dispositions say when the rest does not
+# already say it. " | "-separated; "" = none.
+audio_title_description() {
+    local t="${1:-}" code="${2:-}" name re="" r lc
+    local -a parts=()
+
+    [[ "$t" == "-" ]] && t=""
+    name=$(audio_lang_name "$code")
+    code="${code,,}"; code="${code%%[-_]*}"
+    for r in "${name,,}" "$code"; do
+        [[ -n "$r" && "$r" != - && "$r" =~ ^[a-z\ ]+$ ]] && re+="${re:+|}$r"
+    done
+
+    r=""
+    [[ -n "$t" ]] && r=$(_audio_title_awk residue "$t" "" "" "" "" "$re")
+    lc="${r,,}"
+    # nothing meaningful left ("Audio", "Surround", "Track 2", ...)
+    if [[ "$lc" =~ ^((main|original)\ )?(audio|sound|track|surround|audio\ track)(\ #?[0-9]+)?$ ]]; then
+        r="" lc=""
+    fi
+    [[ -n "$r" ]] && parts+=("$r")
+
+    [[ "${3:-0}" == 1 && "$lc" != *comment* ]] && parts+=("Commentary")
+    [[ "${5:-0}" == 1 && ! "$lc" =~ descri|narrat|(^|[^a-z])ad($|[^a-z]) ]] && parts+=("Descriptive Audio")
+    [[ "${4:-0}" == 1 && ! "$lc" =~ hearing|sdh|(^|[^a-z])hi($|[^a-z])|dialog ]] && parts+=("Hearing Impaired")
+
+    _title_join "${parts[@]+"${parts[@]}"}"
+}
+
+# _title_join PART...  ->  "PART | PART | ..."
+_title_join() {
+    local o="" p
+
+    for p in "$@"; do
+        o+="${o:+ | }$p"
+    done
+    printf '%s' "$o"
+}
+
+# audio_std_title LANG CODEC PROFILE CHANNELS LAYOUT OLD_TITLE COMMENT
+#                 HI VI COPIED
+#   ->  "English | AC-3 | 5.1 | Commentary"
+# COPIED=1: the stream is copied, so object audio named only in the old
+# title (older FFmpeg, see audio_object_kind) still describes it; a
+# transcoded track never has object audio.
+audio_std_title() {
+    local old="${6:-}" object="" out=() p
+
+    [[ "$old" == "-" ]] && old=""
+    if [[ "${10:-0}" == 1 ]]; then
+        object=$(audio_object_kind "$2" "$3" "$old")
+    fi
+
+    for p in "$(audio_lang_name "$1")" "$(audio_codec_name "$2" "$3" "$object")" \
+             "$(audio_channel_notation "$5" "$4")" \
+             "$(audio_title_description "$old" "$1" "${7:-0}" "${8:-0}" "${9:-0}")"; do
+        [[ -n "$p" ]] && out+=("$p")
+    done
+
+    _title_join "${out[@]+"${out[@]}"}"
+}
+
+# audio_std_title_plan FILE [OVERRIDES]
+#   ->  "src_index<TAB>old title<TAB>new title" for every audio track of
+#       FILE (source order; old "-" = none). OVERRIDES: lines
+#       "src_index<TAB>codec<TAB>profile<TAB>channels<TAB>layout" with
+#       the output properties of transcoded tracks; every other track is
+#       copied (its own properties).
+audio_std_title_plan() {
+    local file="$1" i=0 oc op och ol copied
+    local -a f o
+    local -A ov=()
+
+    while IFS=$'\t' read -r -a o; do
+        [[ "${o[0]:-}" =~ ^[0-9]+$ ]] && ov[${o[0]}]="${o[1]:--}"$'\t'"${o[2]:--}"$'\t'"${o[3]:--}"$'\t'"${o[4]:--}"
+    done <<< "${2:-}"
+
+    while IFS=$'\t' read -r -a f; do
+        oc="${f[2]}" op="${f[3]}" och="${f[4]}" ol="${f[5]}" copied=1
+        if [[ -n "${ov[$i]:-}" ]]; then
+            IFS=$'\t' read -r oc op och ol <<< "${ov[$i]}"
+            copied=0
+        fi
+        printf '%s\t%s\t%s\n' "$i" "${f[13]}" \
+            "$(audio_std_title "${f[12]}" "$oc" "$op" "$och" "$ol" "${f[13]}" "${f[8]}" "${f[9]}" "${f[10]}" "$copied")"
+        ((i += 1))
+    done < <(_audio_rows "$file")
+}
+
+# audio_std_title_args FILE [OVERRIDES]  ->  shell-quoted
+# -metadata:s:a:N title=... for EVERY audio track (N: the output audio
+# index, MAP_AUDIO_OUT of build_stream_map; the same index without it).
+# Always set, so MP4 track names (handler_name) become MKV titles too.
+# Metadata only: no stream is re-encoded for it.
+audio_std_title_args() {
     local i old new a=()
 
     while IFS=$'\t' read -r i old new; do
-        [[ "$old" != "$new" ]] && a+=("-metadata:s:a:${MAP_AUDIO_OUT[$i]:-$i}" "title=$new")
-    done < <(audio_title_plan "$1" "$2")
+        [[ -n "$new" ]] && a+=("-metadata:s:a:${MAP_AUDIO_OUT[$i]:-$i}" "title=$new")
+    done < <(audio_std_title_plan "$1" "${2:-}")
 
     (( ${#a[@]} )) && printf '%q ' "${a[@]}"
     return 0
+}
+
+# ------------------------------------------------------------
+# Video track titles. There is no standard video title (a video title
+# is usually the movie name or a release name): only claims the stream
+# disproves are found / removed (codec, resolution, HDR / Dolby Vision /
+# HDR10+, bit depth); neutral text and true claims stay, and a missing
+# title is never created.
+# ------------------------------------------------------------
+
+# video_pix_bits PIX_FMT  ->  8 / 10 / 12 ("" unknown)
+video_pix_bits() {
+    case "${1:-}" in
+        ""|-|unknown)                    ;;
+        *p10|*p10le|*p10be|p010*)        echo 10 ;;
+        *p12|*p12le|*p12be|p012*)        echo 12 ;;
+        yuv*|yuvj*|nv12|nv21|gray|rgb24|bgr24) echo 8 ;;
+    esac
+}
+
+# _video_title_awk MODE TITLE CODEC RES HDR DV HDR10P BITS
+#   MODE check: the claims in TITLE the stream disproves ("" = none)
+#   MODE rewrite: TITLE without them ("" when nothing is left)
+# CODEC: ffprobe codec_name; RES: "WIDTHxHEIGHT"; HDR: HDR_KIND (SDR /
+# HDR10 / HLG); DV: 1 / 0; HDR10P: 1 / 0 / ? (not seen in the probed frames:
+# proves nothing); BITS: video_pix_bits. An unknown property ("")
+# disproves nothing.
+_video_title_awk() {
+    # the title in the environment (awk -v would interpret backslashes)
+    VT_TITLE="$2" awk -v mode="$1" -v codec="$3" -v res="$4" -v hdr="$5" -v dv="$6" -v h10p="$7" -v bits="$8" '
+        BEGIN {
+            t = ENVIRON["VT_TITLE"]
+            n = 0
+            P[++n] = "dolby ?vision|dovi";        C[n] = "dv"
+            P[++n] = "dv";                        C[n] = "dv"
+            P[++n] = "hdr10 ?(\\+|plus)";         C[n] = "h10p"
+            P[++n] = "hdr10";                     C[n] = "hdr10"
+            P[++n] = "hlg";                       C[n] = "hlg"
+            P[++n] = "hdr";                       C[n] = "hdr"
+            P[++n] = "sdr";                       C[n] = "sdr"
+            P[++n] = "[xh]\\.?264|avc";           C[n] = "h264"
+            P[++n] = "[xh]\\.?265|hevc";          C[n] = "hevc"
+            P[++n] = "av1";                       C[n] = "av1"
+            P[++n] = "vp9";                       C[n] = "vp9"
+            P[++n] = "mpeg-?2";                   C[n] = "mpeg2video"
+            P[++n] = "vc-?1";                     C[n] = "vc1"
+            P[++n] = "xvid|divx";                 C[n] = "mpeg4"
+            P[++n] = "4320p|8k";                  C[n] = "r4320"
+            P[++n] = "2160p|4k|uhd";              C[n] = "r2160"
+            P[++n] = "1440p|qhd";                 C[n] = "r1440"
+            P[++n] = "1080[pi]|fhd";              C[n] = "r1080"
+            P[++n] = "720p";                      C[n] = "r720"
+            P[++n] = "576[pi]|480[pi]";           C[n] = "rsd"
+            # frame size; a resolution claim is false only when the frame
+            # clearly cannot be it (letterboxed / cropped / anamorphic /
+            # ultrawide frames keep their claim)
+            w = h = ""
+            if (match(res, /^[0-9]+x[0-9]+$/)) { split(res, wh, "x"); w = wh[1] + 0; h = wh[2] + 0 }
+            P[++n] = "(8|10|12)[- ]?bits?";       C[n] = "bits"
+
+            lc = tolower(t); out = t; stale = ""
+            for (i = 1; i <= n; i++) {
+                re = "(^|[^a-z0-9])(" P[i] ")($|[^a-z0-9])"
+                pos = 1
+                while (pos <= length(lc) && match(substr(lc, pos), re)) {
+                    s = pos + RSTART - 1
+                    if (substr(lc, s, 1) ~ /[^a-z0-9]/) s++
+                    match(substr(lc, s), "^(" P[i] ")")
+                    l = RLENGTH
+                    blank = sprintf("%" l "s", ""); gsub(/./, "\002", blank)
+                    if (is_false(C[i], substr(lc, s, l))) {
+                        stale = stale (stale ? ", " : "") substr(out, s, l)
+                        lc  = substr(lc, 1, s - 1) substr(lc, s + l)
+                        out = substr(out, 1, s - 1) substr(out, s + l)
+                        pos = s
+                    } else {
+                        lc = substr(lc, 1, s - 1) blank substr(lc, s + l)
+                        pos = s + l
+                    }
+                }
+            }
+            if (mode == "check") { print stale; exit }
+
+            gsub(/[ \t]+/, " ", out)
+            gsub(/\( *[-|\/,;:+@. ]*\)|\[ *[-|\/,;:+@. ]*\]|\{ *[-|\/,;:+@. ]*\}/, "", out)
+            while (match(out, /[-|\/,;:+@] *[-|\/,;:+@]/))
+                out = substr(out, 1, RSTART) substr(out, RSTART + RLENGTH)
+            gsub(/\.\.+/, ".", out)
+            gsub(/\( +/, "(", out); gsub(/ +\)/, ")", out)
+            gsub(/\[ +/, "[", out); gsub(/ +\]/, "]", out)
+            gsub(/ +/, " ", out)
+            sub(/^[ .|\/,;:+@-]+/, "", out); sub(/[ .|\/,;:+@-]+$/, "", out)
+            print out
+        }
+        function res_false(c) {
+            if (c == "r4320") return w < 6000 && h < 3400
+            if (c == "r2160") return (w < 3000 && h < 1500) || w >= 6000 || h >= 3400
+            if (c == "r1440") return (w < 2200 && h < 1250) || w >= 3000 || h >= 1500
+            if (c == "r1080") return (w < 1500 && h < 900) || w >= 3000 || h >= 1500
+            if (c == "r720")  return (w < 1000 && h < 600) || w >= 1700 || h >= 1000
+            return w >= 1100 || h >= 650                       # rsd
+        }
+        function is_false(c, txt,    b) {
+            if (c == "dv")    return dv != "" && dv != 1
+            # HDR10+ needs an HDR10 stream; "?" (not seen in the frames
+            # probed, which does not prove it absent) disproves nothing else
+            if (c == "h10p")  return (hdr != "" && hdr != "HDR10") || (h10p != "" && h10p != "?" && h10p != 1)
+            if (c == "hdr10") return hdr != "" && hdr != "HDR10"
+            if (c == "hlg")   return hdr != "" && hdr != "HLG"
+            if (c == "hdr")   return hdr != "" && hdr != "HDR10" && hdr != "HLG" && dv != 1
+            if (c == "sdr")   return hdr != "" && (hdr != "SDR" || dv == 1)
+            if (c ~ /^r/)     return w != "" && res_false(c)
+            if (c == "bits")  { b = txt; sub(/[^0-9].*/, "", b); return bits != "" && b != bits }
+            return codec != "" && c != codec
+        }'
+}
+
+# video_title_false_claims TITLE CODEC RES HDR DV HDR10P BITS  ->  "" if
+# nothing in TITLE is disproved by the stream
+video_title_false_claims() {
+    _video_title_awk check "$@"
+}
+
+# video_title_rewrite TITLE CODEC RES HDR DV HDR10P BITS  ->  TITLE with
+# the disproved claims removed ("" = nothing left)
+video_title_rewrite() {
+    _video_title_awk rewrite "$@"
+}
+
+# video_title_fix FILE VIDX CODEC RES HDR DV HDR10P BITS  ->  the title
+# the OUTPUT video should carry when the source title (stream VIDX of
+# FILE) makes claims the output stream disproves: the cleaned title, or
+# "-" (nothing left: no title). Prints nothing when the source title can
+# stay (no title, or nothing disproved). The other arguments describe
+# the output video as for video_title_false_claims.
+video_title_fix() {
+    local file="$1" vidx="$2" title="-" idx type new
+    shift 2
+
+    while IFS=$'\t' read -r idx type _ _ _ _ _ _ _ _ _ _ _ title _; do
+        [[ "$idx" == "$vidx" ]] && break
+        title="-"
+    done < <(stream_meta "$file")
+    [[ "$idx" == "$vidx" && "$title" != "-" ]] || return 0
+    [[ -n "$(video_title_false_claims "$title" "$@")" ]] || return 0
+
+    new=$(video_title_rewrite "$title" "$@")
+    printf '%s' "${new:--}"
+}
+
+# _video_title_arg FIX  ->  shell-quoted -metadata:s:v:0 title=... for a
+# video_title_fix result ("-": empty title, which removes it)
+_video_title_arg() {
+    local t="$1"
+
+    [[ "$t" == "-" ]] && t=""
+    printf '%q ' -metadata:s:v:0 "title=$t"
+}
+
+# _encoded_size FILE VIDX FILTER  ->  "WIDTHxHEIGHT" of the encoded
+# video: the source size, or what DOWNSCALE_1080P_FILTER makes of it;
+# "" (unknown: no resolution claim is judged) for any other filter
+_encoded_size() {
+    local res w h
+
+    res=$(get_resolution "$1" "$2" 2>/dev/null) || return 0
+    w="${res%x*}" h="${res#*x}"
+    [[ "$w" =~ ^[0-9]+$ && "$h" =~ ^[0-9]+$ ]] || return 0
+    if [[ -n "${3:-}" ]]; then
+        [[ "$3" == "$DOWNSCALE_1080P_FILTER" ]] || return 0
+        read -r w h < <(awk -v w="$w" -v h="$h" 'BEGIN {
+            f = 1; if (1920 / w < f) f = 1920 / w; if (1080 / h < f) f = 1080 / h
+            printf "%d %d\n", w * f, h * f }')
+    fi
+    printf '%sx%s' "$w" "$h"
 }
 
 # audio_object_kind CODEC PROFILE TITLE  ->  "Dolby Atmos" / "DTS:X" /
@@ -1901,7 +2567,9 @@ matroska_mux_args() {
 #   MAP_OTHER_ARGS  the same without the main video map
 #   MAP_CODEC_ARGS  shell-quoted codec options of every mapped stream
 #                   except the main video and the audio
-#   MAP_META_ARGS   shell-quoted per-stream metadata (titles)
+#   MAP_META_ARGS   shell-quoted per-stream metadata (titles, not audio)
+#   MAP_ATITLE_ARGS shell-quoted standard titles of every audio track,
+#                   all copied (audio_std_title_args)
 #   MAP_COVERS      array of "index<TAB>filename<TAB>mimetype"
 #   MAP_NOTES       array of human-readable notes
 #   MAP_AUDIO_COUNT number of mapped audio streams
@@ -1947,10 +2615,13 @@ build_stream_map() {
     while IFS=$'\t' read -r idx type codec att rest; do
         [[ -n "$vidx" && "$idx" == "$vidx" ]] && continue
 
-        if [[ -n "${handler[$idx]:-}" && ( "$type" == "audio" || "$type" == "subtitle" ) ]] &&
-           [[ "$type" != "subtitle" || "$(mkv_subtitle_action "$codec")" != "drop" ]]; then
+        # audio: the name goes into the standard title (MAP_ATITLE_ARGS)
+        if [[ -n "${handler[$idx]:-}" && "$type" == "subtitle" ]] &&
+           [[ "$(mkv_subtitle_action "$codec")" != "drop" ]]; then
             metas+=("-metadata:s:$out_n" "title=${handler[$idx]}")
             MAP_NOTES+=("stream $idx: MP4 track name \"${handler[$idx]}\" kept as MKV title")
+        elif [[ -n "${handler[$idx]:-}" && "$type" == "audio" ]]; then
+            MAP_NOTES+=("stream $idx: MP4 track name \"${handler[$idx]}\" used for the MKV audio title")
         fi
 
         case "$type" in
@@ -2033,6 +2704,10 @@ build_stream_map() {
     MAP_META_ARGS=""
     (( ${#metas[@]} )) && MAP_META_ARGS=$(printf '%q ' "${metas[@]}")
     MAP_AMAP=$(IFS=,; printf '%s' "${amap[*]-}")
+    # standard titles of the copied audio tracks (the audio menu makes
+    # its own, with the transcoded tracks' output properties)
+    MAP_ATITLE_ARGS=""
+    (( MAP_AUDIO_COUNT > 0 )) && MAP_ATITLE_ARGS=$(audio_std_title_args "$file")
     return 0
 }
 
@@ -2084,11 +2759,13 @@ emit_part_and_covers() {
 # (v:0) the language, title and dispositions of source stream VIDX.
 # Used when the video comes from a second input (Dolby Vision path).
 source_video_tag_args() {
-    local file="$1" vidx="$2"
+    local file="$1" vidx="$2" fix="${3:-}"
     local idx type def forced comment hi vi lang title a=() d=()
 
     while IFS=$'\t' read -r idx type _ _ _ _ def forced comment hi vi _ lang title _ _; do
         [[ "$idx" == "$vidx" ]] || continue
+        # FIX (video_title_fix): the corrected title, "-" = none
+        [[ -n "$fix" ]] && title="$fix"
         [[ "$lang" != "-" ]] && a+=(-metadata:s:v:0 "language=$lang")
         [[ "$title" != "-" ]] && a+=(-metadata:s:v:0 "title=$title")
         (( def == 1 )) && d+=(default)
@@ -2331,7 +3008,7 @@ emit_encode_item() {
     # audio payload is hash-compared with the source; amap: source ->
     # output audio index (build_stream_map). ceiling_vbytes / crf_min /
     # crf_max: the CRF retry (High / Base; empty = none).
-    expect=$(printf 'item_expect vidx=%q mode=%q crf=%q kbps=%q est_vbytes=%q dv=%q dv_profile=%q dv_compat=%q hdr10p=%q scaled=%q copyts=%q atrans= ahash=1 amap=%q' \
+    expect=$(printf 'item_expect vidx=%q mode=%q crf=%q kbps=%q est_vbytes=%q dv=%q dv_profile=%q dv_compat=%q hdr10p=%q scaled=%q copyts=%q atrans= ahash=1 amap=%q atitle=std' \
         "$vidx" "$mode" "$crf" "$kbps" "$est" \
         "$( (( HDR_DV == 1 )) && echo "$dv_policy" || echo none)" \
         "$dv_out_profile" "$dv_out_compat" "$h10p_policy" "$scaled" \
@@ -2432,6 +3109,13 @@ emit_encode_item() {
 # _emit_final_encode  ->  the final encode + mux of emit_encode_item
 # into "$ITEM_PART" (covers, chapters); reads emit_encode_item's locals
 _emit_final_encode() {
+    # source video title claims the encoded video disproves (codec,
+    # resolution, HDR / Dolby Vision / HDR10+, bit depth) are removed
+    local vfix
+    vfix=$(video_title_fix "$in" "$vidx" hevc "$(_encoded_size "$in" "$vidx" "$filter")" "$HDR_KIND" \
+        "$( [[ "$dv_policy" == "preserve" ]] && echo 1 || echo 0)" \
+        "$( [[ "$h10p_policy" == "preserve" ]] && echo 1 || echo 0)" 10)
+
     if [[ "$dv_policy" == "preserve" ]]; then
         # Final encode -> raw HEVC, RPU injected, wrapped by mkvmerge (DV
         # configuration record + source timestamps), then the same mux
@@ -2447,7 +3131,7 @@ _emit_final_encode() {
         printf '   item_run mux ffmpeg -y -copyts -i %q -i "$ITEM_TMP/video_dv.mkv" \\\n' "$in"
         printf '      -map 1:0 %s\\\n' "$MAP_OTHER_ARGS"
         printf '      -c:v:0 copy -c:a copy %s\\\n' "$MAP_CODEC_ARGS"
-        printf '      %s\\\n' "$(source_video_tag_args "$in" "$vidx")"
+        printf '      %s\\\n' "$(source_video_tag_args "$in" "$vidx" "$vfix")"
     else
         # one codec option per output stream: -c:v:0 libx265 (below),
         # all audio copied, MAP_CODEC_ARGS for the rest
@@ -2456,9 +3140,11 @@ _emit_final_encode() {
         printf '      -c:a copy %s\\\n' "$MAP_CODEC_ARGS"
         [[ -n "$vf" ]] && printf '      %s\\\n' "$vf"
         _emit_x265_lines "$rate" "$dv" "$pq" "$color"
+        [[ -n "$vfix" ]] && printf '      %s\\\n' "$(_video_title_arg "$vfix")"
     fi
 
     [[ -n "$MAP_META_ARGS" ]] && printf '      %s\\\n' "$MAP_META_ARGS"
+    [[ -n "${MAP_ATITLE_ARGS:-}" ]] && printf '      %s\\\n' "$MAP_ATITLE_ARGS"
     printf '      %s\\\n' "$stale"
     printf '      -map_metadata 0 -map_chapters 0 -max_muxing_queue_size 4096 %s\\\n' "$(matroska_mux_args)"
     emit_part_and_covers "$in"
@@ -2484,14 +3170,24 @@ _emit_x265_lines() {
 # kept. Dolby Vision and HDR10+ stay in the copied stream (verified).
 emit_copy_item() {
     local index="$1" in="$2" out="$3" tier="$4" overwrite="$5" vidx="$6"
+    local vfix vcodec vpix
+
+    # the copied video is the source video: only title claims the source
+    # stream itself disproves are removed
+    IFS=, read -r vcodec vpix < <(ffprobe -v error -select_streams "$vidx" \
+        -show_entries stream=codec_name,pix_fmt -of csv=p=0 "$in" 2>/dev/null | tr -d '\r')
+    vfix=$(video_title_fix "$in" "$vidx" "$vcodec" "$(_encoded_size "$in" "$vidx" "")" "$HDR_KIND" \
+        "$HDR_DV" "$( ((HDR_HDR10PLUS == 1)) && echo 1 || echo "?")" "$(video_pix_bits "$vpix")")
 
     printf '# ---- item %s  (source video kept: stream copy)\n' "$index"
     printf 'if item_begin %q %q %q %q %q "" &&\n' "$index" "$in" "$out" "$tier" "$overwrite"
-    printf '   item_expect vidx=%q video=copy mode=copy dv=none hdr10p=none scaled=0 copyts=0 atrans= ahash=1 amap=%q &&\n' "$vidx" "${MAP_AMAP:-}"
+    printf '   item_expect vidx=%q video=copy mode=copy dv=none hdr10p=none scaled=0 copyts=0 atrans= ahash=1 amap=%q atitle=std &&\n' "$vidx" "${MAP_AMAP:-}"
     printf '   item_run mux ffmpeg -y -i %q \\\n' "$in"
     printf '      %s\\\n' "$MAP_ARGS"
     printf '      -c:v:0 copy -c:a copy %s\\\n' "$MAP_CODEC_ARGS"
+    [[ -n "$vfix" ]] && printf '      %s\\\n' "$(_video_title_arg "$vfix")"
     [[ -n "$MAP_META_ARGS" ]] && printf '      %s\\\n' "$MAP_META_ARGS"
+    [[ -n "${MAP_ATITLE_ARGS:-}" ]] && printf '      %s\\\n' "$MAP_ATITLE_ARGS"
     printf '      -map_metadata 0 -map_chapters 0 -max_muxing_queue_size 4096 %s\\\n' "$(matroska_mux_args)"
     emit_part_and_covers "$in"
     printf 'then\n'

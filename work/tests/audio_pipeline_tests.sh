@@ -17,7 +17,8 @@
 #     option per stream, main video not the first stream, no video
 #  3. The Raid 2 case: DTS 5.1(side) Compact -> AC-3 5.1(side); per-
 #     channel tone identity; copied tracks payload-identical; language /
-#     title / default / forced / commentary kept; no "Multiple -codec"
+#     default / forced / commentary kept, standard titles (Language |
+#     Codec | Channels | Type) on every track; no "Multiple -codec"
 #  4. eight tracks, different codecs and layouts, video not first:
 #     AC-3 2.1 / 5.0(side) / layout-less PCM stereo 44.1 kHz / FLAC
 #     5.1(back) 96 kHz / PCM mono transcoded, Opus stereo High -> AC-3,
@@ -232,9 +233,11 @@ ffmpeg -v error -y -f lavfi -i "testsrc2=s=160x90:r=24:d=2" -f lavfi -i "sine=f=
     -map 0:v -map 1:a -map 2:a -c:v libx264 -preset ultrafast -c:a aac -b:a 64k \
     -metadata:s:a:1 handler_name="Director Commentary" "$T/f/h.mp4"
 build_stream_map "$T/f/h.mp4" 0
-check "MP4 handler title on the right output stream" "[[ \"\$MAP_META_ARGS\" == *'-metadata:s:2 title=Director\\ Commentary'* ]]"
+check "MP4 handler name -> standard audio title"  "[[ \"\$MAP_ATITLE_ARGS\" == *'-metadata:s:a:1 '* && \"\$MAP_META_ARGS\" != *Director* ]]"
+eq    "MP4 handler name kept as the description"  "$(audio_std_title_plan "$T/f/h.mp4" | cut -f3 | tr '\n' '/')" "AAC | 1.0/AAC | 1.0 | Director Commentary/"
 MAP_AUDIO_OUT=([0]=0 [1]=3)
-check "title args use the output audio index"     "[[ \"\$(audio_title_args '$T/f/order.mkv' '-c:a:1 ac3 ')\" != *'s:a:1 '* ]]"
+check "title args use the output audio index"     "[[ \"\$(audio_std_title_args '$T/f/order.mkv')\" == *'s:a:3 '* && \"\$(audio_std_title_args '$T/f/order.mkv')\" != *'s:a:1 '* ]]"
+eq    "transcoded track named after its output"   "$(audio_std_title_plan "$T/f/order.mkv" $'1\tac3\t-\t2\tstereo' | cut -f3 | tr '\n' '/')" "AAC | 1.0/AC-3 | 2.0/"
 MAP_AUDIO_OUT=()
 
 # ------------------------------------------------------------
@@ -332,8 +335,11 @@ else
     done
     eq    "output: languages / dispositions"          "$(ffprobe -v error -select_streams a -show_entries stream_tags=language:stream_disposition=default,forced,comment -of csv=p=0 "$OA" | tr -d '\r' | tr '\n' ' ')" \
                                                       "$(ffprobe -v error -select_streams a -show_entries stream_tags=language:stream_disposition=default,forced,comment -of csv=p=0 "$RAID" | tr -d '\r' | tr '\n' ' ')"
-    eq    "output: AC-3 title rewritten"              "$(probe_a "$OA" 1 stream_tags=title)" "Indonesian AC-3 5.1"
-    eq    "output: copied titles kept"                "$(probe_a "$OA" 0 stream_tags=title)|$(probe_a "$OA" 2 stream_tags=title)" "English E-AC-3 5.1|Commentary"
+    eq    "output: AC-3 track standard title"         "$(probe_a "$OA" 1 stream_tags=title)" "Indonesian | AC-3 | 5.1"
+    eq    "output: copied tracks standard titles"     "$(probe_a "$OA" 0 stream_tags=title)/$(probe_a "$OA" 2 stream_tags=title)" "English | E-AC-3 | 5.1/English | AAC | 2.0 | Commentary"
+    check "menu: planned title shown"                "grep -q 'Title: \"Indonesian DTS 5.1\" -> \"Indonesian | AC-3 | 5.1\"' '$T/raid_menu.log'"
+    check "job: atitle=std, one title per audio track" "has '$JA' 'atitle=std' && (( \$(grep -oE -- '-metadata:s:a:[0-9]+ title=' '$JA' | sort -u | wc -l) == 3 ))"
+    check "verify: titles as planned"                "grep -q 'Track titles: *AS PLANNED (3 audio title' '$T/raid_run.log'"
     eq    "output: subtitles kept"                    "$(ffprobe -v error -select_streams s -show_entries stream_tags=language:stream_disposition=default,forced -of csv=p=0 "$OA" | tr -d '\r' | tr '\n' ' ')" "1,0,eng 0,1,ind "
     eq    "output: video stream copied"               "$(ffmpeg -v error -i "$OA" -map 0:v -c copy -f streamhash -hash md5 - 2>/dev/null | awk -F, '{ print $3 }')" \
                                                       "$(ffmpeg -v error -i "$RAID" -map 0:v -c copy -f streamhash -hash md5 - 2>/dev/null | awk -F, '{ print $3 }')"
@@ -402,8 +408,10 @@ check "verify: 96 -> 48 kHz as planned, no warning" "grep -q 'Audio 5 sample rat
 check "verify: every bit rate as planned"          "[[ \$(grep -cE 'Audio [0-9]+ bit rate: *[0-9]+ kb/s AS PLANNED' '$T/mix_run.log') == 6 ]]"
 check "verify: 6.0 / 7.1 hash-matched"             "grep -q 'Audio track 2: *COPIED (FLAC 6.0, 48000 Hz, payload MD5 MATCH)' '$T/mix_run.log' && grep -q 'Audio track 6: *COPIED (FLAC 7.1, 48000 Hz, payload MD5 MATCH)' '$T/mix_run.log'"
 check "verify: no failure"                         "! grep -q 'RESULT: FAILED' '$T/mix_run.log'"
+eq    "output: every track its standard title"     "$(ffprobe -v error -select_streams a -show_entries stream_tags=title -of csv=p=0 "$OB" | tr -d '\r' | tr '\n' '/')" \
+      "English | AC-3 | 2.1/French | FLAC | 6.0/German | AC-3 | 5.0/Spanish | AC-3 | 2.0/Italian | AC-3 | 5.1/Japanese | FLAC | 7.1/Korean | AC-3 | 1.0 | Commentary/Portuguese | AC-3 | 2.0/"
 eq    "output: titles / dispositions"              "$(probe_a "$OB" 4 stream_tags=title)|$(probe_a "$OB" 7 stream_tags=title)|$(ffprobe -v error -select_streams a -show_entries stream_disposition=default,comment -of csv=p=0 "$OB" | tr -d '\r' | tr '\n' ' ')" \
-      "Italian AC-3 5.1|AC-3 Stereo|$(ffprobe -v error -select_streams a -show_entries stream_disposition=default,comment -of csv=p=0 "$MIX" | tr -d '\r' | tr '\n' ' ')"
+      "Italian | AC-3 | 5.1|Portuguese | AC-3 | 2.0|$(ffprobe -v error -select_streams a -show_entries stream_disposition=default,comment -of csv=p=0 "$MIX" | tr -d '\r' | tr '\n' ' ')"
 
 # ------------------------------------------------------------
 echo

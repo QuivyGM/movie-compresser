@@ -1124,9 +1124,27 @@ item_verify_output() {
         fi
 
         if [[ -z "${trans[$i]:-}" ]]; then
-            exp_titles+=("$st")
+            if [[ "${ITEM_EXP[atitle]:-}" == std ]]; then
+                # standard title from the (copied, so unchanged) track
+                et=$(audio_std_title "$(_field "${S_A[$i]}" 9)" "$sc" "$sp" "$sch" "$sl" "$st" \
+                    "$(_field "${S_A[$i]}" 6)" "$(_field "${S_A[$i]}" 7)" "$(_field "${S_A[$i]}" 8)" 1)
+                exp_titles+=("$et")
+            else
+                exp_titles+=("$st")      # jobs without atitle: titles copied
+            fi
             [[ -n "$oc" ]] || continue      # missing: track count failed above
             _verify_copied_audio "$i"
+            if [[ "${ITEM_EXP[atitle]:-}" == std ]]; then
+                if [[ "$ot" != "$et" ]]; then
+                    _rep "Audio $((i + 1)) title" "UNEXPECTED: \"$ot\" (expected \"$et\")" >&3
+                    warns+=("audio $((i + 1)) title differs from the planned title")
+                elif [[ "$st" != "$ot" ]]; then
+                    _rep "Audio $((i + 1)) title" "UPDATED $( [[ "$st" == - ]] && echo "(none)" || echo "\"$st\"") -> \"$ot\"" >&3
+                    ((updated += 1))
+                else
+                    _rep "Audio $((i + 1)) title" "KEPT \"$ot\" (already standard)" >&3
+                fi
+            fi
             continue
         fi
 
@@ -1203,7 +1221,11 @@ item_verify_output() {
         fi
 
         # title: must describe the new track, neutral text kept
-        if [[ "$st" == "-" ]]; then
+        # (atitle=std: the standard title of the actual output track)
+        if [[ "${ITEM_EXP[atitle]:-}" == std ]]; then
+            et=$(audio_std_title "$(_field "${S_A[$i]}" 9)" "$oc" "$op" "$och" "$ol" "$st" \
+                "$(_field "${S_A[$i]}" 6)" "$(_field "${S_A[$i]}" 7)" "$(_field "${S_A[$i]}" 8)" 0)
+        elif [[ "$st" == "-" ]]; then
             et="-"
         else
             et=$(audio_title_rewrite "$st" "$oc" "$sch")
@@ -1219,7 +1241,7 @@ item_verify_output() {
         elif [[ "$ot" != "$et" ]]; then
             _rep "Audio $((i + 1)) title" "UNEXPECTED: \"$ot\" (expected \"$et\")" >&3
             warns+=("audio $((i + 1)) title differs from the planned title")
-        elif [[ "$st" == "-" ]]; then
+        elif [[ "$st" == "-" && "$ot" == "-" ]]; then
             _rep "Audio $((i + 1)) title" "none (source had none; nothing invented)" >&3
         elif [[ "$st" != "$ot" ]]; then
             _rep "Audio $((i + 1)) title" "UPDATED \"$st\" -> \"$ot\"" >&3

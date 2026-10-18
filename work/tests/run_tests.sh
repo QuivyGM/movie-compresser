@@ -685,6 +685,29 @@ check "overwrite option names the symlink" "grep -q '2) Overwrite: replace the s
 eq    "target unchanged after cancel/confirm" "$(md5sum < "$OS/store/target.mkv")" "$TSUM"
 
 echo
+echo "== unit: standard audio titles (audio_std_title)"
+# LANG CODEC PROFILE CHANNELS LAYOUT OLD_TITLE COMMENT HI VI COPIED
+eq "std: AC-3 5.1, old claims dropped"   "$(audio_std_title eng ac3 - 6 '5.1(side)' 'English Dolby Digital 5.1 384 kbps' 0 0 0 1)" "English | AC-3 | 5.1"
+eq "std: TrueHD Atmos 7.1"               "$(audio_std_title eng truehd 'Dolby TrueHD + Dolby Atmos' 8 7.1 '' 0 0 0 1)" "English | TrueHD Atmos | 7.1"
+eq "std: DTS-HD MA from the profile"     "$(audio_std_title jpn dts 'DTS-HD MA' 6 '5.1(side)' 'DTS-HD MA 5.1 [24-bit/48kHz]' 0 0 0 1)" "Japanese | DTS-HD MA | 5.1"
+eq "std: commentary text kept"           "$(audio_std_title eng ac3 - 2 stereo 'Director Commentary - AC-3' 1 0 0 1)" "English | AC-3 | 2.0 | Director Commentary"
+eq "std: comment flag -> Commentary"     "$(audio_std_title eng ac3 - 2 stereo '' 1 0 0 1)" "English | AC-3 | 2.0 | Commentary"
+eq "std: visual impaired -> Descriptive" "$(audio_std_title eng ac3 - 6 '5.1(side)' '' 0 0 1 1)" "English | AC-3 | 5.1 | Descriptive Audio"
+eq "std: existing AD text not doubled"   "$(audio_std_title eng ac3 - 6 '5.1(side)' 'Audio Description' 0 0 1 1)" "English | AC-3 | 5.1 | Audio Description"
+eq "std: alternate mix kept"             "$(audio_std_title ger dts 'DTS-HD MA' 6 '5.1(side)' 'German Theatrical Mix DTS-HD MA' 0 0 0 1)" "German | DTS-HD MA | 5.1 | Theatrical Mix"
+eq "std: idempotent"                     "$(audio_std_title eng ac3 - 2 stereo 'English | AC-3 | 2.0 | Commentary' 1 0 0 1)" "English | AC-3 | 2.0 | Commentary"
+eq "std: transcode drops Atmos claim"    "$(audio_std_title eng ac3 - 6 '5.1(side)' 'English DDP 5.1 Atmos' 0 0 0 0)" "English | AC-3 | 5.1"
+eq "std: copy keeps title-only Atmos"    "$(audio_std_title eng eac3 - 6 '5.1(side)' 'English DDP 5.1 Atmos' 0 0 0 1)" "English | E-AC-3 Atmos | 5.1"
+eq "std: Atmos never on other codecs"    "$(audio_std_title eng flac - 8 7.1 'Atmos' 0 0 0 1)" "English | FLAC | 7.1"
+eq "std: unknown language / layout"      "$(audio_std_title und pcm_s16le - 6 - '' 0 0 0 1)" "PCM | 6ch"
+eq "std: unlisted language code kept"    "$(audio_std_title tlh aac LC 2 stereo '' 0 0 0 1)" "tlh | AAC | 2.0"
+eq "std: BCP-47 tag, filler dropped"     "$(audio_std_title en-US aac HE-AAC 2 stereo 'Track 2' 0 0 0 1)" "English | HE-AAC | 2.0"
+eq "std: wrong layout claim dropped"     "$(audio_std_title eng aac LC 2 stereo 'English 7.1 Surround' 0 0 0 1)" "English | AAC | 2.0"
+eq "std: height channels"                "$(audio_std_title eng truehd - 12 7.1.4 '' 0 0 0 1)" "English | TrueHD | 7.1.4"
+eq "std: speaker list"                   "$(audio_channel_notation '6 channels (FL+FR+FC+LFE+BL+BR)' 6)" "5.1"
+eq "std: layout / count mismatch"        "$(audio_channel_notation 5.1 2)" "2ch"
+
+echo
 echo "== unit: audio titles after transcoding"
 eq "TrueHD Atmos -> AAC"            "$(audio_title_rewrite "English TrueHD Atmos" aac 8)"           "English AAC"
 eq "TrueHD Atmos 7.1 -> AAC"        "$(audio_title_rewrite "English TrueHD Atmos 7.1" aac 8)"       "English AAC 7.1"
@@ -717,10 +740,13 @@ make_extras() {
     head -c 4096 /dev/urandom > "$T/font.ttf"
 }
 
-# Track titles deliberately name codecs: copied tracks must keep them,
-# transcoded tracks must not.
+# Track titles deliberately name codecs and rates: every output audio
+# track gets its standard title (audio_std_title), built from the actual
+# track; the commentary description is kept.
 A0_TITLE="English Dolby Digital 5.1 384 kbps"
 A1_TITLE="Director Commentary - AC-3"
+A0_STD="English | AC-3 | 5.1"
+A1_STD="English | AC-3 | 2.0 | Director Commentary"
 
 # mux_source VIDEO OUT
 mux_source() {
@@ -833,10 +859,10 @@ nondv_job_checks sdr
 common_checks sdr
 check "sdr: HDR type SDR"                      "report_has sdr 'HDR type: +SDR\$'"
 check "sdr: bt709 kept"                        "[[ \$(ffprobe -v error -select_streams v:0 -show_entries stream=color_space -of default=nw=1:nk=1 '$T/out/sdr.mkv') == bt709 ]]"
-check "sdr: no audio title rewrite in job"     "! grep -q -- '-metadata:s:a:[0-9] title=' '$WORK_DIR/sdr.sh'"
-eq    "sdr: copied audio 1 title unchanged"    "$(out_title sdr 0)" "$A0_TITLE"
-eq    "sdr: copied audio 2 title unchanged"    "$(out_title sdr 1)" "$A1_TITLE"
-check "sdr: track titles MATCH"                "report_has sdr 'Track titles: +MATCH'"
+check "sdr: standard audio titles in job"     "grep -q -- '-metadata:s:a:0 title=' '$WORK_DIR/sdr.sh' && grep -q -- '-metadata:s:a:1 title=' '$WORK_DIR/sdr.sh' && grep -q 'atitle=std' '$WORK_DIR/sdr.sh'"
+eq    "sdr: copied audio 1 standard title"     "$(out_title sdr 0)" "$A0_STD"
+eq    "sdr: copied audio 2 standard title"     "$(out_title sdr 1)" "$A1_STD"
+check "sdr: track titles AS PLANNED"           "report_has sdr 'Track titles: +AS PLANNED \\(2 audio title'"
 check "sdr: report: two-pass mode"             "grep -q 'Video encode mode: *two-pass bitrate (1500 kb/s)' '$T/sdr.log'"
 check "sdr: stream is x265 two-pass"           "report_has sdr 'Video stream: +AS PLANNED \\(hevc 1280x720 yuv420p10le, two-pass 1500 kb/s\\)'"
 check "verify.sh: x265 rate control read"      "[[ \"\$(x265_rate_control '$T/out/sdr.mkv' 0)\" == '2pass 1500' ]]"
@@ -890,7 +916,7 @@ else
 fi
 # tier "Test" is not a menu tier: no COMPRESSION_TIER
 check "sdrcrf: compression tier not recorded"  "report_has sdrcrf 'Compression tier: +not recorded\$'"
-eq    "sdrcrf: copied audio 1 title unchanged" "$(out_title sdrcrf 0)" "$A0_TITLE"
+eq    "sdrcrf: copied audio 1 standard title"  "$(out_title sdrcrf 0)" "$A0_STD"
 check "25 sdrcrf: estimated size reported"     "grep -q 'Estimated video size: ' '$T/sdrcrf.log'"
 check "25 sdrcrf: estimate error reported"     "grep -qE 'Estimate error: +[-+][0-9]+\\.[0-9]%' '$T/sdrcrf.log'"
 err=$(grep -oE 'Estimate error: +[-+][0-9.]+' "$T/sdrcrf.log" | grep -oE '[-+][0-9.]+$')
@@ -1486,7 +1512,9 @@ if [[ -s "$MH/compress/in/Multi.mkv" ]]; then
     check "acopy 10: TrueHD copied"                   "grep -q 'Audio track 2: *COPIED (TrueHD 5.1(side), 48000 Hz, payload MD5 MATCH)' '$AC/movie_run.log'"
     check "acopy 11: DTS copied"                      "grep -q 'Audio track 3: *COPIED (DTS 5.1(side), 48000 Hz, payload MD5 MATCH)' '$AC/movie_run.log'"
     check "acopy 8: commentary kept"                  "[[ \$(ffprobe -v error -select_streams a:3 -show_entries stream_disposition=comment -of default=nw=1:nk=1 '$mout') == 1 ]] && grep -q 'Audio track 4: *COPIED (AAC stereo' '$AC/movie_run.log'"
-    check "acopy: titles / languages kept"            "grep -q 'Languages: *MATCH' '$AC/movie_run.log' && grep -q 'Track titles: *MATCH' '$AC/movie_run.log'"
+    check "acopy: titles / languages kept"            "grep -q 'Languages: *MATCH' '$AC/movie_run.log' && grep -q 'Track titles: *AS PLANNED (4 audio title' '$AC/movie_run.log'"
+    eq    "acopy: standard titles (Atmos per title kept on the copy)" "$(ffprobe -v error -select_streams a -show_entries stream_tags=title -of csv=p=0 "$mout" | tr -d '\r' | tr '\n' '/')" \
+          "English | E-AC-3 Atmos | 5.1/English | TrueHD | 5.1/German | DTS | 5.1/English | AAC | 2.0 | Director Commentary/"
     check "acopy: job succeeded"                      "grep -q 'All encodes finished: 1 ok, 0 failed' '$AC/movie_run.log'"
     check "acopy: no blanket -c copy, one codec option per stream" \
         "! grep -q -- ' -c copy ' '$AC/movie_Quality_job.sh' && grep -q -- '-c:a copy' '$AC/movie_Quality_job.sh' && ! grep -q 'Multiple -codec' '$AC/movie_run.log'"
@@ -1586,11 +1614,11 @@ check "hdr10: colour MATCH"                    "report_has hdr10 'Colour signall
 check "hdr10: chroma location MATCH"           "report_has hdr10 'Chroma location: +MATCH \\(topleft\\)'"
 check "hdr10: mastering VERIFIED"              "report_has hdr10 'HDR10 mastering: +VERIFIED'"
 check "hdr10: MaxCLL VERIFIED"                 "report_has hdr10 'MaxCLL/MaxFALL: +VERIFIED'"
-eq    "hdr10: audio 1 title unchanged"         "$(out_title hdr10 0)" "$A0_TITLE"
-eq    "hdr10: audio 2 title unchanged"         "$(out_title hdr10 1)" "$A1_TITLE"
+eq    "hdr10: audio 1 standard title"          "$(out_title hdr10 0)" "$A0_STD"
+eq    "hdr10: audio 2 standard title"          "$(out_title hdr10 1)" "$A1_STD"
 eq    "hdr10: audio codecs unchanged"          "$(ffprobe -v error -select_streams a -show_entries stream=codec_name,channels,sample_rate -of csv=p=0 "$T/out/hdr10.mkv" | tr '\n' ' ')" \
     "$(ffprobe -v error -select_streams a -show_entries stream=codec_name,channels,sample_rate -of csv=p=0 "$T/in/HDR10.mkv" | tr '\n' ' ')"
-check "hdr10: track titles MATCH"              "report_has hdr10 'Track titles: +MATCH'"
+check "hdr10: track titles AS PLANNED"         "report_has hdr10 'Track titles: +AS PLANNED'"
 
 echo
 echo "== HDR10, x265 CRF (audio copied)"
@@ -1783,7 +1811,7 @@ if (( DOVI_TOOL_OK == 1 )) && [[ -n "$MKVMERGE" ]]; then
     check "dv: RPU VERIFIED"                   "report_has dv 'Dolby Vision RPU: +VERIFIED'"
     check "dv: HDR10 fallback VERIFIED"        "report_has dv 'HDR10 fallback: +VERIFIED'"
     check "dv: mastering VERIFIED"             "report_has dv 'HDR10 mastering: +VERIFIED'"
-    eq    "dv: audio copied, title kept (DV path)" "$(out_title dv 0)" "$A0_TITLE"
+    eq    "dv: audio copied, standard title (DV path)" "$(out_title dv 0)" "$A0_STD"
     check "dv: audio payload MATCH (DV path)"  "report_has dv 'Audio track 1: +COPIED .*payload MD5 MATCH'"
 
     ffmpeg -v error -i "$T/out/dv.mkv" -map 0:v:0 -c copy -f hevc - |

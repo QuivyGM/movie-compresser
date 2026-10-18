@@ -142,6 +142,22 @@ display_encoder() {
     esac
 }
 
+# title_overrides  ->  audio_std_title_plan OVERRIDES: the planned output
+# properties of every track selected for encoding
+title_overrides() {
+    local i
+    for ((i=0; i<AUDIO_COUNT; i++)); do
+        [[ "${ACTION[$i]:-}" == "encode" ]] || continue
+        printf '%s\t%s\t-\t%s\t%s\n' "$i" "$(encoder_codec "${TARGET_CODEC[$i]}")" \
+            "${TARGET_CH[$i]}" "${TARGET_LAYOUT[$i]}"
+    done
+}
+
+# planned_title SOURCE_AUDIO_INDEX  ->  standard title of that output track
+planned_title() {
+    audio_std_title_plan "$IN" "$(title_overrides)" | awk -F'\t' -v i="$1" '$1 == i { print $3 }'
+}
+
 # ============================================================
 # MOVIE SELECTION
 # ============================================================
@@ -672,13 +688,14 @@ while true; do
                 ;;
         esac
 
-        if [[ -n "${TITLE[$idx]}" ]]; then
-            new_title=$(audio_title_rewrite "${TITLE[$idx]}" \
-                "$(encoder_codec "${TARGET_CODEC[$idx]}")" "${CHANNELS[$idx]}")
-            if [[ "$new_title" != "${TITLE[$idx]}" ]]; then
-                echo "  Title: \"${TITLE[$idx]}\" -> \"$new_title\" (codec/object-audio claims no longer true)"
-            fi
-        fi
+    fi
+
+    # the standard title of the output track (encode_common.sh)
+    new_title=$(planned_title "$idx")
+    if [[ "$new_title" != "${TITLE[$idx]}" ]]; then
+        echo "  Title: \"${TITLE[$idx]:-none}\" -> \"$new_title\""
+    else
+        echo "  Title: \"$new_title\" (already standard)"
     fi
 
     echo
@@ -790,14 +807,13 @@ fi
 # video, every audio track (copy or its encoder), MAP_CODEC_ARGS for the
 # rest. A transcoded track gets its bitrate and, when its layout needs
 # the surround relabel, its channelmap (-filter:a:N) on the same index.
-# Stale statistics of the re-encoded tracks (refreshed after the mux)
-# and their titles (codec / object-audio claims that are no longer true).
-# AUDIO_SPEC: "-c:a:<source index> encoder" for audio_title_args;
-# ATRANS / APLAN: source indexes (item_verify_output).
+# Stale statistics of the re-encoded tracks (refreshed after the mux).
+# Every audio track gets its standard title (TITLE_ARGS; transcoded
+# tracks named after their planned output). ATRANS / APLAN: source
+# indexes (item_verify_output).
 CODEC_ARGS=()
 [[ -n "$VIDX" ]] && CODEC_ARGS+=(-c:v:0 copy)
 STALE_ARGS=""
-AUDIO_SPEC=""
 ATRANS=""
 APLAN=""
 for ((i=0; i<AUDIO_COUNT; i++)); do
@@ -806,14 +822,13 @@ for ((i=0; i<AUDIO_COUNT; i++)); do
         CODEC_ARGS+=("-c:a:$o" "${TARGET_CODEC[$i]}" "-b:a:$o" "${TARGET_KBPS[$i]}k")
         [[ "${TARGET_FILTER[$i]}" != "-" ]] && CODEC_ARGS+=("-filter:a:$o" "${TARGET_FILTER[$i]}")
         STALE_ARGS+=$(stale_stats_args "a:$o")
-        AUDIO_SPEC+="-c:a:$i ${TARGET_CODEC[$i]} "
         ATRANS+="${ATRANS:+,}$i"
         APLAN+="${APLAN:+,}$i:$(encoder_codec "${TARGET_CODEC[$i]}"):${TARGET_CH[$i]}:${TARGET_LAYOUT[$i]}:${TARGET_SR[$i]}:${TARGET_KBPS[$i]}"
     else
         CODEC_ARGS+=("-c:a:$o" copy)
     fi
 done
-TITLE_ARGS=$(audio_title_args "$IN" "$AUDIO_SPEC")
+TITLE_ARGS=$(audio_std_title_args "$IN" "$(title_overrides)")
 
 # ============================================================
 # GENERATE JOB
@@ -824,8 +839,9 @@ TITLE_ARGS=$(audio_title_args "$IN" "$AUDIO_SPEC")
 
     printf 'if item_begin 1 %q %q %q 0 "" &&\n' "$IN" "$OUT" "Audio ${JOB_TIER}"
     # atrans / aplan: what is transcoded and its planned result; ahash=1:
-    # the copied tracks are payload-hashed; amap: source -> output index
-    printf '   item_expect vidx=%q video=copy atrans=%q aplan=%q ahash=1 amap=%q &&\n' \
+    # the copied tracks are payload-hashed; amap: source -> output index;
+    # atitle=std: every audio track has its standard title
+    printf '   item_expect vidx=%q video=copy atrans=%q aplan=%q ahash=1 amap=%q atitle=std &&\n' \
         "$VIDX" "$ATRANS" "$APLAN" "$MAP_AMAP"
     printf '   item_run mux ffmpeg -y -i %q \\\n' "$IN"
     printf '      %s\\\n' "$STREAM_MAP_ARGS"

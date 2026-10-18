@@ -529,7 +529,9 @@ if (( HAVE_FFMPEG == 1 && HAVE_MKV == 1 )); then
     # unrelated metadata, compared before / after (compression tags excluded)
     meta() {
         local f="$BO/$1 HEVC High.mkv"
-        ffprobe -v error -show_entries format_tags:stream_tags -of default=nw=1 "$f" | tr -d '\r' |
+        # track titles excluded: Validate + update corrects them (checked below)
+        { ffprobe -v error -show_entries format_tags -of default=nw=1 "$f"
+          ffprobe -v error -show_entries stream_tags -of default=nw=1 "$f" | grep -v '^TAG:title='; } | tr -d '\r' |
             grep -vE '^TAG:(COMPRESSION_|BPS|DURATION|NUMBER_OF|_STATISTICS)'
         # the full tag structure, without the statistics Validate + update
         # always refreshes (their values include the writing date)
@@ -551,6 +553,10 @@ if (( HAVE_FFMPEG == 1 && HAVE_MKV == 1 )); then
     check "Verify: missing tags reported, not failed" "rows bv Missing | grep -qE '^  Compression CRF +not recorded\$'"
     check "Verify: stale value reported as stored" "rows bv Stale | grep -qE '^  Compression CRF +30\$'"
     check "Verify: no backfill"                  "! grep -q 'Compression tags' '$T/bv.log'"
+    check "Verify: missing audio title reported" "grep -q 'no title - MISSING' '$T/bv.log' && grep -q 'Titles to correct: 4' '$T/bv.log'"
+    atitles() { local n; for n in Missing Stale NoRecord Kept; do printf '%s ' "$(ffprobe -v error -select_streams a:0 -show_entries stream_tags=title -of default=nw=1:nk=1 "$BO/$n HEVC High.mkv" | tr -d '\r')"; done; }
+    pay() { local n; for n in Missing Stale NoRecord Kept; do ffmpeg -v error -i "$BO/$n HEVC High.mkv" -map 0 -c copy -f streamhash -hash md5 - 2>/dev/null; done; }
+    P0=$(pay)
 
     printf '2\n2\n' | HOME="$BH" bash "$BH/compress/verify.sh" > "$T/bu1.log" 2>&1
     eq    "Validate + update: backfilled / corrected / not guessed / kept" "$(crfs)" \
@@ -561,12 +567,15 @@ if (( HAVE_FFMPEG == 1 && HAVE_MKV == 1 )); then
     check "Validate + update: existing tags without a record left unchanged" "rows bu1 Kept | grep -q 'not recovered (no job record of this encode); existing tags left unchanged'"
     check "Validate + update: summary"           "grep -q 'CRF tags written:  2' '$T/bu1.log' && grep -q 'CRF not recovered: 2' '$T/bu1.log'"
     eq    "Validate + update: unrelated metadata unchanged" "$(for n in Missing Stale NoRecord Kept; do meta "$n"; done)" "$M0"
+    eq    "Validate + update: standard audio titles" "$(atitles)" "German | AC-3 | 1.0 German | AC-3 | 1.0 German | AC-3 | 1.0 German | AC-3 | 1.0 "
+    eq    "Validate + update: stream data unchanged" "$(pay)" "$P0"
 
     printf '2\n2\n' | HOME="$BH" bash "$BH/compress/verify.sh" > "$T/bu2.log" 2>&1
     eq    "repeat: same values"                  "$(crfs)" "Missing=21/High Stale=20/High NoRecord=-/- Kept=18/High "
     eq    "repeat: one COMPRESSION_CRF per file" "$(ncrf)" "1 1 0 1 "
     check "repeat: reported UNCHANGED, nothing written" "rows bu2 Missing | grep -q 'UNCHANGED (CRF 21, High' && rows bu2 Stale | grep -q 'UNCHANGED (CRF 20, High' && ! grep -q 'CRF tags written:  [1-9]' '$T/bu2.log'"
     eq    "repeat: unrelated metadata unchanged" "$(for n in Missing Stale NoRecord Kept; do meta "$n"; done)" "$M0"
+    check "repeat: titles already correct, none rewritten" "grep -q 'Titles correct:    4' '$T/bu2.log' && grep -q 'Titles updated:    0' '$T/bu2.log'"
     S2=$(sums)
     printf '2\n1\n' | HOME="$BH" bash "$BH/compress/verify.sh" > "$T/bv2.log" 2>&1
     eq    "Verify after update: no file modified" "$(sums)" "$S2"

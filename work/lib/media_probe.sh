@@ -465,11 +465,21 @@ stream_meta() {
         -of flat=s=_ \
         "$1" 2>/dev/null |
     awk '
-        function unq(s) {
-            sub(/^"/, "", s); sub(/"$/, "", s)
-            gsub(/\\"/, "\"", s); gsub(/\\\\/, "\\", s)
-            gsub(/[\t\r\n]/, " ", s)
-            return s
+        # one pass over the flat writer escapes (\\ \" \` \$ \n \r);
+        # tabs / line breaks become spaces
+        function unq(s,    o, i, c, n) {
+            sub(/\r$/, "", s); sub(/^"/, "", s); sub(/"$/, "", s)
+            o = ""; n = length(s)
+            for (i = 1; i <= n; i++) {
+                c = substr(s, i, 1)
+                if (c == "\\" && i < n) {
+                    c = substr(s, ++i, 1)
+                    if (c == "n" || c == "r") c = " "
+                }
+                o = o c
+            }
+            gsub(/[\t\r\n]/, " ", o)
+            return o
         }
         function g(n, k) { return ((n SUBSEP k) in f && f[n, k] != "") ? f[n, k] : "-" }
         {
@@ -502,11 +512,20 @@ stream_meta() {
 chapter_meta() {
     ffprobe -v error -show_chapters -of flat=s=_ "$1" 2>/dev/null |
     awk '
-        function unq(s) {
-            sub(/^"/, "", s); sub(/"$/, "", s)
-            gsub(/\\"/, "\"", s); gsub(/\\\\/, "\\", s)
-            gsub(/[\t\r\n]/, " ", s)
-            return s
+        # one pass over the flat writer escapes (see stream_meta)
+        function unq(s,    o, i, c, n) {
+            sub(/\r$/, "", s); sub(/^"/, "", s); sub(/"$/, "", s)
+            o = ""; n = length(s)
+            for (i = 1; i <= n; i++) {
+                c = substr(s, i, 1)
+                if (c == "\\" && i < n) {
+                    c = substr(s, ++i, 1)
+                    if (c == "n" || c == "r") c = " "
+                }
+                o = o c
+            }
+            gsub(/[\t\r\n]/, " ", o)
+            return o
         }
         match($0, /^chapters_chapter_[0-9]+_/) {
             n = substr($0, 1, RLENGTH); gsub(/[^0-9]/, "", n)
