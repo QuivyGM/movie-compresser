@@ -101,12 +101,15 @@ quality_class() {
     esac
 }
 
+# High keeps the codec family of the source where possible; AC-3 for
+# Opus sources and for more than 6 channels (AC-3 stores at most 5.1, so
+# such a track is copied: audio_encode_plan)
 high_encoder() {
     local codec="$1"
     local channels="$2"
 
     if (( channels > 6 )); then
-        echo "libopus"
+        echo "ac3"
         return
     fi
 
@@ -114,14 +117,11 @@ high_encoder() {
         eac3)
             echo "eac3"
             ;;
-        ac3)
+        ac3|opus)
             echo "ac3"
             ;;
         aac)
             echo "aac"
-            ;;
-        opus)
-            echo "libopus"
             ;;
         mp3)
             echo "libmp3lame"
@@ -134,7 +134,6 @@ high_encoder() {
 
 display_encoder() {
     case "$1" in
-        libopus)    echo "Opus" ;;
         libmp3lame) echo "MP3" ;;
         eac3)       echo "E-AC3" ;;
         ac3)        echo "AC3" ;;
@@ -441,9 +440,13 @@ while true; do
     H_KBPS=$(high_target "${CHANNELS[$idx]}")
     H_CODEC=$(high_encoder "${CODEC[$idx]}" "${CHANNELS[$idx]}")
 
-    # AC-3 format limit (not a policy value)
-    if [[ "$H_CODEC" == "ac3" ]] && (( H_KBPS > 640 )); then
-        H_KBPS=640
+    # AC-3 format limits (not policy values): the AC-3 bit rate at or
+    # below the target (at most 640; FFmpeg would round any other rate
+    # to the nearest one, possibly above the target)
+    H_REQ_KBPS="$H_KBPS" H_RATE_ERR=""
+    if [[ "$H_CODEC" == "ac3" ]]; then
+        H_KBPS=$(ac3_kbps "$H_REQ_KBPS") ||
+            H_KBPS="$H_REQ_KBPS" H_RATE_ERR="no AC-3 bit rate at or below $H_REQ_KBPS kb/s (AC-3 minimum: 32 kb/s)"
     fi
 
     H_SIZE=$(size_from_kbps "$H_KBPS" "$DURATION")
@@ -465,8 +468,13 @@ while true; do
         }'
     )
 
-    C_CODEC="libopus"
-    C_CODEC_NAME="Opus"
+    # the AC-3 bit rate at or below the target, so the result stays
+    # within the limit
+    C_CODEC="ac3"
+    C_CODEC_NAME=$(display_encoder "$C_CODEC")
+    C_REQ_KBPS="$C_KBPS" C_RATE_ERR=""
+    C_KBPS=$(ac3_kbps "$C_REQ_KBPS") ||
+        C_KBPS="$C_REQ_KBPS" C_RATE_ERR="the size limit needs $C_REQ_KBPS kb/s, below the AC-3 minimum of 32 kb/s"
     C_SIZE=$(size_from_kbps "$C_KBPS" "$DURATION")
 
     # ========================================================
@@ -494,7 +502,9 @@ while true; do
     H_STATUS="copy" H_FILTER="-" H_OLAYOUT="-" H_OCH="-" H_OSR="-" H_NOTE=""
     C_STATUS="copy" C_FILTER="-" C_OLAYOUT="-" C_OCH="-" C_OSR="-" C_NOTE=""
 
-    if (( HIGH_DOES_COMPRESS == 1 )); then
+    if (( HIGH_DOES_COMPRESS == 1 )) && [[ -n "$H_RATE_ERR" ]]; then
+        H_NOTE="$H_RATE_ERR"
+    elif (( HIGH_DOES_COMPRESS == 1 )); then
         if ! IFS=$'\t' read -r H_STATUS H_FILTER H_OLAYOUT H_OCH H_OSR H_NOTE < <(
                 audio_encode_plan "$H_CODEC" "$H_KBPS" "${LAYOUT_RAW[$idx]}" \
                     "${CHANNELS[$idx]}" "${SAMPLE_RATE[$idx]}"); then
@@ -502,7 +512,9 @@ while true; do
         fi
     fi
 
-    if (( COMPACT_DOES_COMPRESS == 1 )); then
+    if (( COMPACT_DOES_COMPRESS == 1 )) && [[ -n "$C_RATE_ERR" ]]; then
+        C_NOTE="$C_RATE_ERR"
+    elif (( COMPACT_DOES_COMPRESS == 1 )); then
         if ! IFS=$'\t' read -r C_STATUS C_FILTER C_OLAYOUT C_OCH C_OSR C_NOTE < <(
                 audio_encode_plan "$C_CODEC" "$C_KBPS" "${LAYOUT_RAW[$idx]}" \
                     "${CHANNELS[$idx]}" "${SAMPLE_RATE[$idx]}"); then
@@ -526,9 +538,10 @@ while true; do
 
     if (( HIGH_DOES_COMPRESS == 1 )) && [[ "$H_STATUS" == ok ]]; then
         echo "   $H_CODEC_NAME | ${H_KBPS} kb/s -> ~${H_SIZE} GiB"
+        (( H_KBPS != H_REQ_KBPS )) && echo "   Rate: ${H_REQ_KBPS} kb/s target -> ${H_KBPS} kb/s ($H_CODEC_NAME bit rate at or below it)"
         echo "   Layout: $H_NOTE"
     elif (( HIGH_DOES_COMPRESS == 1 )); then
-        echo "   $H_CODEC_NAME not possible without changing channels; copy unchanged"
+        echo "   $H_CODEC_NAME not possible ${H_RATE_ERR:+at this bit rate}${H_RATE_ERR:-without changing channels}; copy unchanged"
         echo "   Reason: $H_NOTE"
         echo "   ${TRACK_KBPS[$idx]} kb/s -> ${TRACK_GIB[$idx]} GiB"
     else
@@ -542,9 +555,10 @@ while true; do
     if (( COMPACT_DOES_COMPRESS == 1 )) && [[ "$C_STATUS" == ok ]]; then
         echo "   $C_CODEC_NAME | ${C_KBPS} kb/s -> ~${C_SIZE} GiB"
         echo "   Target: < ${AUDIO_COMPACT_LIMIT_GIB} GiB"
+        (( C_KBPS != C_REQ_KBPS )) && echo "   Rate: ${C_REQ_KBPS} kb/s target -> ${C_KBPS} kb/s ($C_CODEC_NAME bit rate at or below it)"
         echo "   Layout: $C_NOTE"
     elif (( COMPACT_DOES_COMPRESS == 1 )); then
-        echo "   $C_CODEC_NAME not possible without changing channels; copy unchanged"
+        echo "   $C_CODEC_NAME not possible ${C_RATE_ERR:+within the size limit}${C_RATE_ERR:-without changing channels}; copy unchanged"
         echo "   Reason: $C_NOTE"
         echo "   ${TRACK_KBPS[$idx]} kb/s -> ${TRACK_GIB[$idx]} GiB"
     else
@@ -790,13 +804,11 @@ for ((i=0; i<AUDIO_COUNT; i++)); do
     o="${MAP_AUDIO_OUT[$i]}"
     if [[ "${ACTION[$i]:-}" == "encode" ]]; then
         CODEC_ARGS+=("-c:a:$o" "${TARGET_CODEC[$i]}" "-b:a:$o" "${TARGET_KBPS[$i]}k")
-        mapfile -t ENC_OPTS < <(audio_encoder_opts "${TARGET_CODEC[$i]}" "${TARGET_CH[$i]}" "$o")
-        CODEC_ARGS+=("${ENC_OPTS[@]+"${ENC_OPTS[@]}"}")
         [[ "${TARGET_FILTER[$i]}" != "-" ]] && CODEC_ARGS+=("-filter:a:$o" "${TARGET_FILTER[$i]}")
         STALE_ARGS+=$(stale_stats_args "a:$o")
         AUDIO_SPEC+="-c:a:$i ${TARGET_CODEC[$i]} "
         ATRANS+="${ATRANS:+,}$i"
-        APLAN+="${APLAN:+,}$i:$(encoder_codec "${TARGET_CODEC[$i]}"):${TARGET_CH[$i]}:${TARGET_LAYOUT[$i]}:${TARGET_SR[$i]}"
+        APLAN+="${APLAN:+,}$i:$(encoder_codec "${TARGET_CODEC[$i]}"):${TARGET_CH[$i]}:${TARGET_LAYOUT[$i]}:${TARGET_SR[$i]}:${TARGET_KBPS[$i]}"
     else
         CODEC_ARGS+=("-c:a:$o" copy)
     fi

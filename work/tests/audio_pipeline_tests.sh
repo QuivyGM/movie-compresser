@@ -7,24 +7,27 @@
 # Needs ffmpeg / ffprobe (with the experimental DTS encoder for the
 # fixtures). Short synthetic files only.
 #
-#  1. planner: every standard layout for Opus (incl. 5.1(side) -> 5.1,
-#     5.0(side) -> 5.0, quad(side) -> quad, 6.1(back) -> 6.1 by explicit
-#     channelmap; 2.1 / 4.0 / 6.0 / 7.0 / 7.1(wide) / >8 channels / no
-#     speaker order copied with a reason), E-AC-3 (6.0 / hexagonal would
-#     lose a channel: copied) and AAC; never aformat / pan / -ac
+#  1. planner: every standard layout for AC-3 (mono ... 5.1, back
+#     surrounds stored as AC-3's side pair; 6.0 / hexagonal / 6.1 / 7.x /
+#     >8 channels / no speaker order copied with a reason, never
+#     downmixed), AC-3 bit rate steps (rounded down, never up; a rate
+#     FFmpeg would round is refused), AC-3 sample rates, E-AC-3 and AAC;
+#     never aformat / pan / -ac; per-channel tone identity through AC-3
 #  2. build_stream_map: explicit source -> output audio index, one codec
 #     option per stream, main video not the first stream, no video
-#  3. The Raid 2 case: DTS 5.1(side) Compact -> Opus 5.1; per-channel
-#     tone identity; copied tracks payload-identical; language / title /
-#     default / forced / commentary kept; no "Multiple -codec" warning
-#  4. mixed copied / transcoded tracks, video not first: unsupported
-#     layouts copied with the reason shown, 44.1 kHz -> Opus 48 kHz
-#     without a warning, every option on the right output track
-#  5. nothing to transcode -> nothing started
-#  6. verification: channel count / codec / planned layout / copied
-#     payload mismatch fail
-#  7. job level: the old libopus failure leaves no output; a downmixed
-#     track fails the verification and is never finalized
+#  3. The Raid 2 case: DTS 5.1(side) Compact -> AC-3 5.1(side); per-
+#     channel tone identity; copied tracks payload-identical; language /
+#     title / default / forced / commentary kept; no "Multiple -codec"
+#  4. eight tracks, different codecs and layouts, video not first:
+#     AC-3 2.1 / 5.0(side) / layout-less PCM stereo 44.1 kHz / FLAC
+#     5.1(back) 96 kHz / PCM mono transcoded, Opus stereo High -> AC-3,
+#     6.0 and 7.1 copied with the reason shown; tone identity; exactly
+#     one codec configuration per output stream; bit rate as planned
+#  5. nothing to transcode (7.1(wide), 8ch PCM) -> nothing started
+#  6. verification: channel count / codec / planned layout / bit rate /
+#     copied payload mismatch fail; jobs without a planned bit rate
+#  7. job level: an AC-3 encoder failure leaves no output; a downmixed
+#     or wrong-rate track fails the verification and is never finalized
 set -uo pipefail
 
 SRC_WORK="$(cd "$(dirname "$0")/.." && pwd)"
@@ -38,6 +41,7 @@ ok()    { echo "  ok    $1"; ((PASS += 1)); }
 bad()   { echo "  FAIL  $1"; ((FAIL += 1)); }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 eq()    { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1  (got \"$2\", want \"$3\")"; fi; }
+has()   { grep -qF -- "$2" "$1"; }      # FILE TEXT: literal match
 
 for t in ffmpeg ffprobe; do
     command -v "$t" >/dev/null || { echo "$t not found: skipped"; exit 0; }
@@ -94,24 +98,30 @@ echo "== 1 layout planning (audio_plan.sh)"
 plan() { audio_encode_plan "$1" "${4:-$((64 * $3))}" "$2" "$3" "${5:-48000}"; }
 pl()   { cut -f"$1" <<< "$2"; }
 
-declare -A OPUS=(
+# AC-3 takes every layout up to 5.1 as it is (no channelmap); FFmpeg's
+# decoder names the surround pair SL/SR. Anything else would be
+# downmixed by FFmpeg: copied.
+declare -A AC3=(
     [mono]="ok|-|mono"                [stereo]="ok|-|stereo"
-    [2.1]="copy"                      [3.0]="ok|-|3.0"
-    [4.0]="copy"                      [quad]="ok|-|quad"
-    [quad(side)]="ok|map|quad"        [5.0]="ok|-|5.0"
-    [5.0(side)]="ok|map|5.0"          [5.1]="ok|-|5.1"
-    [5.1(side)]="ok|map|5.1"          [6.0]="copy"
-    [hexagonal]="copy"                [6.1]="ok|-|6.1"
-    [6.1(back)]="ok|map|6.1"          [7.0]="copy"
-    [7.1]="ok|-|7.1"                  [7.1(wide)]="copy"
+    [2.1]="ok|-|2.1"                  [3.0]="ok|-|3.0"
+    [3.0(back)]="ok|-|3.0(back)"      [4.0]="ok|-|4.0"
+    [quad]="ok|-|quad(side)"          [quad(side)]="ok|-|quad(side)"
+    [3.1]="ok|-|3.1"                  [4.1]="ok|-|4.1"
+    [5.0]="ok|-|5.0(side)"            [5.0(side)]="ok|-|5.0(side)"
+    [5.1]="ok|-|5.1(side)"            [5.1(side)]="ok|-|5.1(side)"
+    [6.0]="copy"                      [6.0(front)]="copy"
+    [hexagonal]="copy"                [6.1]="copy"
+    [6.1(back)]="copy"                [6.1(front)]="copy"
+    [7.0]="copy"                      [7.0(front)]="copy"
+    [7.1]="copy"                      [7.1(wide)]="copy"
     [7.1(wide-side)]="copy"           [octagonal]="copy"
     [5.1.2]="copy"                    [7.1.4]="copy"
 )
-for l in "${!OPUS[@]}"; do
+for l in "${!AC3[@]}"; do
     n=$(ap_layout_channels "$l" "")
     n=$(awk -F+ '{ print NF }' <<< "$n")
-    p=$(plan libopus "$l" "$n")
-    want="${OPUS[$l]}"
+    p=$(plan ac3 "$l" "$n")
+    want="${AC3[$l]}"
     got="$(pl 1 "$p")"
     if [[ "$want" != copy ]]; then
         f=$(pl 2 "$p"); [[ "$f" == channelmap=* ]] && f=map
@@ -120,29 +130,42 @@ for l in "${!OPUS[@]}"; do
     else
         [[ -n "$(pl 6 "$p")" ]] || got+=" (no reason)"
     fi
-    eq "opus $l -> $want" "$got" "$want"
+    eq "ac3 $l -> $want" "$got" "$want"
 done
 
-p=$(plan libopus "5.1(side)" 6)
-eq    "opus 5.1(side): explicit channelmap, SL->BL SR->BR" "$(pl 2 "$p")" "channelmap=map=FL-FL|FR-FR|FC-FC|LFE-LFE|SL-BL|SR-BR:channel_layout=5.1"
-check "opus 5.1(side): note says relabel, no remix"       "[[ '$(pl 6 "$p")' == *'SL->BL, SR->BR; same channels, no remix'* ]]"
-eq    "opus 6.1(back): BL->SL BR->SR, BC kept"            "$(pl 2 "$(plan libopus "6.1(back)" 7)")" "channelmap=map=FL-FL|FR-FR|FC-FC|LFE-LFE|BC-BC|BL-SL|BR-SR:channel_layout=6.1"
-p=$(plan libopus 2.1 3)
-check "opus 2.1: copy, reason names the Opus layouts"    "[[ '$(pl 1 "$p")' == copy && '$(pl 6 "$p")' == *'Opus has no 3-channel layout'* ]]"
-check "opus 7.1.4: at most 8 channels"                   "[[ '$(pl 6 "$(plan libopus 7.1.4 12)")' == *'at most 8 positioned channels'* ]]"
-p=$(plan libopus "6 channels (FL+FR+FC+LFE+SL+SR)" 6)
-eq    "opus custom-order 6ch named channels -> 5.1"       "$(pl 1 "$p")|$(pl 3 "$p")" "ok|5.1"
-p=$(plan libopus "6 channels" 6)
-check "opus 6ch without speaker order: copy"             "[[ '$(pl 1 "$p")' == copy && '$(pl 6 "$p")' == *'no known speaker order'* ]]"
-p=$(plan libopus - 2)
-eq    "opus 2ch without layout: stereo, index-mapped"     "$(pl 1 "$p")|$(pl 2 "$p")|$(pl 3 "$p")" "ok|channelmap=map=0-FL|1-FR:channel_layout=stereo|stereo"
-p=$(plan libopus mono 1 640)
-check "opus bit rate out of range: copy, encoder error shown" "[[ '$(pl 1 "$p")' == copy && '$(pl 6 "$p")' == *'bit rate'* ]]"
-p=$(plan libopus stereo 2 192 44100)
-check "opus 44.1 kHz: planned 48000 Hz, noted"           "[[ '$(pl 5 "$p")' == 48000 && '$(pl 6 "$p")' == *'44100 Hz -> 48000 Hz'* ]]"
+p=$(plan ac3 5.1 6)
+check "ac3 5.1(back): note says same channels (AC-3 naming)" "[[ '$(pl 6 "$p")' == '5.1 -> 5.1(side): same channels (AC-3 surround naming)' ]]"
+eq    "ac3 5.1(side): kept, no filter"                       "$(pl 2 "$(plan ac3 "5.1(side)" 6)")|$(pl 6 "$(plan ac3 "5.1(side)" 6)")" "-|5.1(side) kept"
+check "ac3 7.1: copied, at most 6 channels, never downmixed" "[[ '$(pl 6 "$(plan ac3 7.1 8)")' == '7.1: AC-3 stores at most 6 channels (5.1); the 8 channels are copied, never downmixed' ]]"
+check "ac3 6.1(back): at most 6 channels"                    "[[ '$(pl 6 "$(plan ac3 "6.1(back)" 7)")' == *'at most 6 channels'* ]]"
+check "ac3 7.1.4: at most 6 channels"                        "[[ '$(pl 6 "$(plan ac3 7.1.4 12)")' == *'at most 6 channels'* ]]"
+check "ac3 6.0: reason says 6 -> 5 channels"                 "[[ '$(pl 6 "$(plan ac3 6.0 6)")' == *'AC-3 would turn it into 5.0(side) (6 -> 5 channels)'* ]]"
+p=$(plan ac3 "6 channels (FL+FR+FC+LFE+SL+SR)" 6)
+eq    "ac3 custom-order 6ch named channels -> 5.1(side)"     "$(pl 1 "$p")|$(pl 3 "$p")" "ok|5.1(side)"
+p=$(plan ac3 "6 channels" 6)
+check "ac3 6ch without speaker order: copy"                  "[[ '$(pl 1 "$p")' == copy && '$(pl 6 "$p")' == *'no known speaker order'* ]]"
+p=$(plan ac3 - 2)
+eq    "ac3 2ch without layout: stereo, index-mapped"         "$(pl 1 "$p")|$(pl 2 "$p")|$(pl 3 "$p")" "ok|channelmap=map=0-FL|1-FR:channel_layout=stereo|stereo"
+p=$(plan ac3 - 1)
+eq    "ac3 1ch without layout: mono, index-mapped"           "$(pl 1 "$p")|$(pl 2 "$p")|$(pl 3 "$p")" "ok|channelmap=map=0-FC:channel_layout=mono|mono"
+p=$(plan ac3 "5.1(side)" 6 32)
+check "ac3 5.1 at 32 kb/s: copy, encoder error shown"        "[[ '$(pl 1 "$p")' == copy && '$(pl 6 "$p")' == *'Bit allocation failed'* ]]"
+p=$(plan ac3 "5.1(side)" 6 630)
+check "ac3 630 kb/s (FFmpeg would use 640): copy, reason"    "[[ '$(pl 1 "$p")' == copy && '$(pl 6 "$p")' == *'AC-3 would encode at 640 kb/s instead of 630 kb/s'* ]]"
+p=$(plan ac3 stereo 2 192 44100)
+eq    "ac3 44.1 kHz: kept, no rate note"                     "$(pl 5 "$p")|$(pl 6 "$p")" "44100|stereo kept"
+p=$(plan ac3 "5.1(side)" 6 448 96000)
+check "ac3 96 kHz: planned 48000 Hz, noted"                  "[[ '$(pl 5 "$p")' == 48000 && '$(pl 6 "$p")' == *'96000 Hz -> 48000 Hz (AC-3 rate)'* ]]"
+p=$(plan ac3 stereo 2 192 22050)
+check "ac3 22.05 kHz: planned 32000 Hz, noted"               "[[ '$(pl 5 "$p")' == 32000 && '$(pl 6 "$p")' == *'22050 Hz -> 32000 Hz (AC-3 rate)'* ]]"
+
+got=""
+for k in 0 31 32 33 96 100 300 384 600 630 640 641 1024 x; do got+="$k:$(ac3_kbps "$k") "; done
+eq    "ac3_kbps: AC-3 rate at or below the target"  "$got" "0: 31: 32:32 33:32 96:96 100:96 300:256 384:384 600:576 630:576 640:640 641:640 1024:640 x: "
+check "ac3_kbps: below the minimum fails"            "! ac3_kbps 31 > /dev/null"
 
 for c in "eac3 6.0 6 copy" "eac3 hexagonal 6 copy" "eac3 2.1 3 ok|2.1" "eac3 4.0 4 ok|4.0" \
-         "eac3 5.1 6 ok|5.1(side)" "eac3 5.1(side) 6 ok|5.1(side)" "ac3 5.0 5 ok|5.0(side)" \
+         "eac3 5.1 6 ok|5.1(side)" "eac3 5.1(side) 6 ok|5.1(side)" \
          "aac 5.1(side) 6 ok|5.1" "aac 6.0 6 copy" "aac 7.1(wide) 8 copy" "libmp3lame 5.1 6 copy"; do
     read -r e l n want <<< "$c"
     p=$(plan "$e" "$l" "$n" 384)
@@ -152,45 +175,38 @@ done
 check "eac3 6.0: reason says 6 -> 5 channels"            "[[ '$(pl 6 "$(plan eac3 6.0 6 384)")' == *'(6 -> 5 channels)'* ]]"
 check "aac 5.1(side): relabelled by channelmap"          "[[ '$(pl 2 "$(plan aac "5.1(side)" 6 384)")' == channelmap=*SL-BL* ]]"
 check "no plan uses aformat / pan / -ac / -ch_layout"    "! grep -qE 'aformat|pan=|-ac|ch_layout' <<< \"\$(declare -f audio_encode_plan _ap_trial)\""
+check "no Opus encoder left in the audio menu / planner" "! grep -q libopus '$ROOT/audio_compress_menu.sh' '$SRC_WORK/lib/audio_plan.sh'"
 
-eq    "libopus > 2 channels: mapping family 1"      "$(audio_encoder_opts libopus 6 3 | tr '\n' ' ')" "-mapping_family:a:3 1 "
-eq    "libopus stereo / E-AC-3: no extra options"   "$(audio_encoder_opts libopus 2 0; audio_encoder_opts eac3 6 0)" ""
-
-# every layout Opus can take, encoded exactly as the job does (planned
-# channelmap + encoder options), decoded and checked by tone: each
-# source channel must come out on its own (or relabelled) speaker.
-# FFmpeg's default mapping family scrambles 5.0 and 6.1.
-# Expensive (an encode + decode per layout): AUDIO_TESTS_EXHAUSTIVE=1.
-# Always covered end to end: 5.1(side) -> 5.1 (section 3) and
-# 5.0(side) -> 5.0 (section 4, the mapping-family case).
-ID_LAYOUTS=()
+# every layout AC-3 takes, encoded exactly as the job does (planned
+# filter, no other option), decoded and checked by tone: each source
+# channel must come out on its own speaker (back surrounds on AC-3's
+# surround pair). Mono / stereo / 5.1(side) / 5.1(back) always; the rest
+# with AUDIO_TESTS_EXHAUSTIVE=1. End to end: 5.1(side) (section 3),
+# 5.0(side), 5.1(back), mono, stereo, 2.1 (section 4).
+ID_LAYOUTS=(mono stereo "5.1(side)" 5.1)
 if [[ "${AUDIO_TESTS_EXHAUSTIVE:-0}" == 1 ]]; then
-    ID_LAYOUTS=(3.0 quad "quad(side)" 5.0 "5.0(side)" 5.1 "5.1(side)" 6.1 "6.1(back)" 7.1)
+    ID_LAYOUTS+=(2.1 3.0 "3.0(back)" 4.0 quad "quad(side)" 3.1 4.1 5.0 "5.0(side)")
 else
-    echo "skipped: per-layout Opus channel identity (AUDIO_TESTS_EXHAUSTIVE=1 runs it)"
+    echo "skipped: AC-3 channel identity of the other layouts (AUDIO_TESTS_EXHAUSTIVE=1 runs it)"
 fi
-for l in "${ID_LAYOUTS[@]+"${ID_LAYOUTS[@]}"}"; do
+for l in "${ID_LAYOUTS[@]}"; do
     IFS=+ read -ra sc <<< "$(ap_layout_channels "$l" "")"
-    declare -A tone=() moved=()
+    declare -A tone=()
     fs=(); k=0
     for c in "${sc[@]}"; do
         f=$((200 + k * 100)); [[ "$c" == LFE ]] && f=60
         tone[$c]=$f; fs+=("$f"); ((k += 1))
     done
-    p=$(plan libopus "$l" "${#sc[@]}")
+    p=$(plan ac3 "$l" "${#sc[@]}" 448)
     filt=$(pl 2 "$p")
-    if [[ "$filt" != "-" ]]; then
-        for m in $(tr '|' ' ' <<< "${filt#channelmap=map=}"); do m="${m%%:*}"; moved[${m#*-}]="${m%-*}"; done
-    fi
     IFS=+ read -ra oc <<< "$(ap_layout_channels "$(pl 3 "$p")" "")"
     want=""
-    for c in "${oc[@]}"; do want+="${tone[${moved[$c]:-$c}]} "; done
-    a=(-c:a libopus -b:a "$((96 * ${#sc[@]}))k")
-    mapfile -t eo < <(audio_encoder_opts libopus "${#sc[@]}" 0)
+    for c in "${oc[@]}"; do want+="${tone[$c]:-${tone[${AP_PAIR[$c]:-}]:-?}} "; done
+    a=(-c:a ac3 -b:a 448k)
     [[ "$filt" != "-" ]] && a+=(-filter:a:0 "$filt")
-    ffmpeg -v error -y -f lavfi -i "$(tones "$l" "${fs[@]}")" "${a[@]}" "${eo[@]+"${eo[@]}"}" "$T/f/id.mka" 2>/dev/null
-    eq "opus $l: channel identity through the planned command" "$(dominant_tones "$T/f/id.mka" 0 "${fs[@]}")" "$want"
-    unset tone moved
+    ffmpeg -v error -y -f lavfi -i "$(tones "$l" "${fs[@]}")" "${a[@]}" "$T/f/id.mka" 2>/dev/null
+    eq "ac3 $l: channel identity through the planned command" "$(dominant_tones "$T/f/id.mka" 0 "${fs[@]}")" "$want"
+    unset tone
 done
 
 eq    "relabel: side surrounds -> back"                  "$(ap_relabel FL+FR+FC+LFE+SL+SR FL+FR+FC+LFE+BL+BR)" "FL-FL|FR-FR|FC-FC|LFE-LFE|SL-BL|SR-BR"
@@ -218,7 +234,7 @@ ffmpeg -v error -y -f lavfi -i "testsrc2=s=160x90:r=24:d=2" -f lavfi -i "sine=f=
 build_stream_map "$T/f/h.mp4" 0
 check "MP4 handler title on the right output stream" "[[ \"\$MAP_META_ARGS\" == *'-metadata:s:2 title=Director\\ Commentary'* ]]"
 MAP_AUDIO_OUT=([0]=0 [1]=3)
-check "title args use the output audio index"     "[[ \"\$(audio_title_args '$T/f/order.mkv' '-c:a:1 libopus ')\" != *'s:a:1 '* ]]"
+check "title args use the output audio index"     "[[ \"\$(audio_title_args '$T/f/order.mkv' '-c:a:1 ac3 ')\" != *'s:a:1 '* ]]"
 MAP_AUDIO_OUT=()
 
 # ------------------------------------------------------------
@@ -247,10 +263,19 @@ amenu() {   # HOME CONF INPUT LOG
         bash "$1/compress/audio_compress_menu.sh" > "$4" 2>&1
 }
 job_of() { ls -t "$1/compress/work"/a[0-9]*.sh 2>/dev/null | head -1; }
+# one_codec_each CMD N  ->  every output audio index 0..N-1 has exactly
+# one -c:a:N, and no blanket -c / -c:a / -codec option exists
+one_codec_each() {
+    local o
+    for ((o = 0; o < $2; o++)); do
+        (( $(grep -oE -- "-c:a:$o " <<< "$1" | wc -l) == 1 )) || return 1
+    done
+    ! grep -qE -- '(^| )(-c|-c:a|-codec|-codec:a|-acodec) ' <<< "$1"
+}
 
 # ------------------------------------------------------------
 echo
-echo "== 3 The Raid 2: DTS 5.1(side) Compact -> Opus 5.1"
+echo "== 3 The Raid 2: DTS 5.1(side) Compact -> AC-3 5.1(side)"
 HA=$(new_home raid)
 RAID="$HA/compress/out/The Raid 2 (2014) HEVC Base.mkv"
 FREQS=(200 300 400 60 600 700)      # FL FR FC LFE SL SR
@@ -271,29 +296,34 @@ if [[ "$(probe_a "$RAID" 1 stream=codec_name,channel_layout)" != "dts,5.1(side)"
     bad "fixture: DTS 5.1(side) track ($(head -1 "$T/raid_mk.err"))"
 else
     eq "fixture: source DTS channels carry their own tone" "$(dominant_tones "$RAID" 1 "${FREQS[@]}")" "200 300 400 60 600 700 "
+    # Compact limit 0.0002 GiB over 4 s: ~429 kb/s -> AC-3 384 kb/s
     CONF_A=$(conf_with raid AUDIO_COMPACT_TRIGGER_GIB=0.0002 AUDIO_COMPACT_LIMIT_GIB=0.0002)
     amenu "$HA" "$CONF_A" "1\n2\n3\nn\n" "$T/raid_menu.log"
     JA=$(job_of "$HA")
     # the job removes itself after success: section 7 needs a copy
     [[ -n "$JA" ]] && cp "$JA" "$T/raid_job.sh" && JA="$T/raid_job.sh"
-    check "menu: Compact plan shows the relabel"     "grep -q 'Layout: 5.1(side) -> 5.1: surround channels relabelled (SL->BL, SR->BR; same channels, no remix)' '$T/raid_menu.log'"
-    check "menu: Opus 48 kHz, no rate change noted"  "! grep -q 'Hz -> 48000 Hz' '$T/raid_menu.log'"
+    check "menu: Compact is AC3 384 kb/s"            "grep -q '   AC3 | 384 kb/s -> ' '$T/raid_menu.log'"
+    check "menu: AC-3 rate rounded DOWN, shown"      "grep -q 'Rate: 429 kb/s target -> 384 kb/s (AC3 bit rate at or below it)' '$T/raid_menu.log'"
+    check "menu: layout kept"                        "grep -q 'Layout: 5.1(side) kept' '$T/raid_menu.log'"
+    check "menu: no rate change noted"               "! grep -q 'Hz -> ' '$T/raid_menu.log'"
+    check "menu: no Opus anywhere"                   "! grep -qi opus '$T/raid_menu.log'"
     check "job written"                              "[[ -n '$JA' ]]"
     cmd=$(grep -A6 'item_run mux' "$JA")
-    check "job: Opus on output a:1 with its channelmap" "grep -qE -- '-c:a:1 libopus -b:a:1 [0-9]+k -mapping_family:a:1 1 -filter:a:1 channelmap=map=FL-FL\\\\\\|FR-FR\\\\\\|FC-FC\\\\\\|LFE-LFE\\\\\\|SL-BL\\\\\\|SR-BR:channel_layout=5.1' <<< \"\$cmd\""
-    check "job: every stream has one codec option"   "grep -q -- '-c:v:0 copy -c:a:0 copy ' <<< \"\$cmd\" && grep -q -- '-c:a:2 copy -c:s:0 copy -c:s:1 copy' <<< \"\$cmd\" && ! grep -qE -- '-c copy|-c:a copy' <<< \"\$cmd\""
-    check "job: no aformat / -ac / -ch_layout"       "! grep -qE -- 'aformat|-ac[: ]|-ch_layout' '$JA'"
-    check "job: expected plan, hash, mapping"        "grep -q 'atrans=1 aplan=1:opus:6:5.1:48000 ahash=1 amap=0:0\\\\,1:1\\\\,2:2' '$JA'"
+    check "job: AC-3 on output a:1, no filter"       "grep -qE -- '-c:a:1 ac3 -b:a:1 384k -c:a:2 copy ' <<< \"\$cmd\" && ! grep -q -- '-filter:a' <<< \"\$cmd\""
+    check "job: every stream has one codec option"   "grep -q -- '-c:v:0 copy -c:a:0 copy ' <<< \"\$cmd\" && grep -q -- '-c:a:2 copy -c:s:0 copy -c:s:1 copy' <<< \"\$cmd\" && one_codec_each \"\$cmd\" 3"
+    check "job: no aformat / -ac / -ch_layout / -ar"  "! grep -qE -- 'aformat|-ac[: ]|-ch_layout|-ar[: ]|libopus|mapping_family' '$JA'"
+    check "job: expected plan, hash, mapping"        "has '$JA' 'atrans=1 aplan=1:ac3:6:5.1\(side\):48000:384 ahash=1 amap=0:0\,1:1\,2:2'"
 
     bash "$JA" < /dev/null > "$T/raid_run.log" 2>&1
     OA="$HA/compress/out/The Raid 2 (2014) HEVC Base AudioCompressed.mkv"
     check "job succeeded"                            "grep -q 'All encodes finished: 1 ok, 0 failed' '$T/raid_run.log'"
     check "no 'Multiple -codec' warning"             "! grep -q 'Multiple -codec' '$T/raid_run.log'"
-    eq    "output: Opus 5.1, 6 channels, 48 kHz"      "$(probe_a "$OA" 1 stream=codec_name,channels,channel_layout,sample_rate)" "opus,48000,6,5.1"
-    eq    "output: channel identity (SL->BL, SR->BR)" "$(dominant_tones "$OA" 1 "${FREQS[@]}")" "200 300 400 60 600 700 "
+    eq    "output: AC-3 5.1(side), 6 channels, 48 kHz, 384 kb/s" "$(probe_a "$OA" 1 stream=codec_name,channels,channel_layout,sample_rate,bit_rate)" "ac3,48000,6,5.1(side),384000"
+    eq    "output: channel identity"                  "$(dominant_tones "$OA" 1 "${FREQS[@]}")" "200 300 400 60 600 700 "
     eq    "output: copied tracks payload-identical"   "$(_audio_payload_md5 "$OA" | sed -n '1p;3p' | tr '\n' ' ')" "$(_audio_payload_md5 "$RAID" | sed -n '1p;3p' | tr '\n' ' ')"
     check "verify: copied tracks hash-matched"       "grep -q 'Audio track 1: *COPIED (E-AC-3 5.1(side), 48000 Hz, payload MD5 MATCH)' '$T/raid_run.log' && grep -q 'Audio track 3: *COPIED (AAC stereo, 48000 Hz, payload MD5 MATCH)' '$T/raid_run.log'"
-    check "verify: relabel reported as planned"      "grep -q 'Audio 2 layout: *5.1(side) -> 5.1 AS PLANNED (same channels' '$T/raid_run.log'"
+    check "verify: transcode reported"               "grep -q 'Audio track 2: *DTS (DTS) 5.1(side) -> AC-3 5.1(side) (transcoded)' '$T/raid_run.log'"
+    check "verify: bit rate as planned"              "grep -q 'Audio 2 bit rate: *384 kb/s AS PLANNED' '$T/raid_run.log'"
     check "verify: no audio warning or failure"     "! grep -qE '^  Audio.*(CHANGED|UNEXPECTED|NOT AS PLANNED|MISMATCH|DOES NOT MATCH)' '$T/raid_run.log' && ! grep -q 'RESULT: FAILED' '$T/raid_run.log'"
     # without mkvtoolnix the editions are reported "NOT VERIFIED" (a warning)
     (( HAVE_MKV == 1 )) && check "verify: no warnings at all" "! grep -q 'RESULT:' '$T/raid_run.log'"
@@ -302,11 +332,13 @@ else
     done
     eq    "output: languages / dispositions"          "$(ffprobe -v error -select_streams a -show_entries stream_tags=language:stream_disposition=default,forced,comment -of csv=p=0 "$OA" | tr -d '\r' | tr '\n' ' ')" \
                                                       "$(ffprobe -v error -select_streams a -show_entries stream_tags=language:stream_disposition=default,forced,comment -of csv=p=0 "$RAID" | tr -d '\r' | tr '\n' ' ')"
-    eq    "output: Opus title rewritten"              "$(probe_a "$OA" 1 stream_tags=title)" "$(audio_title_rewrite "Indonesian DTS 5.1" opus 6)"
+    eq    "output: AC-3 title rewritten"              "$(probe_a "$OA" 1 stream_tags=title)" "Indonesian AC-3 5.1"
     eq    "output: copied titles kept"                "$(probe_a "$OA" 0 stream_tags=title)|$(probe_a "$OA" 2 stream_tags=title)" "English E-AC-3 5.1|Commentary"
     eq    "output: subtitles kept"                    "$(ffprobe -v error -select_streams s -show_entries stream_tags=language:stream_disposition=default,forced -of csv=p=0 "$OA" | tr -d '\r' | tr '\n' ' ')" "1,0,eng 0,1,ind "
+    eq    "output: video stream copied"               "$(ffmpeg -v error -i "$OA" -map 0:v -c copy -f streamhash -hash md5 - 2>/dev/null | awk -F, '{ print $3 }')" \
+                                                      "$(ffmpeg -v error -i "$RAID" -map 0:v -c copy -f streamhash -hash md5 - 2>/dev/null | awk -F, '{ print $3 }')"
     if (( HAVE_MKV == 1 )); then
-        check "statistics refreshed for the Opus track" "[[ -n \"\$(probe_a '$OA' 1 stream_tags=NUMBER_OF_BYTES)\" ]] && grep -q 'MKV statistics updated' '$T/raid_run.log'"
+        check "statistics refreshed for the AC-3 track" "[[ -n \"\$(probe_a '$OA' 1 stream_tags=NUMBER_OF_BYTES)\" ]] && grep -q 'MKV statistics updated' '$T/raid_run.log'"
     else
         check "stale statistics of the DTS track removed" "[[ -z \"\$(probe_a '$OA' 1 stream_tags=BPS)\" ]]"
     fi
@@ -314,45 +346,64 @@ fi
 
 # ------------------------------------------------------------
 echo
-echo "== 4 mixed copied / transcoded tracks, video not the first stream"
+echo "== 4 eight tracks: codecs / layouts mixed, video not the first stream"
 HB=$(new_home mixed)
 MIX="$HB/compress/out/Mixed.mkv"
 ffmpeg -v error -y -f lavfi -i "$(tones 2.1 200 300 60)" -f lavfi -i "testsrc2=s=320x180:r=24:d=4" \
     -f lavfi -i "$(TONE_NOISE=1 tones 6.0 200 300 400 500 600 700)" -f lavfi -i "$(TONE_NOISE=1 tones "5.0(side)" 200 300 400 600 700)" \
     -f lavfi -i "$(TONE_RATE=44100 tones stereo 300 900)" \
-    -map 0:a -map 1:v -map 2:a -map 3:a -map 4:a \
+    -f lavfi -i "$(TONE_NOISE=1 TONE_RATE=96000 tones 5.1 200 300 400 60 600 700)" \
+    -f lavfi -i "$(TONE_NOISE=1 tones 7.1 200 300 400 60 500 600 700 800)" \
+    -f lavfi -i "$(tones mono 440)" -f lavfi -i "$(tones stereo 500 700)" \
+    -map 0:a -map 1:v -map 2:a -map 3:a -map 4:a -map 5:a -map 6:a -map 7:a -map 8:a \
     -c:v libx264 -preset ultrafast -crf 30 -c:a:0 ac3 -b:a:0 448k -c:a:1 flac -c:a:2 flac -c:a:3 pcm_s16le \
+    -c:a:4 flac -c:a:5 flac -c:a:6 pcm_s16le -c:a:7 libopus -b:a:7 256k -vbr:a:7 off \
     -metadata:s:a:0 language=eng -metadata:s:a:1 language=fre -metadata:s:a:2 language=ger -metadata:s:a:3 language=spa \
+    -metadata:s:a:4 language=ita -metadata:s:a:5 language=jpn -metadata:s:a:6 language=kor -metadata:s:a:7 language=por \
+    -metadata:s:a:4 "title=Italian FLAC 5.1 96kHz" -metadata:s:a:7 "title=Opus Stereo" -disposition:a:0 default -disposition:a:6 comment \
     "$MIX" 2> "$T/mix_mk.err"
-eq "fixture: 2.1 / 6.0 / 5.0(side) / PCM stereo 44.1k (MKV: no layout), video second" \
-    "$(ffprobe -v error -show_entries stream=codec_type,channel_layout,sample_rate -of csv=p=0 "$MIX" | tr -d '\r' | tr '\n' ' ')" \
-    "audio,48000,2.1 video audio,48000,6.0 audio,48000,5.0(side) audio,44100,unknown "
-# Compact for tracks >= 0.00012 GiB (~126 KB), at most ~257 kb/s here
-# (realistic Opus rates: channel identity is measured on the result)
+eq "fixture: AC-3 2.1 / FLAC 6.0 / FLAC 5.0(side) / PCM stereo 44.1k (MKV: no layout) / FLAC 5.1 96k / FLAC 7.1 / PCM mono / Opus stereo, video second" \
+    "$(ffprobe -v error -show_entries stream=codec_type,codec_name,channel_layout,sample_rate -of csv=p=0 "$MIX" | tr -d '\r' | tr '\n' ' ')" \
+    "ac3,audio,48000,2.1 h264,video flac,audio,48000,6.0 flac,audio,48000,5.0(side) pcm_s16le,audio,44100,unknown flac,audio,96000,5.1 flac,audio,48000,7.1 pcm_s16le,audio,48000,unknown opus,audio,48000,stereo "
+# High above 100 kb/s; Compact for tracks >= 0.00012 GiB (~126 KB), at
+# most ~258 kb/s here -> AC-3 256 kb/s (192 / 96 for stereo / mono)
 CONF_B=$(conf_with mixed AUDIO_HIGH_TRIGGER_KBPS=100 AUDIO_COMPACT_TRIGGER_GIB=0.00012 AUDIO_COMPACT_LIMIT_GIB=0.00012)
-# track 1 Compact, track 2 High, track 3 Compact, track 4 Compact
-amenu "$HB" "$CONF_B" "1\n1\n3\ny\n2\n2\ny\n3\n3\ny\n4\n3\nn\n" "$T/mix_menu.log"
+# 1 Compact, 2 High, 3-7 Compact, 8 High
+amenu "$HB" "$CONF_B" "1\n1\n3\ny\n2\n2\ny\n3\n3\ny\n4\n3\ny\n5\n3\ny\n6\n3\ny\n7\n3\ny\n8\n2\nn\n" "$T/mix_menu.log"
 JB=$(job_of "$HB")
 [[ -n "$JB" ]] && cp "$JB" "$T/mixed_job.sh" && JB="$T/mixed_job.sh"
-check "menu: 2.1 Opus impossible -> copy, reason"  "grep -q 'Opus not possible without changing channels; copy unchanged' '$T/mix_menu.log' && grep -q 'Reason: 2.1: Opus has no 3-channel layout' '$T/mix_menu.log'"
 check "menu: 6.0 E-AC-3 would drop a channel -> copy" "grep -q 'Reason: 6.0: E-AC-3 would turn it into 5.0(side) (6 -> 5 channels)' '$T/mix_menu.log'"
-check "plan summary lists the copy reasons"        "[[ \$(grep -c '^  Reason: ' '$T/mix_menu.log') -ge 2 ]] && grep -A3 '^Track 2: ' '$T/mix_menu.log' | grep -q 'Result: copied unchanged'"
-check "menu: 44.1 kHz -> 48 kHz noted"             "grep -q '44100 Hz -> 48000 Hz (Opus rate)' '$T/mix_menu.log'"
+check "menu: 7.1 AC-3 impossible -> copy, reason"  "grep -q 'AC3 not possible without changing channels; copy unchanged' '$T/mix_menu.log' && grep -q 'Reason: 7.1: AC-3 stores at most 6 channels (5.1); the 8 channels are copied, never downmixed' '$T/mix_menu.log'"
+check "plan summary lists the copy reasons"        "[[ \$(grep -c '^  Reason: ' '$T/mix_menu.log') -ge 2 ]] && grep -A3 '^Track 2: ' '$T/mix_menu.log' | grep -q 'Result: copied unchanged' && grep -A3 '^Track 6: ' '$T/mix_menu.log' | grep -q 'Result: copied unchanged'"
+check "menu: 2.1 AC-3 -> AC-3 2.1 kept"            "grep -q 'Layout: 2.1 kept' '$T/mix_menu.log'"
+check "menu: 5.1(back) 96 kHz -> 5.1(side) 48 kHz noted" "grep -q 'Layout: 5.1 -> 5.1(side): same channels (AC-3 surround naming); 96000 Hz -> 48000 Hz (AC-3 rate)' '$T/mix_menu.log'"
+check "menu: layout-less PCM stereo / mono index-mapped" "grep -q 'unspecified 2-channel layout stored as stereo (channel order kept)' '$T/mix_menu.log' && grep -q 'unspecified 1-channel layout stored as mono (channel order kept)' '$T/mix_menu.log'"
+check "menu: 44.1 kHz kept (AC-3 has it)"          "! grep -q '44100 Hz -> ' '$T/mix_menu.log'"
+check "menu: Opus source High -> AC3 320 kb/s"     "grep -A4 '^Track 8: ' '$T/mix_menu.log' | grep -q 'After:  AC3 | 320 kb/s'"
+check "menu: no Opus encoder offered"              "! grep -qE 'Opus \\| |-> Opus|Opus not possible' '$T/mix_menu.log'"
 cmd=$(grep -A6 'item_run mux' "$JB")
-check "job: copied tracks a:0 a:1, Opus a:2 a:3"   "grep -qE -- '-c:v:0 copy -c:a:0 copy -c:a:1 copy -c:a:2 libopus -b:a:2 [0-9]+k -mapping_family:a:2 1 -filter:a:2 channelmap=[^ ]*:channel_layout=5.0 -c:a:3 libopus -b:a:3 [0-9]+k -filter:a:3 channelmap=map=0-FL\\\|1-FR:channel_layout=stereo ' <<< \"\$cmd\""
-check "job: no mapping family for stereo Opus"   "! grep -q -- '-mapping_family:a:3' <<< \"\$cmd\""
-check "menu: layout-less PCM stereo index-mapped"  "grep -q 'unspecified 2-channel layout stored as stereo (channel order kept)' '$T/mix_menu.log'"
-check "job: plan for tracks 3 and 4 only"          "grep -q 'atrans=2\\\\,3 aplan=2:opus:5:5.0:48000\\\\,3:opus:2:stereo:48000 ahash=1 amap=0:0\\\\,1:1\\\\,2:2\\\\,3:3' '$JB'"
+check "job: copy / AC-3 on the right output tracks" "grep -qE -- '-c:v:0 copy -c:a:0 ac3 -b:a:0 256k -c:a:1 copy -c:a:2 ac3 -b:a:2 256k -c:a:3 ac3 -b:a:3 192k -filter:a:3 channelmap=map=0-FL\\\\\\|1-FR:channel_layout=stereo -c:a:4 ac3 -b:a:4 256k -c:a:5 copy -c:a:6 ac3 -b:a:6 96k -filter:a:6 channelmap=map=0-FC:channel_layout=mono -c:a:7 ac3 -b:a:7 320k ' <<< \"\$cmd\""
+check "job: exactly one codec option per audio track" "one_codec_each \"\$cmd\" 8 && (( \$(grep -oE -- '-b:a:[0-9]+ ' <<< \"\$cmd\" | wc -l) == 6 ))"
+check "job: plan for the six transcoded tracks"    "has '$JB' 'atrans=0\,2\,3\,4\,6\,7 aplan=0:ac3:3:2.1:48000:256\,2:ac3:5:5.0\(side\):48000:256\,3:ac3:2:stereo:44100:192\,4:ac3:6:5.1\(side\):48000:256\,6:ac3:1:mono:48000:96\,7:ac3:2:stereo:48000:320 ahash=1 amap=0:0\,1:1\,2:2\,3:3\,4:4\,5:5\,6:6\,7:7'"
 bash "$JB" < /dev/null > "$T/mix_run.log" 2>&1
 OB="$HB/compress/out/Mixed AudioCompressed.mkv"
 check "job succeeded"                              "grep -q 'All encodes finished: 1 ok, 0 failed' '$T/mix_run.log'"
 check "no 'Multiple -codec' warning"               "! grep -q 'Multiple -codec' '$T/mix_run.log'"
-eq    "output tracks in source order"              "$(ffprobe -v error -select_streams a -show_entries stream=codec_name,channels,channel_layout,sample_rate:stream_tags=language -of csv=p=0 "$OB" | tr -d '\r' | tr '\n' ' ')" \
-      "ac3,48000,3,2.1,eng flac,48000,6,6.0,fre opus,48000,5,5.0,ger opus,48000,2,stereo,spa "
-eq    "copied 2.1 / 6.0 payload-identical"         "$(_audio_payload_md5 "$OB" | head -2 | tr '\n' ' ')" "$(_audio_payload_md5 "$MIX" | head -2 | tr '\n' ' ')"
-eq    "5.0(side) -> Opus 5.0: channel identity"     "$(dominant_tones "$OB" 2 200 300 400 600 700)" "200 300 400 600 700 "
-check "verify: 44.1 -> 48 kHz as planned, no warning" "grep -q 'Audio 4 sample rate: *44100 -> 48000 Hz AS PLANNED' '$T/mix_run.log' && ! grep -qiE 'UNEXPECTED|layout changed|sample rate .* planned' '$T/mix_run.log'"
-check "verify: 2.1 / 6.0 hash-matched"             "grep -q 'Audio track 1: *COPIED (AC-3 2.1, 48000 Hz, payload MD5 MATCH)' '$T/mix_run.log' && grep -q 'Audio track 2: *COPIED (FLAC 6.0, 48000 Hz, payload MD5 MATCH)' '$T/mix_run.log'"
+eq    "output tracks in source order"              "$(ffprobe -v error -select_streams a -show_entries stream=codec_name,channels,channel_layout,sample_rate,bit_rate:stream_tags=language -of csv=p=0 "$OB" | tr -d '\r' | tr '\n' ' ')" \
+      "ac3,48000,3,2.1,256000,eng flac,48000,6,6.0,N/A,fre ac3,48000,5,5.0(side),256000,ger ac3,44100,2,stereo,192000,spa ac3,48000,6,5.1(side),256000,ita flac,48000,8,7.1,N/A,jpn ac3,48000,1,mono,96000,kor ac3,48000,2,stereo,320000,por "
+eq    "copied 6.0 / 7.1 payload-identical"         "$(_audio_payload_md5 "$OB" | sed -n '2p;6p' | tr '\n' ' ')" "$(_audio_payload_md5 "$MIX" | sed -n '2p;6p' | tr '\n' ' ')"
+eq    "2.1 -> AC-3 2.1: channel identity"          "$(dominant_tones "$OB" 0 200 300 60)" "200 300 60 "
+eq    "5.0(side) -> AC-3 5.0(side): channel identity" "$(dominant_tones "$OB" 2 200 300 400 600 700)" "200 300 400 600 700 "
+eq    "stereo 44.1k -> AC-3 stereo: channel identity" "$(dominant_tones "$OB" 3 300 900)" "300 900 "
+eq    "5.1(back) -> AC-3 5.1(side): BL/BR on SL/SR" "$(dominant_tones "$OB" 4 200 300 400 60 600 700)" "200 300 400 60 600 700 "
+eq    "mono -> AC-3 mono"                          "$(dominant_tones "$OB" 6 440 1000)" "440 "
+eq    "Opus stereo -> AC-3 stereo: channel identity" "$(dominant_tones "$OB" 7 500 700)" "500 700 "
+check "verify: 96 -> 48 kHz as planned, no warning" "grep -q 'Audio 5 sample rate: *96000 -> 48000 Hz AS PLANNED' '$T/mix_run.log' && ! grep -qiE 'UNEXPECTED|NOT AS PLANNED|layout changed|sample rate .* planned' '$T/mix_run.log'"
+check "verify: every bit rate as planned"          "[[ \$(grep -cE 'Audio [0-9]+ bit rate: *[0-9]+ kb/s AS PLANNED' '$T/mix_run.log') == 6 ]]"
+check "verify: 6.0 / 7.1 hash-matched"             "grep -q 'Audio track 2: *COPIED (FLAC 6.0, 48000 Hz, payload MD5 MATCH)' '$T/mix_run.log' && grep -q 'Audio track 6: *COPIED (FLAC 7.1, 48000 Hz, payload MD5 MATCH)' '$T/mix_run.log'"
+check "verify: no failure"                         "! grep -q 'RESULT: FAILED' '$T/mix_run.log'"
+eq    "output: titles / dispositions"              "$(probe_a "$OB" 4 stream_tags=title)|$(probe_a "$OB" 7 stream_tags=title)|$(ffprobe -v error -select_streams a -show_entries stream_disposition=default,comment -of csv=p=0 "$OB" | tr -d '\r' | tr '\n' ' ')" \
+      "Italian AC-3 5.1|AC-3 Stereo|$(ffprobe -v error -select_streams a -show_entries stream_disposition=default,comment -of csv=p=0 "$MIX" | tr -d '\r' | tr '\n' ' ')"
 
 # ------------------------------------------------------------
 echo
@@ -360,10 +411,10 @@ echo "== 5 nothing to transcode"
 HC=$(new_home wide)
 ffmpeg -v error -y -f lavfi -i "testsrc2=s=160x90:r=24:d=4" -f lavfi -i "$(TONE_NOISE=1 tones "7.1(wide)" 1 2 3 4 5 6 7 8)" \
     -map 0:v -map 1:a -map 1:a -c:v libx264 -preset ultrafast -c:a:0 flac -c:a:1 pcm_s16le "$HC/compress/out/Wide.mkv" 2>/dev/null
-# FLAC 7.1(wide): named, but no Opus layout; PCM 8ch: MKV stores no layout
+# FLAC 7.1(wide) and PCM 8ch (MKV stores no layout): more than AC-3 has
 amenu "$HC" "$CONF_B" "1\n1\n3\ny\n2\n3\nn\n" "$T/wide_menu.log"
-check "7.1(wide) Compact: Opus impossible, copy"   "grep -q 'Reason: 7.1(wide): Opus has no 8-channel layout' '$T/wide_menu.log'"
-check "PCM 8ch without layout: copy, no guessing"  "grep -q 'the 8 channels have no known speaker order' '$T/wide_menu.log'"
+check "7.1(wide) Compact: AC-3 impossible, copy"   "grep -q 'Reason: 7.1(wide): AC-3 stores at most 6 channels' '$T/wide_menu.log'"
+check "PCM 8ch without layout: copy"               "grep -q 'Reason: 8ch: AC-3 stores at most 6 channels' '$T/wide_menu.log'"
 check "nothing started"                            "grep -q 'No selected track requires compression.' '$T/wide_menu.log' && [[ -z \"\$(job_of '$HC')\" ]]"
 
 # ------------------------------------------------------------
@@ -373,24 +424,29 @@ if [[ -s "${OA:-}" ]]; then
     vrun() {   # NAME PART [aplan]  ->  report in $T/v_NAME/report.txt
         ITEM_INPUT="$RAID"; ITEM_PART="$2"; ITEM_TMP="$T/v_$1"
         mkdir -p "$ITEM_TMP"
-        unset ITEM_EXP; declare -gA ITEM_EXP=([vidx]=0 [video]=copy [atrans]=1 [aplan]="${3:-1:opus:6:5.1:48000}" [ahash]=1 [amap]="0:0,1:1,2:2")
+        unset ITEM_EXP; declare -gA ITEM_EXP=([vidx]=0 [video]=copy [atrans]=1 [aplan]="${3:-1:ac3:6:5.1(side):48000:384}" [ahash]=1 [amap]="0:0,1:1,2:2")
         item_verify_output > /dev/null 2>&1
     }
     rep() { cat "$T/v_$1/report.txt"; }
     vrun good "$OA"
-    check "the real output passes"                   "rep good | grep -q 'Audio 2 layout: *5.1(side) -> 5.1 AS PLANNED' && ! rep good | grep -q 'RESULT: FAILED'"
-    ffmpeg -v error -y -i "$OA" -map 0 -c copy -c:a:1 libopus -ac:a:1 2 -b:a:1 128k "$T/f/stereo.mkv" 2>/dev/null
+    check "the real output passes"                   "rep good | grep -q 'Audio 2 bit rate: *384 kb/s AS PLANNED' && ! rep good | grep -q 'RESULT: FAILED'"
+    vrun old "$OA" "1:ac3:6:5.1(side):48000"
+    check "a job without a planned bit rate passes"  "! rep old | grep -q 'bit rate' && ! rep old | grep -q 'RESULT: FAILED'"
+    ffmpeg -v error -y -i "$OA" -map 0 -c copy -c:a:1 ac3 -ac:a:1 2 -b:a:1 192k "$T/f/stereo.mkv" 2>/dev/null
     vrun chan "$T/f/stereo.mkv"
     check "channel count change FAILS"               "rep chan | grep -q 'Audio 2 channels: *CHANGED: 6 -> 2' && rep chan | grep -q 'RESULT: FAILED'"
     ffmpeg -v error -y -i "$OA" -map 0 -c copy -c:a:1 aac -b:a:1 384k "$T/f/aac.mkv" 2>/dev/null
     vrun codec "$T/f/aac.mkv"
-    check "codec mismatch FAILS"                     "rep codec | grep -q 'Audio 2 codec: *NOT AS PLANNED: aac (planned opus)' && rep codec | grep -q 'RESULT: FAILED'"
-    vrun layout "$OA" "1:opus:6:5.1(side):48000"
-    check "planned layout mismatch FAILS"            "rep layout | grep -q 'Audio 2 layout: *NOT AS PLANNED: 5.1 (planned 5.1(side)' && rep layout | grep -q 'RESULT: FAILED'"
+    check "codec mismatch FAILS"                     "rep codec | grep -q 'Audio 2 codec: *NOT AS PLANNED: aac (planned ac3)' && rep codec | grep -q 'RESULT: FAILED'"
+    vrun layout "$OA" "1:ac3:6:5.1:48000:384"
+    check "planned layout mismatch FAILS"            "rep layout | grep -q 'Audio 2 layout: *NOT AS PLANNED: 5.1(side) (planned 5.1' && rep layout | grep -q 'RESULT: FAILED'"
+    ffmpeg -v error -y -i "$OA" -map 0 -c copy -c:a:1 ac3 -b:a:1 448k "$T/f/rate.mkv" 2>/dev/null
+    vrun rate "$T/f/rate.mkv"
+    check "bit rate mismatch FAILS"                  "rep rate | grep -q 'Audio 2 bit rate: *NOT AS PLANNED: 448000 b/s (planned 384 kb/s)' && rep rate | grep -q 'RESULT: FAILED'"
     ffmpeg -v error -y -i "$OA" -map 0 -c copy -c:a:0 eac3 -b:a:0 384k "$T/f/reenc.mkv" 2>/dev/null
     vrun hash "$T/f/reenc.mkv"
     check "copied payload mismatch FAILS"            "rep hash | grep -q 'Audio track 1: .*payload MD5 MISMATCH' && rep hash | grep -q 'RESULT: FAILED - audio 1 payload differs'"
-    vrun sr "$OA" "1:opus:6:5.1:44100"
+    vrun sr "$OA" "1:ac3:6:5.1(side):44100:384"
     check "unexpected sample rate warns"             "rep sr | grep -q 'Audio 2 sample rate: *UNEXPECTED: 48000 Hz (planned 44100 Hz)'"
 else
     bad "verification tests need the section 3 output"
@@ -402,10 +458,10 @@ echo "== 7 job-level failures never finalize a broken file"
 if [[ -n "${JA:-}" && -s "${OA:-}" ]]; then
     mv "$OA" "$T/f/raid_ok.mkv"
 
-    # the original bug: libopus given 5.1(side) (no channelmap)
-    sed 's/ -filter:a:1 [^ ]*//' "$JA" > "$T/raid_nomap.sh"
-    bash "$T/raid_nomap.sh" < /dev/null > "$T/nomap_run.log" 2>&1
-    check "encoder failure: item FAILED (pass mux)"  "grep -q 'Reason: pass mux failed (ffmpeg exit' '$T/nomap_run.log' && grep -q 'Invalid channel layout 5.1(side)' '$T/nomap_run.log'"
+    # the AC-3 encoder failing mid-job (too low a rate for 5.1)
+    sed 's/-b:a:1 384k/-b:a:1 32k/' "$JA" > "$T/raid_fail.sh"
+    bash "$T/raid_fail.sh" < /dev/null > "$T/fail_run.log" 2>&1
+    check "encoder failure: item FAILED (pass mux)"  "grep -q 'Reason: pass mux failed (ffmpeg exit' '$T/fail_run.log' && grep -q 'Bit allocation failed' '$T/fail_run.log'"
     check "encoder failure: no output, no .part"     "[[ ! -e '$OA' && ! -e '$OA.part' && -z \"\$(ls '$HA/compress/out' | grep -i audiocompressed)\" ]]"
     check "encoder failure: recorded in failed.tsv"  "grep -rq 'The Raid 2 (2014) HEVC Base.mkv' '$HA/compress/work/logs'/*/failed.tsv"
 
@@ -414,6 +470,13 @@ if [[ -n "${JA:-}" && -s "${OA:-}" ]]; then
     bash "$T/raid_downmix.sh" < /dev/null > "$T/downmix_run.log" 2>&1
     check "downmix: verification FAILS the item"     "grep -q 'audio 2 channel count changed (6 -> 2)' '$T/downmix_run.log' && grep -q 'All encodes finished: 0 ok, 1 failed' '$T/downmix_run.log'"
     check "downmix: never finalized, kept for inspection" "[[ ! -e '$OA' && -s '$OA.verify-failed' ]]"
+    rm -f -- "$OA.verify-failed"
+
+    # a rate other than the planned one fails the verification
+    sed 's/-b:a:1 384k/-b:a:1 448k/' "$JA" > "$T/raid_rate.sh"
+    bash "$T/raid_rate.sh" < /dev/null > "$T/rate_run.log" 2>&1
+    check "wrong bit rate: verification FAILS the item" "grep -q 'audio 2 bit rate is 448000 b/s, planned 384 kb/s' '$T/rate_run.log' && grep -q 'All encodes finished: 0 ok, 1 failed' '$T/rate_run.log'"
+    check "wrong bit rate: never finalized"          "[[ ! -e '$OA' && -s '$OA.verify-failed' ]]"
 else
     bad "job-level tests need the section 3 job and output"
 fi

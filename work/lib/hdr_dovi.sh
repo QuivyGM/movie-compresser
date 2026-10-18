@@ -1090,17 +1090,18 @@ item_verify_output() {
         fi
     fi
 
-    # aplan=src:codec:channels:layout:sample_rate,... (audio menu): the
-    # planned result of every transcoded track (audio_plan.sh)
-    local -A p_codec=() p_ch=() p_layout=() p_sr=()
+    # aplan=src:codec:channels:layout:sample_rate[:kbps],... (audio
+    # menu): the planned result of every transcoded track (audio_plan.sh;
+    # kbps: jobs from before it was recorded have none)
+    local -A p_codec=() p_ch=() p_layout=() p_sr=() p_kbps=()
     if [[ -n "${ITEM_EXP[aplan]:-}" ]]; then
         local -a plans=()
-        local pi pc pch pl psr
+        local pi pc pch pl psr pk
         IFS=, read -ra plans <<< "${ITEM_EXP[aplan]}"
         for v in "${plans[@]}"; do
-            IFS=: read -r pi pc pch pl psr <<< "$v"
+            IFS=: read -r pi pc pch pl psr pk <<< "$v"
             [[ "$pi" =~ ^[0-9]+$ ]] || continue
-            p_codec[$pi]="$pc" p_ch[$pi]="$pch" p_layout[$pi]="$pl" p_sr[$pi]="$psr"
+            p_codec[$pi]="$pc" p_ch[$pi]="$pch" p_layout[$pi]="$pl" p_sr[$pi]="$psr" p_kbps[$pi]="$pk"
         done
     fi
 
@@ -1169,13 +1170,27 @@ item_verify_output() {
             elif [[ "$sl" != "$ol" ]]; then
                 _rep "Audio $((i + 1)) layout" "${sl/#-/${sch}ch} -> $ol AS PLANNED (same channels; surround positions relabelled, no remix)" >&3
             fi
-            # Opus always encodes at 48 kHz: a planned rate change is no
-            # warning
+            # AC-3 encodes at 48 / 44.1 / 32 kHz only: a planned rate
+            # change is no warning
             if [[ -n "${p_sr[$i]}" && "$osr" != "${p_sr[$i]}" ]]; then
                 _rep "Audio $((i + 1)) sample rate" "UNEXPECTED: ${osr:-?} Hz (planned ${p_sr[$i]} Hz)" >&3
                 warns+=("audio $((i + 1)) sample rate ${osr:-?} Hz, planned ${p_sr[$i]} Hz")
             elif [[ -n "$osr" && "$osr" != "$ssr" ]]; then
                 _rep "Audio $((i + 1)) sample rate" "$ssr -> $osr Hz AS PLANNED ($(_codec_label "$oc" -) encodes at $osr Hz)" >&3
+            fi
+            # AC-3 is constant bit rate and every frame header carries
+            # the rate: it must be the planned one (FFmpeg silently rounds
+            # a rate AC-3 does not have)
+            if [[ "${p_codec[$i]}" == ac3 && "${p_kbps[$i]:-}" =~ ^[0-9]+$ && "$oc" == ac3 ]]; then
+                local obr=""
+                obr=$(ffprobe -v error -select_streams "$(_field "${O_A[$i]}" 12)" \
+                    -show_entries stream=bit_rate -of default=nw=1:nk=1 "$out" 2>/dev/null | tr -d '\r' | head -n 1)
+                if [[ "$obr" == "$(( p_kbps[$i] * 1000 ))" ]]; then
+                    _rep "Audio $((i + 1)) bit rate" "${p_kbps[$i]} kb/s AS PLANNED" >&3
+                else
+                    _rep "Audio $((i + 1)) bit rate" "NOT AS PLANNED: ${obr:-unknown} b/s (planned ${p_kbps[$i]} kb/s)" >&3
+                    fails+=("audio $((i + 1)) bit rate is ${obr:-unknown} b/s, planned ${p_kbps[$i]} kb/s")
+                fi
             fi
         elif [[ "$sl" != "$ol" && "$sl" != "-" ]]; then
             # jobs without aplan

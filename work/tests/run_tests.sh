@@ -47,7 +47,7 @@
 #     CRF (movie High / Base / Quality retries, series shared CRF,
 #     Custom), source tags kept, none for copy / two-pass, verification
 #     report incl. "not recorded" (compression_tag_tests.sh)
-# 16. audio pipeline: layout planning (Opus / E-AC-3 / AAC; surround
+# 16. audio pipeline: layout planning (AC-3 / E-AC-3 / AAC; surround
 #     relabels by explicit channelmap; layouts that would change
 #     channels copied), source -> output audio index, one codec option
 #     per stream, audio menu jobs incl. The Raid 2 DTS 5.1(side) case,
