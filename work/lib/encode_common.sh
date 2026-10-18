@@ -1789,16 +1789,25 @@ codec_title_label() {
 _audio_title_awk() {
     # the title is passed in the environment: awk -v would turn its
     # backslashes into escape sequences
-    AT_TITLE="$2" awk -v mode="$1" -v codec="$3" -v label="$4" -v ch="$5" -v prof="$6" -v lang="${7:-}" '
+    AT_TITLE="$2" awk -v mode="$1" -v codec="$3" -v label="$4" -v ch="$5" -v prof="$6" -v lang="${7:-}" \
+        -v nbr="${8:-}" -v bits="${9:-}" -v sr="${10:-}" -v trans="${11:-}" '
         BEGIN {
             t = ENVIRON["AT_TITLE"]
+            # residue / check: release-style separators ("TrueHD.Atmos.7.1",
+            # "DTS_HD") are spaces; a dot between digits stays ("7.1")
+            if (mode != "rewrite") t = undot(t)
+            # Dolby Digital EX / Surround EX: the "EX" belongs to the codec
+            # claim (matrixed rear surround in an AC-3 stream)
+            lt = tolower(t)
+            exclaim = (lt ~ /(^|[^a-z])(dolby digital( plus)?|dd\+?|ddp|e?-?ac-?3)[^a-z]*([0-9][.][0-9][^a-z]*)?(surround[ -])?ex([^a-z]|$)/ ||
+                       lt ~ /(^|[^a-z])surround[ -]ex([^a-z]|$)/)
             # pattern, class (order matters: longest / most specific first)
             n = 0
             P[++n] = "dolby atmos";                       C[n] = "atmos"
             P[++n] = "atmos";                             C[n] = "atmos"
             P[++n] = "dts[:-]? ?x";                       C[n] = "dtsx"
-            P[++n] = "dolby truehd";                      C[n] = "truehd"
-            P[++n] = "true[- ]?hd";                       C[n] = "truehd"
+            P[++n] = "dolby tru(e)?[- ]?hd";              C[n] = "truehd"
+            P[++n] = "tru(e)?[- ]?hd";                    C[n] = "truehd"
             P[++n] = "dolby digital plus";                C[n] = "eac3"
             P[++n] = "dolby digital";                     C[n] = "ac3"
             P[++n] = "dd\\+";                             C[n] = "eac3"
@@ -1812,6 +1821,7 @@ _audio_title_awk() {
             P[++n] = "dts-?hd";                           C[n] = "dts"
             P[++n] = "dts-?es";                           C[n] = "dts"
             P[++n] = "master audio";                      C[n] = "dts"
+            P[++n] = "hd[- ]?(ma|hra)";                   C[n] = "dts"
             P[++n] = "dts";                               C[n] = "dts"
             P[++n] = "l?pcm";                             C[n] = "pcm"
             P[++n] = "flac";                              C[n] = "flac"
@@ -1838,6 +1848,7 @@ _audio_title_awk() {
             P[++n] = "[0-9]+\\.[0-9](\\.[0-9])?";          C[n] = "chx"
             P[++n] = "[0-9]+ ?(ch|channels?)";            C[n] = "chx"
             if (lang != "") { P[++n] = lang;              C[n] = "lang" }
+            if (exclaim)    { P[++n] = "(surround[ -])?ex"; C[n] = "ex" }
 
             lc = tolower(t); out = t; first = 1; stale = ""
 
@@ -1860,8 +1871,10 @@ _audio_title_awk() {
                     # blank: same length, never matches again
                     blank = sprintf("%" l "s", ""); gsub(/./, "\002", blank)
 
-                    if (!is_false(C[i]) || mode == "check") {
-                        if (mode == "check" && is_false(C[i]))
+                    if (!is_false(C[i], substr(lc, s, l)) || mode == "check" || mode == "unknown") {
+                        if (mode == "check" && is_false(C[i], substr(lc, s, l)))
+                            stale = stale (stale ? ", " : "") substr(t, s, l)
+                        else if (mode == "unknown" && is_unknown(C[i]))
                             stale = stale (stale ? ", " : "") substr(t, s, l)
                         lc = substr(lc, 1, s - 1) blank substr(lc, s + l)
                         pos = s + l
@@ -1877,7 +1890,7 @@ _audio_title_awk() {
                 }
             }
 
-            if (mode == "check") { print stale; exit }
+            if (mode == "check" || mode == "unknown") { print stale; exit }
 
             while (match(out, /\001[0-9A-Za-z]/)) out = substr(out, 1, RSTART) " " substr(out, RSTART + 1)
             while (match(out, /[0-9A-Za-z]\001/)) out = substr(out, 1, RSTART) " " substr(out, RSTART + 1)
@@ -1896,16 +1909,68 @@ _audio_title_awk() {
             print out
         }
         function is_codec(c) { return c ~ /^(truehd|eac3|ac3|dts|pcm|flac|alac|aac|opus|mp3|vorbis)$/ }
-        function is_false(c) {
+        # TXT: the matched (lower-case) claim
+        function is_false(c, txt,    v) {
             if (mode == "residue") return 1
             if (c == "chx" || c == "lang") return 0
             if (is_codec(c)) return c != codec
             if (c == "dolby")    return codec !~ /^(ac3|eac3|truehd)$/
             if (c == "lossless") return codec !~ /^(flac|alac|pcm|truehd)$/
-            if (c == "atmos")    return prof !~ /Atmos/
-            if (c == "dtsx")     return prof !~ /DTS:X/
+            if (c == "ex")       return codec !~ /^(ac3|eac3)$/
+            # object audio: FFmpeg does not report every Atmos / DTS:X
+            # stream in the profile, so on an unchanged (not transcoded)
+            # stream of a codec that can carry it a title claim is not
+            # disproved; a transcode always drops it
+            if (c == "atmos")    return prof !~ /Atmos/ && (mode == "rewrite" || trans == 1 || codec !~ /^(truehd|eac3)$/)
+            if (c == "dtsx")     return prof !~ /DTS:X/ && (mode == "rewrite" || trans == 1 || codec != "dts")
+            # EX is matrixed into the surrounds: "6.1" on 6 channels is EX
+            if (c == "ch7" && exclaim && ch + 0 == 6) return 0
             if (c ~ /^ch/)       return (ch != "" && substr(c, 3) + 0 != ch + 0)
-            return 1   # bitrate / bit depth / sample rate of the old stream
+            # bit rate / bit depth / sample rate: rewrite (the old stream
+            # of a transcode) drops them; check only when the stream says
+            # otherwise (unknown is never false)
+            if (mode == "rewrite") return 1
+            if (c == "bitrate") {
+                v = claim_bps(txt)
+                return nbr ~ /^[0-9]+$/ && nbr + 0 > 0 && v > 0 && (v > nbr * 1.02 || v < nbr * 0.98)
+            }
+            if (c == "bitdepth") {
+                v = txt; sub(/[^0-9].*/, "", v)
+                return bits ~ /^[0-9]+$/ && bits + 0 > 0 && v + 0 != bits + 0
+            }
+            if (c == "samplerate") {
+                v = txt; sub(/ ?khz$/, "", v); gsub(/,/, ".", v); v = v * 1000
+                return sr ~ /^[0-9]+$/ && sr + 0 > 0 && (v > sr * 1.006 || v < sr * 0.994)
+            }
+            return 0
+        }
+        # unknown mode: a technical claim the stream can neither confirm
+        # nor contradict (no nominal rate / bit depth / sample rate)
+        function is_unknown(c) {
+            if (c == "bitrate")    return nbr !~ /^[0-9]+$/
+            if (c == "bitdepth")   return bits !~ /^[0-9]+$/
+            if (c == "samplerate") return sr !~ /^[0-9]+$/
+            return 0
+        }
+        # "3394 kbps" / "1.5 Mbps" / "1,509 kb/s" / "640k"  ->  bits per second
+        function claim_bps(x,    num, unit) {
+            num = x; sub(/ ?[a-z\/]+$/, "", num)
+            unit = substr(x, length(num) + 1); gsub(/ /, "", unit)
+            if (num ~ /^[0-9]+,[0-9][0-9][0-9]$/) gsub(/,/, "", num); else gsub(/,/, ".", num)
+            return num * (unit ~ /^m/ ? 1000000 : 1000)
+        }
+        function undot(x,    o, i, c, n, a, b) {
+            o = ""; n = length(x)
+            for (i = 1; i <= n; i++) {
+                c = substr(x, i, 1)
+                if (c == "_") c = " "
+                else if (c == ".") {
+                    a = substr(x, i - 1, 1); b = substr(x, i + 1, 1)
+                    if (!(a ~ /[0-9]/ && b ~ /[0-9]/)) c = " "
+                }
+                o = o c
+            }
+            return o
         }'
 }
 
@@ -1914,9 +1979,55 @@ audio_title_rewrite() {
     _audio_title_awk rewrite "$1" "$2" "$(codec_title_label "$2")" "$3" ""
 }
 
-# audio_title_false_claims TITLE CODEC CHANNELS PROFILE  ->  "" if accurate
+# audio_title_false_claims TITLE CODEC CHANNELS PROFILE [NOMINAL_BPS BITS
+#                          SAMPLE_RATE TRANSCODED]  ->  "" if accurate
+# Only what the stream contradicts is listed: a bit rate against the
+# nominal (constant) rate, a bit depth / sample rate against the known
+# value (audio_title_stream_facts); "" for any of them = unknown, never
+# false. TRANSCODED=1: the track was re-encoded (object audio is gone).
 audio_title_false_claims() {
-    _audio_title_awk check "$1" "$2" "" "$3" "$4"
+    _audio_title_awk check "$1" "$2" "" "$3" "$4" "" "${5:-}" "${6:-}" "${7:-}" "${8:-}"
+}
+
+# audio_title_unverified TITLE CODEC CHANNELS PROFILE [NOMINAL_BPS BITS
+#                         SAMPLE_RATE]  ->  the bit rate / bit depth /
+# sample rate claims the stream can neither confirm nor contradict
+# (UNKNOWN, as opposed to the false claims above); "" = none
+audio_title_unverified() {
+    _audio_title_awk unknown "$1" "$2" "" "$3" "$4" "" "${5:-}" "${6:-}" "${7:-}" ""
+}
+
+# audio_title_stream_facts CODEC PROFILE BIT_RATE BITS_PER_RAW_SAMPLE
+#                          SAMPLE_RATE CHANNELS
+#   ->  "NOMINAL_BPS BITS SAMPLE_RATE" ("-" = unknown) for
+#       audio_title_false_claims. A nominal bit rate only for constant
+#       rate streams (AC-3, E-AC-3, MP2, DTS core without HD extension,
+#       PCM); TrueHD / DTS-HD / FLAC / AAC / Opus / ... are variable, so a
+#       title's (average) rate cannot be judged. A bit depth only where
+#       it is a property of the stream (PCM, lossless).
+audio_title_stream_facts() {
+    local codec="$1" profile="${2:-}" br="${3:-}" raw="${4:-}" sr="${5:-}" ch="${6:-}" n="-" b="-" pb=""
+
+    [[ "$br" =~ ^[0-9]+$ ]] || br=""
+    [[ "$raw" =~ ^[1-9][0-9]*$ ]] || raw=""
+    [[ "$sr" =~ ^[1-9][0-9]*$ ]] || sr=""
+
+    case "$codec" in
+        pcm_*)
+            [[ "$codec" =~ ^pcm_[a-z]?([0-9]+) ]] && pb="${BASH_REMATCH[1]}"
+            b="${pb:--}"
+            [[ -n "$pb" && -n "$sr" && "$ch" =~ ^[0-9]+$ ]] && n=$(( pb * sr * ch ))
+            ;;
+        ac3|eac3|mp2)
+            n="${br:--}" ;;
+        dts)
+            [[ "$profile" == DTS || "$profile" == DTS-ES || "$profile" == "DTS 96/24" ]] && n="${br:--}"
+            [[ "$profile" == *MA* ]] && b="${raw:--}"
+            ;;
+        truehd|mlp|flac|alac|wavpack)
+            b="${raw:--}" ;;
+    esac
+    printf '%s %s %s' "$n" "$b" "${sr:--}"
 }
 
 # _audio_rows FILE  ->  audio stream_meta rows with the effective title
@@ -2092,6 +2203,17 @@ audio_title_description() {
 
     r=""
     [[ -n "$t" ]] && r=$(_audio_title_awk residue "$t" "" "" "" "" "$re")
+    # connectors left over from removed claims ("TrueHD with Atmos" ->
+    # "with"): dropped at either end; inside the text they stay
+    local conn='(with|and|plus|in|on|feat\.?|featuring|w/|&|\+)' sep='[][[:space:]|/,;:@()-]'
+    while [[ "${r,,}" =~ ^${conn}(${sep}+|$) ]]; do
+        r="${r:${#BASH_REMATCH[0]}}"
+    done
+    while [[ "${r,,}" =~ (^|${sep}+)${conn}$ ]]; do
+        r="${r:0:$(( ${#r} - ${#BASH_REMATCH[0]} ))}"
+    done
+    while [[ "$r" =~ ^${sep} ]]; do r="${r:1}"; done
+    while [[ "$r" =~ ${sep}$ ]]; do r="${r:0:$(( ${#r} - 1 ))}"; done
     lc="${r,,}"
     # nothing meaningful left ("Audio", "Surround", "Track 2", ...)
     if [[ "$lc" =~ ^((main|original)\ )?(audio|sound|track|surround|audio\ track)(\ #?[0-9]+)?$ ]]; then
@@ -2104,6 +2226,16 @@ audio_title_description() {
     [[ "${4:-0}" == 1 && ! "$lc" =~ hearing|sdh|(^|[^a-z])hi($|[^a-z])|dialog ]] && parts+=("Hearing Impaired")
 
     _title_join "${parts[@]+"${parts[@]}"}"
+}
+
+# audio_title_ex TITLE  ->  0 when TITLE claims Dolby Digital EX ("Dolby
+# Digital EX", "DD EX", "DD5.1 EX", "AC-3 EX", "Surround EX"): the same
+# rule as the "ex" claim of _audio_title_awk
+audio_title_ex() {
+    local t="${1,,}"
+
+    [[ "$t" =~ (^|[^a-z])(dolby\ digital(\ plus)?|dd\+?|ddp|e?-?ac-?3)[^a-z]*([0-9][.][0-9][^a-z]*)?(surround[\ -])?ex([^a-z]|$) ||
+       "$t" =~ (^|[^a-z])surround[\ -]ex([^a-z]|$) ]]
 }
 
 # _title_join PART...  ->  "PART | PART | ..."
@@ -2123,14 +2255,20 @@ _title_join() {
 # title (older FFmpeg, see audio_object_kind) still describes it; a
 # transcoded track never has object audio.
 audio_std_title() {
-    local old="${6:-}" object="" out=() p
+    local old="${6:-}" object="" out=() p cname
 
     [[ "$old" == "-" ]] && old=""
+    cname=$(audio_codec_name "$2" "$3")
     if [[ "${10:-0}" == 1 ]]; then
         object=$(audio_object_kind "$2" "$3" "$old")
+        cname=$(audio_codec_name "$2" "$3" "$object")
+        # Dolby Digital EX is a flag in the AC-3 stream FFmpeg does not
+        # report: kept from the old title of an unchanged (copied) AC-3 /
+        # E-AC-3 track, never invented, dropped by a transcode
+        [[ "$2" =~ ^(ac3|eac3)$ ]] && audio_title_ex "$old" && cname+=" EX"
     fi
 
-    for p in "$(audio_lang_name "$1")" "$(audio_codec_name "$2" "$3" "$object")" \
+    for p in "$(audio_lang_name "$1")" "$cname" \
              "$(audio_channel_notation "$5" "$4")" \
              "$(audio_title_description "$old" "$1" "${7:-0}" "${8:-0}" "${9:-0}")"; do
         [[ -n "$p" ]] && out+=("$p")

@@ -706,6 +706,29 @@ eq "std: wrong layout claim dropped"     "$(audio_std_title eng aac LC 2 stereo 
 eq "std: height channels"                "$(audio_std_title eng truehd - 12 7.1.4 '' 0 0 0 1)" "English | TrueHD | 7.1.4"
 eq "std: speaker list"                   "$(audio_channel_notation '6 channels (FL+FR+FC+LFE+BL+BR)' 6)" "5.1"
 eq "std: layout / count mismatch"        "$(audio_channel_notation 5.1 2)" "2ch"
+# real-world titles (regressions)
+TPA='Dolby TrueHD + Dolby Atmos'
+eq "std: 'Tru HD with' fragment removed" "$(audio_std_title ind truehd "$TPA" 8 7.1 'Indonesian Tru HD with Atmos 7.1' 0 0 0 1)" "Indonesian | TrueHD Atmos | 7.1"
+eq "std: 'with' after removed claims"    "$(audio_std_title ind truehd "$TPA" 8 7.1 'Indonesian Dolby TrueHD with Dolby Atmos 7.1' 0 0 0 1)" "Indonesian | TrueHD Atmos | 7.1"
+eq "std: dotted release title"           "$(audio_std_title ind truehd "$TPA" 8 7.1 'TrueHD.Atmos.7.1' 0 0 0 1)" "Indonesian | TrueHD Atmos | 7.1"
+eq "std: inner connector kept"           "$(audio_std_title eng ac3 - 2 stereo "Director's Commentary with Cast" 1 0 0 1)" "English | AC-3 | 2.0 | Director's Commentary with Cast"
+eq "std: Dolby Digital EX (copy)"        "$(audio_std_title eng ac3 - 6 '5.1(side)' 'English Dolby Digital EX 5.1' 0 0 0 1)" "English | AC-3 EX | 5.1"
+eq "std: EX idempotent"                  "$(audio_std_title eng ac3 - 6 '5.1(side)' 'English | AC-3 EX | 5.1' 0 0 0 1)" "English | AC-3 EX | 5.1"
+eq "std: EX dropped by a transcode"      "$(audio_std_title eng aac LC 6 5.1 'English Dolby Digital EX 5.1' 0 0 0 0)" "English | AAC | 5.1"
+eq "std: EX never invented"              "$(audio_std_title eng ac3 - 6 '5.1(side)' 'Ex-Wife Commentary' 0 0 0 1)" "English | AC-3 | 5.1 | Ex-Wife Commentary"
+eq "std: no EX on other codecs"          "$(audio_std_title eng dts DTS 6 '5.1(side)' 'Dolby Digital EX 5.1' 0 0 0 1)" "English | DTS | 5.1"
+eq "check: TrueHD avg rate / 24-bit / 48 kHz not STALE" "$(audio_title_false_claims 'TrueHD Atmos 7.1 @ 3394 kbps / 48 kHz / 24-bit' truehd 8 "$TPA" '' 24 48000)" ""
+eq "check: TrueHD avg rate is UNKNOWN"   "$(audio_title_unverified 'TrueHD Atmos 7.1 @ 3394 kbps / 48 kHz / 24-bit' truehd 8 "$TPA" '' 24 48000)" "3394 kbps"
+eq "check: 640 kbps on 640k E-AC-3"      "$(audio_title_false_claims 'English DD+ 5.1 640 kbps' eac3 6 - 640000 '' 48000)" ""
+eq "check: 640 kbps on 448k AC-3"        "$(audio_title_false_claims 'English AC3 5.1 640 kbps' ac3 6 - 448000 '' 48000)" "640 kbps"
+eq "check: bit depth / rate unknown"     "$(audio_title_false_claims 'AC3 24-bit 48 kHz 640 kbps' ac3 6 - '' '' '')" ""
+eq "check: 24-bit on a 16-bit TrueHD"    "$(audio_title_false_claims 'TrueHD 24-bit' truehd 6 - '' 16 48000)" "24-bit"
+eq "check: 44.1 kHz on 48 kHz"           "$(audio_title_false_claims 'FLAC 44.1 kHz' flac 2 - '' 16 48000)" "44.1 kHz"
+eq "check: EX 6.1 on 6 channels"         "$(audio_title_false_claims 'Dolby Digital EX 6.1' ac3 6 - 640000 '' 48000)" ""
+eq "check: transcode drops title Atmos"  "$(audio_title_false_claims 'E-AC-3 Atmos' eac3 6 - '' '' '' 1)" "Atmos"
+eq "check: copied E-AC-3 Atmos unknown"  "$(audio_title_false_claims 'E-AC-3 Atmos' eac3 6 - '' '' '')" ""
+eq "facts: CBR / VBR / PCM"              "$(audio_title_stream_facts ac3 - 640000 '' 48000 6)/$(audio_title_stream_facts truehd "$TPA" 3394000 24 48000 8)/$(audio_title_stream_facts pcm_s24le - '' '' 48000 2)/$(audio_title_stream_facts dts 'DTS-HD MA' 1509000 24 48000 6)" \
+   "640000 - 48000/- 24 48000/2304000 24 48000/- 24 48000"
 
 echo
 echo "== unit: audio titles after transcoding"

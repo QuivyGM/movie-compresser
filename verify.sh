@@ -284,8 +284,30 @@ check_track_titles() {
         fi
     fi
 
+    # audio stream facts a title's bit rate / bit depth / sample rate can
+    # be checked against (audio_title_stream_facts; unknown = "")
+    local -A afact=()
+    local ai="" abr="" araw="" asr=""
+    while IFS='=' read -r k v; do
+        v="${v%$'\r'}"
+        case "$k" in
+            index)               [[ -n "$ai" ]] && afact[$ai]="$abr|$araw|$asr"; ai="$v" abr="" araw="" asr="" ;;
+            bit_rate)            abr="$v" ;;
+            bits_per_raw_sample) araw="$v" ;;
+            sample_rate)         asr="$v" ;;
+        esac
+    done < <(ffprobe -v error -select_streams a -show_entries stream=index,bit_rate,bits_per_raw_sample,sample_rate \
+        -of default=nw=1 "$file" 2>/dev/null)
+    [[ -n "$ai" ]] && afact[$ai]="$abr|$araw|$asr"
+
     # audio: every track against its standard title
+    local fn fb fr unk
     while IFS=$'\t' read -r -a f; do
+        IFS='|' read -r abr araw asr <<< "${afact[${f[0]}]:-||}"
+        read -r fn fb fr <<< "$(audio_title_stream_facts "${f[2]}" "${f[3]}" "$abr" "$araw" "$asr" "${f[4]}")"
+        [[ "$fn" == - ]] && fn=""
+        [[ "$fb" == - ]] && fb=""
+        [[ "$fr" == - ]] && fr=""
         ((an += 1))
         new=$(audio_std_title "${f[12]}" "${f[2]}" "${f[3]}" "${f[4]}" "${f[5]}" "${f[13]}" \
             "${f[8]}" "${f[9]}" "${f[10]}" 1)
@@ -300,6 +322,10 @@ check_track_titles() {
         obj=$(audio_object_kind "${f[2]}" "${f[3]}" "${f[13]}")
         [[ "$obj" == *"(per track title)"* ]] &&
             note+="; ${obj%% (*} named only in the title (the stream does not report it; kept, not confirmed)"
+        [[ "${f[2]}" =~ ^(ac3|eac3)$ ]] && audio_title_ex "${f[13]}" &&
+            note+="; Dolby Digital EX named only in the title (the stream flag is not read; kept, not confirmed)"
+        unk=$(audio_title_unverified "${f[13]}" "${f[2]}" "${f[4]}" "${f[3]}" "$fn" "$fb" "$fr")
+        [[ -n "$unk" ]] && note+="; UNKNOWN (cannot be checked against the stream): $unk"
 
         if [[ "${f[13]}" == "$new" ]]; then
             row "Audio $an" "$label | \"${f[13]}\" - STANDARD${note}"
@@ -308,9 +334,9 @@ check_track_titles() {
         if [[ "${f[13]}" == "-" ]]; then
             row "Audio $an" "$label | no title - MISSING${note}"
         else
-            claims=$(audio_title_false_claims "${f[13]}" "${f[2]}" "${f[4]}" "${f[3]}")
+            claims=$(audio_title_false_claims "${f[13]}" "${f[2]}" "${f[4]}" "${f[3]}" "$fn" "$fb" "$fr")
             if [[ -n "$claims" ]]; then
-                row "Audio $an" "$label | \"${f[13]}\" - STALE (the track is not: $claims)${note}"
+                row "Audio $an" "$label | \"${f[13]}\" - STALE (INCORRECT per the stream: $claims)${note}"
             else
                 row "Audio $an" "$label | \"${f[13]}\" - NOT STANDARD${note}"
             fi

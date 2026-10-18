@@ -1233,7 +1233,14 @@ item_verify_output() {
         exp_titles+=("$et")
 
         claims=""
-        [[ "$ot" != "-" ]] && claims=$(audio_title_false_claims "$ot" "$oc" "$och" "$op")
+        # judged against the output: AC-3 has its planned constant rate;
+        # TRANSCODED=1: object audio is gone
+        if [[ "$ot" != "-" ]]; then
+            local tnbr=""
+            [[ "$oc" == ac3 && "${p_kbps[$i]:-}" =~ ^[0-9]+$ ]] && tnbr=$(( p_kbps[$i] * 1000 ))
+            claims=$(audio_title_false_claims "$ot" "$oc" "$och" "$op" "$tnbr" "" \
+                "$( (( i < ${#O_A[@]} )) && _field "${O_A[$i]}" 14)" 1)
+        fi
 
         if [[ -n "$claims" ]]; then
             _rep "Audio $((i + 1)) title" "STALE: \"$ot\" claims $claims" >&3
