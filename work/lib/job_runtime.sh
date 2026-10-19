@@ -43,9 +43,11 @@
 # (not deleted) when the job is interrupted. Custom CRF never retries.
 #
 # A CRF encode records its final CRF and tier in the output as the
-# global MKV tags COMPRESSION_CRF / COMPRESSION_TIER (item_tag_compression,
-# just before the verification; stream copies and two-pass encodes get
-# none).
+# global MKV tags COMPRESSION_CRF / COMPRESSION_TIER, together with
+# COMPRESSION_TOOL=movie-compresser, MOVIE_COMPRESSER_VERSION (the Git
+# version taken once when the job was generated: JOB_COMPRESSER_VERSION)
+# and COMPRESSION_DATE (item_tag_compression, just before the
+# verification; stream copies and two-pass encodes get none).
 #
 # Outputs are written to "<output>.part" and only renamed to the final
 # name after ffmpeg succeeded and the result passed a duration check, so
@@ -73,6 +75,12 @@ job_init() {
     JOB_TYPE="$2"
     JOB_ITEMS="$3"
     JOB_WORK="$4"
+    # set by the job header (emit_job_header); job scripts of earlier
+    # versions have none: taken now, still once for the whole job
+    if [[ -z "${JOB_COMPRESSER_VERSION:-}" ]]; then
+        JOB_COMPRESSER_VERSION=unknown
+        declare -F compresser_version > /dev/null && JOB_COMPRESSER_VERSION=$(compresser_version)
+    fi
 
     JOB_STATE="$JOB_WORK/$JOB_SESSION.state"
     JOB_PROGRESS="$JOB_WORK/$JOB_SESSION.progress"
@@ -148,6 +156,7 @@ job_write_state() {
         printf 'updated=%s\n' "$(date +%s)"
         printf 'progress=%s\n' "$JOB_PROGRESS"
         printf 'log_dir=%s\n' "$JOB_LOG_DIR"
+        printf 'compresser_version=%s\n' "$JOB_COMPRESSER_VERSION"
     } > "$tmp" 2>/dev/null &&
     mv -f "$tmp" "$JOB_STATE" 2>/dev/null
 
@@ -539,24 +548,31 @@ item_restore_mkv_chapters() {
 # item_tag_compression
 #
 # Records the CRF of the accepted encode in "$ITEM_PART" as the global
-# MKV tags COMPRESSION_CRF / COMPRESSION_TIER (mkv_set_compression_tags;
-# all other tags kept). Only for CRF encodes (ITEM_EXP[mode]=crf):
-# stream copies and two-pass encodes get no CRF. Called by
+# MKV tags COMPRESSION_CRF / COMPRESSION_TIER, with the provenance tags
+# COMPRESSION_TOOL / MOVIE_COMPRESSER_VERSION (JOB_COMPRESSER_VERSION,
+# the same for every item and attempt of the job) / COMPRESSION_DATE
+# (today, UTC) (mkv_set_compression_tags; all other tags kept, earlier
+# values of these names replaced, so each is stored once). Only for CRF
+# encodes (ITEM_EXP[mode]=crf): stream copies and two-pass encodes get
+# no CRF. Called by
 # item_succeeded once ITEM_EXP[crf] is final (after every CRF retry /
 # season decision) and after the last remux / restore step (covers,
 # chapters); what follows (verification, rename, statistics refresh)
 # leaves global tags alone. A failure is a warning only: the encode is
 # unchanged.
 item_tag_compression() {
-    local crf="${ITEM_EXP[crf]:-}" tier rc
+    local crf="${ITEM_EXP[crf]:-}" tier rc date
+    local version="${JOB_COMPRESSER_VERSION:-unknown}"
 
     [[ "${ITEM_EXP[mode]:-}" == crf ]] || return 0
     [[ "${ITEM_OUTPUT,,}" == *.mkv ]] || return 0
 
     tier=$(compression_tier_name "$ITEM_TIER")
+    date=$(compression_date_now)
 
-    echo "Recording compression tags: COMPRESSION_CRF=$crf${tier:+ COMPRESSION_TIER=$tier}"
-    mkv_set_compression_tags "$ITEM_PART" "$crf" "$tier" "$ITEM_TMP" >> "$ITEM_LOG" 2>&1
+    echo "Recording compression tags: COMPRESSION_CRF=$crf${tier:+ COMPRESSION_TIER=$tier}" \
+        "MOVIE_COMPRESSER_VERSION=$version COMPRESSION_DATE=$date"
+    mkv_set_compression_tags "$ITEM_PART" "$crf" "$tier" "$ITEM_TMP" "$version" "$date" >> "$ITEM_LOG" 2>&1
     rc=$?
     if (( rc != 0 )); then
         cat -- "$ITEM_TMP/mkvpropedit_tags.log" >> "$ITEM_LOG" 2>/dev/null

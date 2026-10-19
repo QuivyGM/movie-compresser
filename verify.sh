@@ -14,13 +14,19 @@
 #                      COMPRESSION_CRF / COMPRESSION_TIER written or
 #                      corrected from the job records in work/logs
 #                      (never guessed; see backfill_compression_tags).
+#                      The provenance tags (COMPRESSION_TOOL /
+#                      MOVIE_COMPRESSER_VERSION / COMPRESSION_DATE) are
+#                      never written or changed here: only an encode
+#                      records them.
 #                      Track titles that are wrong are corrected
 #                      (check_track_titles; track names only).
 #
-# Both modes report the COMPRESSION_CRF / COMPRESSION_TIER tags ("not
-# recorded" when absent, never a failure) and check the audio / video
-# track titles against the actual streams (check_track_titles). Verify
-# never modifies a file.
+# Both modes report the compression tags (compression tool, compressor
+# version, compression date, tier, CRF; "Not recorded" when absent, never
+# a failure: outputs of earlier versions have none), flag compression
+# tags stored more than once with different values (MKVToolNix), and
+# check the audio / video track titles against the actual streams
+# (check_track_titles). Verify never modifies a file.
 #
 # Recursive, so series folders are included. Non-MKV files are only
 # inspected; mkvpropedit is never run on them.
@@ -183,12 +189,25 @@ inspect_file() {
             *)         row "Video encode" "x265 ${rc}" ;;
         esac
     fi
-    # COMPRESSION_CRF / COMPRESSION_TIER tags (report only; outputs of
-    # earlier versions have none and still verify normally)
-    local cname cval
+    # compression tags (report only; outputs of earlier versions have
+    # none or only some and still verify normally)
+    local cname cval ckind
     while IFS=$'\t' read -r cname cval; do
         row "$cname" "$cval"
     done < <(compression_tag_lines "$file")
+    # a compression tag stored more than once (needs MKVToolNix; ffprobe
+    # shows only one value per name)
+    if is_mkv "$file"; then
+        while IFS=$'\t' read -r cname ckind cval; do
+            [[ -n "$cname" ]] || continue
+            if [[ "$ckind" == conflict ]]; then
+                row "Tag conflict" "$cname stored with different values ($cval) - CHECK REQUIRED"
+                ((CHECK_REQUIRED++))
+            else
+                row "Tag duplicate" "$cname stored more than once with the same value ($cval)"
+            fi
+        done < <(compression_tag_duplicates "$file")
+    fi
     probe_hdr "$file" "$vidx"
     row "Dynamic range" "$(hdr_description)"
     row "Video" "$(rate_size "$vbytes" "$dur" "$approx")"
@@ -532,7 +551,11 @@ update_and_check() {
 # from the job records in work/logs (compression_record_lookup; the
 # packet-scanned VIDEO_BYTES identify the encode). Without a matching
 # record nothing is written (no value is guessed). Tags that already
-# hold the recorded values are not rewritten.
+# hold the recorded values are not rewritten. The provenance tags
+# (MOVIE_COMPRESSER_VERSION etc.) are left exactly as they are
+# (mkv_set_compression_tags without VERSION): the version of the encode
+# is history, not the version running this check, and none is invented
+# for an output of an earlier version.
 backfill_compression_tags() {
     local file="$1" vbytes="$2" rec rc crf tier from ccrf ctier what
 

@@ -16,18 +16,26 @@ Only the EBML header, SeekHead(s), Info, Tracks and Tags are read; Clusters
 (the audio / video data) are skipped by their size, never read. A file
 without a SeekHead gets one bounded tail scan. Files are opened read-only.
 """
+import datetime
 import os
+import re
 import sys
 
 # Element IDs (with their length marker, as written in the file)
 EBML, DOC_TYPE = 0x1A45DFA3, 0x4282
 SEGMENT, SEEK_HEAD, SEEK, SEEK_ID, SEEK_POSITION = 0x18538067, 0x114D9B74, 0x4DBB, 0x53AB, 0x53AC
-INFO, MUXING_APP, WRITING_APP = 0x1549A966, 0x4D80, 0x5741
+INFO, MUXING_APP, WRITING_APP, DATE_UTC = 0x1549A966, 0x4D80, 0x5741, 0x4461
 TRACKS, TRACK_ENTRY, TRACK_UID, TRACK_TYPE = 0x1654AE6B, 0xAE, 0x73C5, 0x83
+TRACK_NUMBER, CODEC_ID, CODEC_PRIVATE, TRACK_NAME = 0xD7, 0x86, 0x63A2, 0x536E
+LANGUAGE, LANGUAGE_BCP47, FLAG_DEFAULT, FLAG_FORCED = 0x22B59C, 0x22B59D, 0x88, 0x55AA
+VIDEO, PIXEL_WIDTH, PIXEL_HEIGHT, AUDIO, CHANNELS = 0xE0, 0xB0, 0xBA, 0xE1, 0x9F
+TRACK_TYPES = {1: "video", 2: "audio", 17: "subtitle", 16: "logo", 18: "buttons", 32: "control", 33: "metadata"}
+MATROSKA_EPOCH = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
 CLUSTER = 0x1F43B675
 TAGS, TAG, TARGETS, SIMPLE_TAG, TAG_NAME, TAG_STRING = 0x1254C367, 0x7373, 0x63C0, 0x67C8, 0x45A3, 0x4487
 TAG_TRACK_UID, OTHER_TARGET_UIDS = 0x63C5, (0x63C9, 0x63C4, 0x63C6)   # edition, chapter, attachment
 VOID, CRC32 = 0xEC, 0xBF
+ELEMENT_NAMES = {SEEK_HEAD: "SeekHead", INFO: "Info", TRACKS: "Tracks", TAGS: "Tags"}
 
 # I/O limits: whatever a file claims, no more than this is ever read
 MAX_HEADER, MAX_SEEK_HEAD, MAX_INFO = 64 << 10, 256 << 10, 1 << 20
@@ -36,6 +44,9 @@ MAX_TOP_LEVEL_WALK, MAX_SEEK_TARGETS, TAIL_SCAN, MAX_VALUE_CHARS = 64, 64, 1 << 
 UNKNOWN = None   # unknown element size (live / streaming muxing)
 
 FIELDS = [   # (CompressionInfo attribute, label)
+    ("tool", "Compression tool"),
+    ("version", "Compressor version"),
+    ("date", "Compression date"),
     ("tier", "Compression tier"),
     ("crf", "Compression CRF"),
     ("video_encoder", "Video encoder"),
@@ -43,6 +54,11 @@ FIELDS = [   # (CompressionInfo attribute, label)
     ("writing_app", "Writing application"),
     ("muxing_app", "Muxing application"),
 ]
+# global tags written by mkv_set_compression_tags -> CompressionInfo attribute
+# (the first global value counts, as in the scripts)
+GLOBAL_FIELDS = {"COMPRESSION_TOOL": "tool", "MOVIE_COMPRESSER_VERSION": "version", "COMPRESSION_DATE": "date",
+                 "COMPRESSION_TIER": "tier", "COMPRESSION_CRF": "crf"}
+LABEL_WIDTH = 22
 NOT_RECORDED = "Not recorded"
 USAGE = "usage: viewer.py [--stats] [--pause] FILE..."
 EXIT_OK, EXIT_NOT_MATROSKA, EXIT_USAGE, EXIT_UNREADABLE = 0, 1, 2, 3
@@ -55,6 +71,9 @@ class CompressionInfo:
     def __init__(self):
         self.is_matroska = False
         self.tags_found = False
+        self.tool = ""            # global COMPRESSION_TOOL (movie-compresser)
+        self.version = ""         # global MOVIE_COMPRESSER_VERSION (Git version of the encode job)
+        self.date = ""            # global COMPRESSION_DATE (YYYY-MM-DD, UTC)
         self.crf = ""             # global COMPRESSION_CRF
         self.tier = ""            # global COMPRESSION_TIER
         self.video_encoder = ""   # ENCODER of the first video track
@@ -63,10 +82,50 @@ class CompressionInfo:
         self.muxing_app = ""
         self.bytes_read = 0
         self.error = ""
+        # for validation (same bounded reads)
+        self.file_size = 0
+        self.date_utc = None      # Segment Info DateUTC (muxing date)
+        self.tracks = []          # Track, in file order
+        self.global_tags = {}     # upper-case name -> every value of global SimpleTags
+        self.misplaced = []       # (name, value) of compression tags with a track / edition / ... target
+        self.damaged = []         # structural problems met while reading
 
     @property
     def video_stream_size(self):
         return format_byte_size(self.video_bytes) if self.video_bytes is not None else ""
+
+
+class Track:
+    """One TrackEntry (only fields the validation looks at)."""
+
+    def __init__(self):
+        self.number = self.uid = 0
+        self.type = ""            # video / audio / subtitle / ...
+        self.codec_id = ""        # e.g. V_MPEGH/ISO/HEVC, A_AC3
+        self.name = ""            # track title
+        self.language = "eng"     # Matroska default when the element is absent
+        self.default = True
+        self.forced = False
+        self.width = self.height = self.channels = 0
+        self.x265 = {}            # encoder settings x265 stores in CodecPrivate (rc, crf, bitrate, ...)
+        self.x265_version = ""
+        self.tags = {}            # upper-case name -> value of tags targeting this track
+
+
+X265_SETTINGS = re.compile(rb"x265 \(build \d+\) - ([\x20-\x7e]{1,200}?) - H\.265/HEVC codec[\x20-\x7e]{0,400}?options: "
+                           rb"([\x20-\x7e]{1,8000})")
+
+
+def parse_x265_settings(private):
+    """(version, {option: value}) from the x265 info SEI in CodecPrivate."""
+    m = X265_SETTINGS.search(private)
+    if not m:
+        return "", {}
+    opts = {}
+    for token in m.group(2).decode("ascii", "replace").split():
+        key, sep, value = token.partition("=")
+        opts[key] = value if sep else "1"
+    return m.group(1).decode("ascii", "replace"), opts
 
 
 def format_byte_size(n):
@@ -168,7 +227,9 @@ class _Reader:
         return (r[0], off + s[1], s[0]) if s else None
 
     def payload(self, h, limit):
-        _, pos, size = h
+        id_, pos, size = h
+        if size is not UNKNOWN and pos + size > self.size and id_ in ELEMENT_NAMES:
+            self.info.damaged.append(f"{ELEMENT_NAMES[id_]} element extends past the end of the file (truncated)")
         if size is UNKNOWN or size > limit or pos + size > self.size:
             return None
         data = self.read(pos, size)
@@ -178,6 +239,7 @@ class _Reader:
 class _Parser:
     def __init__(self, f, info):
         self.r, self.info = _Reader(f, info), info
+        info.file_size = self.r.size
         self.seg_data = self.seg_end = 0
         self.seek_head_seen = False
         self.visited, self.pending = set(), set()
@@ -274,18 +336,51 @@ class _Parser:
                 self.info.muxing_app = text(v)
             elif i == WRITING_APP and not self.info.writing_app:
                 self.info.writing_app = text(v)
+            elif i == DATE_UTC and len(v) == 8 and self.info.date_utc is None:
+                ns = int.from_bytes(v, "big", signed=True)
+                self.info.date_utc = MATROSKA_EPOCH + datetime.timedelta(microseconds=ns // 1000)
 
     def tracks(self, buf):
-        if self.video_uid is not None:
+        if self.info.tracks:
             return
         for i, entry in safe_children(buf):
             if i != TRACK_ENTRY:
                 continue
-            fields = dict(safe_children(entry))
-            uid, kind = uint(fields.get(TRACK_UID, b"")), uint(fields.get(TRACK_TYPE, b""))
-            if kind == 1 and uid:   # first video track
-                self.video_uid = uid
-                return
+            t = Track()
+            bcp47 = ""   # LanguageBCP47 wins over Language when both are present
+            for j, v in safe_children(entry):
+                if j == TRACK_NUMBER:
+                    t.number = uint(v)
+                elif j == TRACK_UID:
+                    t.uid = uint(v)
+                elif j == TRACK_TYPE:
+                    t.type = TRACK_TYPES.get(uint(v), f"type {uint(v)}")
+                elif j == CODEC_ID:
+                    t.codec_id = text(v)
+                elif j == TRACK_NAME:
+                    t.name = text(v)
+                elif j == LANGUAGE:
+                    t.language = text(v) or t.language
+                elif j == LANGUAGE_BCP47:
+                    bcp47 = text(v)
+                elif j == FLAG_DEFAULT:
+                    t.default = bool(uint(v))
+                elif j == FLAG_FORCED:
+                    t.forced = bool(uint(v))
+                elif j == CODEC_PRIVATE:
+                    t.x265_version, t.x265 = parse_x265_settings(bytes(v))
+                elif j in (VIDEO, AUDIO):
+                    for k, w in safe_children(v):
+                        if k == PIXEL_WIDTH:
+                            t.width = uint(w)
+                        elif k == PIXEL_HEIGHT:
+                            t.height = uint(w)
+                        elif k == CHANNELS:
+                            t.channels = uint(w)
+            t.language = bcp47 or t.language
+            self.info.tracks.append(t)
+            if t.type == "video" and t.uid and self.video_uid is None:   # first video track
+                self.video_uid = t.uid
 
     def tags(self, buf):
         """A Tag is global when its Targets name no track / edition / chapter /
@@ -316,16 +411,22 @@ class _Parser:
                         simple.append((name.upper(), value))
             for name, value in simple:
                 if global_:
-                    if name == "COMPRESSION_CRF" and not self.info.crf:
-                        self.info.crf = value
-                    elif name == "COMPRESSION_TIER" and not self.info.tier:
-                        self.info.tier = value
-                elif len(track_uids) == 1 and track_uids[0]:
+                    self.info.global_tags.setdefault(name, []).append(value)
+                    attr = GLOBAL_FIELDS.get(name)
+                    if attr and not getattr(self.info, attr):
+                        setattr(self.info, attr, value)
+                    continue
+                if name.startswith("COMPRESSION_") or name in GLOBAL_FIELDS:
+                    self.info.misplaced.append((name, value))
+                if len(track_uids) == 1 and track_uids[0]:
                     self.track_tags.append((track_uids[0], name, value))
 
     def apply_track_tags(self):
-        """Tags may come before Tracks: matched to the video track last."""
+        """Tags may come before Tracks: matched to the tracks last."""
+        by_uid = {t.uid: t for t in self.info.tracks if t.uid}
         for uid, name, value in self.track_tags:
+            if uid in by_uid:
+                by_uid[uid].tags.setdefault(name, value)
             if uid != self.video_uid:
                 continue
             if name == "ENCODER" and not self.info.video_encoder:
@@ -375,10 +476,10 @@ def describe(path, info, stats=False):
     elif not info.is_matroska:
         lines.append("  Error: not a Matroska file (no valid EBML header / Segment)")
     else:
-        lines += [f"  {label + ':':<21}{getattr(info, attr) or NOT_RECORDED}" for attr, label in FIELDS]
+        lines += [f"  {label + ':':<{LABEL_WIDTH}}{getattr(info, attr) or NOT_RECORDED}" for attr, label in FIELDS]
     if stats:
-        lines.append(f"  {'Tags element found:':<21}{'yes' if info.tags_found else 'no'}")
-        lines.append(f"  {'Bytes read:':<21}{info.bytes_read}")
+        lines.append(f"  {'Tags element found:':<{LABEL_WIDTH}}{'yes' if info.tags_found else 'no'}")
+        lines.append(f"  {'Bytes read:':<{LABEL_WIDTH}}{info.bytes_read}")
     return lines
 
 

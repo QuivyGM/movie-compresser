@@ -46,7 +46,10 @@
 # 15. COMPRESSION_CRF / COMPRESSION_TIER tags of CRF encodes: the final
 #     CRF (movie High / Base / Quality retries, series shared CRF,
 #     Custom), source tags kept, none for copy / two-pass, verification
-#     report incl. "not recorded" (compression_tag_tests.sh)
+#     report incl. "Not recorded"; the provenance tags COMPRESSION_TOOL /
+#     MOVIE_COMPRESSER_VERSION / COMPRESSION_DATE on every CRF output,
+#     once each, kept by Validate + update (compression_tag_tests.sh);
+#     Git version detection (compresser_version_tests.sh)
 # 16. audio pipeline: layout planning (AC-3 / E-AC-3 / AAC; surround
 #     relabels by explicit channelmap; layouts that would change
 #     channels copied), source -> output audio index, one codec option
@@ -890,7 +893,7 @@ check "sdr: report: two-pass mode"             "grep -q 'Video encode mode: *two
 check "sdr: stream is x265 two-pass"           "report_has sdr 'Video stream: +AS PLANNED \\(hevc 1280x720 yuv420p10le, two-pass 1500 kb/s\\)'"
 check "verify.sh: x265 rate control read"      "[[ \"\$(x265_rate_control '$T/out/sdr.mkv' 0)\" == '2pass 1500' ]]"
 check "sdr: pane shows pass 1/2 and 2/2"       "grep -q 'PASS 1/2' '$T/sdr.log' && grep -q 'PASS 2/2' '$T/sdr.log'"
-check "sdr: two-pass: compression CRF not recorded" "report_has sdr 'Compression CRF: +not recorded\$' && report_has sdr 'Compression tier: +not recorded\$'"
+check "sdr: two-pass: compression CRF not recorded" "report_has sdr 'Compression CRF: +Not recorded\$' && report_has sdr 'Compression tier: +Not recorded\$' && report_has sdr 'Compressor version: +Not recorded\$'"
 
 # crf_job_checks NAME CRF  ->  single-pass CRF job: no -b:v, no passes
 crf_job_checks() {
@@ -934,11 +937,12 @@ check "sdrcrf: HDR type SDR"                   "report_has sdrcrf 'HDR type: +SD
 if (( HAVE_MKV == 1 )); then
     check "sdrcrf: COMPRESSION_CRF tag reported" "report_has sdrcrf 'Compression CRF: +24\$'"
     eq    "sdrcrf: COMPRESSION_CRF tag in output" "$(compression_tags "$T/out/sdrcrf.mkv" | cut -f1)" 24
+    check "sdrcrf: provenance reported"          "report_has sdrcrf 'Compression tool: +movie-compresser\$' && report_has sdrcrf 'Compressor version: +[^ ]+\$' && report_has sdrcrf 'Compression date: +[0-9]{4}-[0-9]{2}-[0-9]{2}\$'"
 else
-    check "sdrcrf: no mkvtoolnix: CRF not recorded, job ok" "report_has sdrcrf 'Compression CRF: +not recorded\$'"
+    check "sdrcrf: no mkvtoolnix: CRF not recorded, job ok" "report_has sdrcrf 'Compression CRF: +Not recorded\$'"
 fi
 # tier "Test" is not a menu tier: no COMPRESSION_TIER
-check "sdrcrf: compression tier not recorded"  "report_has sdrcrf 'Compression tier: +not recorded\$'"
+check "sdrcrf: compression tier not recorded"  "report_has sdrcrf 'Compression tier: +Not recorded\$'"
 eq    "sdrcrf: copied audio 1 standard title"  "$(out_title sdrcrf 0)" "$A0_STD"
 check "25 sdrcrf: estimated size reported"     "grep -q 'Estimated video size: ' '$T/sdrcrf.log'"
 check "25 sdrcrf: estimate error reported"     "grep -qE 'Estimate error: +[-+][0-9]+\\.[0-9]%' '$T/sdrcrf.log'"
@@ -2310,12 +2314,20 @@ FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/audio_pipeline.out")))
 while IFS= read -r s; do SKIPPED+=("${s#skipped: }"); done < <(grep '^skipped: ' "$T/audio_pipeline.out")
 
 echo
-echo "== COMPRESSION_CRF / COMPRESSION_TIER output tags (compression_tag_tests.sh)"
+echo "== compression / provenance output tags (compression_tag_tests.sh)"
 bash "$SRC_WORK/tests/compression_tag_tests.sh" > "$T/compression_tags.out" 2>&1
 grep -E '^  (ok|FAIL) ' "$T/compression_tags.out"
 PASS=$((PASS + $(grep -c '^  ok ' "$T/compression_tags.out")))
 FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/compression_tags.out")))
 while IFS= read -r s; do SKIPPED+=("${s#skipped: }"); done < <(grep '^skipped: ' "$T/compression_tags.out")
+
+echo
+echo "== movie-compresser Git version detection (compresser_version_tests.sh)"
+bash "$SRC_WORK/tests/compresser_version_tests.sh" > "$T/compresser_version.out" 2>&1
+grep -E '^  (ok|FAIL) ' "$T/compresser_version.out"
+PASS=$((PASS + $(grep -c '^  ok ' "$T/compresser_version.out")))
+FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/compresser_version.out")))
+while IFS= read -r s; do SKIPPED+=("${s#skipped: }"); done < <(grep '^skipped: ' "$T/compresser_version.out")
 
 echo
 echo "============================================================"

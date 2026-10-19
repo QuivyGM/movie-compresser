@@ -46,15 +46,31 @@ def ebml_header():
               + s(0x4282, "matroska") + uint(0x4287, 4) + uint(0x4285, 2))
 
 
-def info(writing="mkvmerge v88.0 ('All I Know') 64-bit", muxing="libebml v1.4.5 + libmatroska v1.7.1"):
-    return el(INFO, uint(0x2AD7B1, 1000000) + s(0x4D80, muxing) + s(0x5741, writing))
+def info(writing="mkvmerge v88.0 ('All I Know') 64-bit", muxing="libebml v1.4.5 + libmatroska v1.7.1", date_ns=None):
+    date = el(0x4461, date_ns.to_bytes(8, "big", signed=True)) if date_ns is not None else b""
+    return el(INFO, uint(0x2AD7B1, 1000000) + s(0x4D80, muxing) + s(0x5741, writing) + date)
 
 
-def tracks():
+def x265_private(options):
+    """hvcC-like CodecPrivate holding the x265 info SEI text (as libx265 writes it)."""
+    sei = (b"x265 (build 215) - 4.1+1-1d117be:[Linux][GCC 13.3.0][64 bit] 10bit - H.265/HEVC codec - "
+           b"Copyright 2013-2018 (c) Multicoreware, Inc - http://x265.org - options: " + options.encode() + b"\x00\x80")
+    return b"\x01\x02\x20\x00\x00\x00\x90\x00\x00\x00\x00\x00\x99\xf0\x00\xfc\xfd\xfa\xfa\x00\x0f\x04" + sei
+
+
+def tracks(x265=None, audio_title=None):
+    private = el(0x63A2, x265_private(x265)) if x265 else b""
     video = el(0xAE, uint(0xD7, 1) + uint(0x73C5, VIDEO_UID) + uint(0x83, 1) + s(0x86, "V_MPEGH/ISO/HEVC")
-               + el(0xE0, uint(0xB0, 320) + uint(0xBA, 240)))
-    audio = el(0xAE, uint(0xD7, 2) + uint(0x73C5, AUDIO_UID) + uint(0x83, 2) + s(0x86, "A_AC3"))
+               + private + el(0xE0, uint(0xB0, 320) + uint(0xBA, 240)))
+    title = s(0x536E, audio_title) if audio_title else b""
+    audio = el(0xAE, uint(0xD7, 2) + uint(0x73C5, AUDIO_UID) + uint(0x83, 2) + s(0x86, "A_AC3") + title)
     return el(TRACKS, video + audio)
+
+
+def stats(nbytes, date="2026-10-13 12:00:00"):
+    return [simple("BPS", "6400000"), simple("DURATION", "00:00:01.000000000"), simple("NUMBER_OF_BYTES", str(nbytes)),
+            simple("_STATISTICS_WRITING_APP", "mkvpropedit v88.0"), simple("_STATISTICS_WRITING_DATE_UTC", date),
+            simple("_STATISTICS_TAGS", "BPS DURATION NUMBER_OF_BYTES")]
 
 
 def cluster(payload_len=64):
@@ -181,6 +197,47 @@ def main(out):
 
     write(out, "garbage.mkv", os.urandom(4096))
     write(out, "empty.mkv", b"")
+
+    # validation cases (compression tags vs x265 settings, statistics, titles)
+    def ns(text):   # "2026-10-13 12:00:00" -> Matroska DateUTC
+        import datetime
+        t = datetime.datetime.fromisoformat(text).replace(tzinfo=datetime.timezone.utc)
+        return int((t - datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)).total_seconds()) * 10**9
+
+    def valid_case(name, x265, glob, date_ns=None, stats_date="2026-10-13 12:00:00", title="English | AC-3 | 5.1"):
+        body_v = [info(date_ns=date_ns), tracks(x265=x265, audio_title=title)]
+        t = tags(track_tag(VIDEO_UID, simple("ENCODER", "Lavc61 libx265"), *stats(100, stats_date)),
+                 track_tag(AUDIO_UID, *stats(50, stats_date)), *glob)
+        write(out, name, head + segment(body_v, cluster(), [(TAGS, t)]))
+
+    crf_tags = lambda crf, tier: global_ttv50(simple("COMPRESSION_CRF", crf), simple("COMPRESSION_TIER", tier))  # noqa: E731
+    valid_case("valid_ok.mkv", "rc=crf crf=22.0 qcomp=0.60", [crf_tags("22", "Base")], date_ns=ns("2026-10-13 11:59:00"))
+    valid_case("crf_mismatch.mkv", "rc=crf crf=20.0 qcomp=0.60", [crf_tags("23.5", "Compact")])
+    valid_case("x265_untagged.mkv", "rc=crf crf=24.0", [])
+    valid_case("twopass_with_crf.mkv", "rc=abr bitrate=4000 stats-read=2", [crf_tags("22", "Base")])
+    valid_case("stats_outdated.mkv", "rc=crf crf=22.0", [crf_tags("22", "Base")],
+               date_ns=ns("2026-10-15 08:00:00"), stats_date="2026-10-13 12:00:00")
+    valid_case("conflicting_tags.mkv", "rc=crf crf=22.0",
+               [crf_tags("22", "Base"), global_empty_targets(simple("COMPRESSION_CRF", "26"))])
+    valid_case("bad_values.mkv", None, [crf_tags("twenty", "Ultra")], title=None)
+    valid_case("tier_without_crf.mkv", None, [global_ttv50(simple("COMPRESSION_TIER", "High"))])
+
+    # provenance tags (COMPRESSION_TOOL / MOVIE_COMPRESSER_VERSION /
+    # COMPRESSION_DATE), laid out as mkv_set_compression_tags writes them
+    def prov_tags(version="v1.4.2-5-ga3f8c21-dirty", date="2026-10-19", tool="movie-compresser", crf="23", tier="Base"):
+        named = (("COMPRESSION_TOOL", tool), ("MOVIE_COMPRESSER_VERSION", version), ("COMPRESSION_DATE", date),
+                 ("COMPRESSION_CRF", crf), ("COMPRESSION_TIER", tier))
+        return global_ttv50(*(simple(n, v) for n, v in named if v is not None))
+
+    valid_case("provenance_current.mkv", "rc=crf crf=23.0 qcomp=0.60", [prov_tags()], date_ns=ns("2026-10-13 11:59:00"))
+    valid_case("provenance_conflict.mkv", "rc=crf crf=23.0",
+               [prov_tags(), global_empty_targets(simple("MOVIE_COMPRESSER_VERSION", "v1.3.0"))])
+    valid_case("provenance_ffmpeg_version.mkv", "rc=crf crf=23.0", [prov_tags(version="Lavf61.7.100")])
+    valid_case("provenance_partial.mkv", "rc=crf crf=23.0", [prov_tags(tool=None, date="19/10/2026")])
+    valid_case("provenance_unknown.mkv", "rc=crf crf=23.0", [prov_tags(version="unknown")])
+    # a version on a track is not the file's
+    valid_case("provenance_on_track.mkv", "rc=crf crf=22.0",
+               [crf_tags("22", "Base"), track_tag(VIDEO_UID, simple("MOVIE_COMPRESSER_VERSION", "v9.9.9"))])
 
     # 256 MiB cluster before the Tags: proves clusters are skipped, not read
     big_len = 256 * 1024 * 1024

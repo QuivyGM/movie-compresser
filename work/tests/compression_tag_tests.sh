@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# COMPRESSION_CRF / COMPRESSION_TIER output tags
+# COMPRESSION_CRF / COMPRESSION_TIER output tags and the provenance tags
+# COMPRESSION_TOOL / MOVIE_COMPRESSER_VERSION / COMPRESSION_DATE
 # (encode_common.sh mkv_set_compression_tags, job_runtime.sh
-# item_tag_compression, media_probe.sh compression_tags / compression_tag_lines,
-# verify.sh).
+# item_tag_compression, media_probe.sh compression_tags / compression_provenance /
+# compression_tag_lines, verify.sh). Version detection itself:
+# compresser_version_tests.sh.
 #
 #   bash ~/compress/work/tests/compression_tag_tests.sh
 #
@@ -12,7 +14,13 @@
 # The tags carry the FINAL CRF (after the CRF retries / season decision),
 # are written before the verification and survive the rename to the
 # final name; source tags stay; stream copies and two-pass encodes get
-# none. A tag write that would lose other tags is undone.
+# none. A tag write that would lose other tags is undone. Every CRF
+# output (movie Quality / High / Base / Compact / Custom, series High /
+# Base / Compact / Custom, scaled or not) also gets the provenance tags:
+# the version taken when the job was generated (not when an item ends),
+# today's UTC date, each name once, earlier / source values replaced.
+# Without a version (Validate + update) existing provenance is kept and
+# none is added.
 # Part 2 (no media tools): the verification report lines (ffprobe
 # stand-in): values, "not recorded" for outputs of earlier versions.
 # Part 3 (needs ffmpeg): verify.sh on an output without the tags (earlier
@@ -51,6 +59,12 @@ WORK_DIR="$W"
 for l in ui media_probe media_stats bitrate encode_common hdr_dovi policy naming job_runtime; do
     source "$W/lib/$l.sh" > /dev/null
 done
+# the version the generated jobs record (emit_job_header); the jobs
+# themselves would detect something else (see STUBS)
+TV="v1.4.2-5-ga3f8c21-dirty"
+compresser_version() { echo "$TV"; }
+TD=$(date -u +%Y-%m-%d)
+PROV="COMPRESSION_TOOL=movie-compresser MOVIE_COMPRESSER_VERSION=$TV COMPRESSION_DATE=$TD "
 
 # real tools (parts 3 / 4) are looked up before the stand-ins shadow them
 HAVE_FFMPEG=0
@@ -170,6 +184,18 @@ OLD_TAGS="${SRC_TAGS%</Tags>}"'  <Tag>
       <TargetTypeValue>50</TargetTypeValue>
     </Targets>
     <Simple>
+      <Name>COMPRESSION_TOOL</Name>
+      <String>movie-compresser</String>
+    </Simple>
+    <Simple>
+      <Name>MOVIE_COMPRESSER_VERSION</Name>
+      <String>v0.9.0</String>
+    </Simple>
+    <Simple>
+      <Name>COMPRESSION_DATE</Name>
+      <String>2025-01-01</String>
+    </Simple>
+    <Simple>
       <Name>COMPRESSION_CRF</Name>
       <String>30</String>
     </Simple>
@@ -178,8 +204,15 @@ OLD_TAGS="${SRC_TAGS%</Tags>}"'  <Tag>
       <String>Base</String>
     </Simple>
   </Tag>
+  <Tag>
+    <Targets />
+    <Simple>
+      <Name>MOVIE_COMPRESSER_VERSION</Name>
+      <String>v0.8.0</String>
+    </Simple>
+  </Tag>
 </Tags>'
-for m in High Base Q C Copy Abr New L N; do echo "movie $m" > "$T/in/$m.mkv"; done
+for m in High Base Q C Copy Abr New L N K; do echo "movie $m" > "$T/in/$m.mkv"; done
 printf '%s\n' "$SRC_TAGS" > "$T/src_tags.xml"
 printf '%s\n' "$OLD_TAGS" > "$T/old_tags.xml"
 SRC_LIST="TITLE=Test Movie SOURCE_NOTE=keep me NESTED=child ENCODER=Lavf61.7.100 COMPRESSION_CRF=track-level stays DURATION=00:01:40.000000000 "
@@ -200,6 +233,8 @@ matroska_mux_args()  { :; }
 # (SRCTAGS[ITEM], ffmpeg -map_metadata 0); the verification records the
 # CRF it verified and the COMPRESSION_CRF tag the file had at that time.
 STUBS='
+# a checkout that changed after the job was generated: never asked again
+compresser_version() { echo CHANGED-DURING-JOB; }
 get_duration() { echo 100; }
 media_stream_totals() { local v a c; read -r v a c < "$1"; echo "$v $a"; }
 item_verify_output() {
@@ -255,10 +290,20 @@ eq    "High: COMPRESSION_CRF=21 (not planned 20)" "$(tagval "$T/out/High.mkv" CO
 eq    "High: COMPRESSION_TIER=High"              "$(tagval "$T/out/High.mkv" COMPRESSION_TIER)" High
 eq    "High: tagged before verification"         "$(verified mh)" "1:21:21 "
 check "High: one tag write (accepted attempt only)" "[[ \$(grep -c -- '--tags' '$STUB_LOG') == 1 ]]"
-eq    "High: source tags intact + compression tags" "$(taglist "$T/out/High.mkv")" "${SRC_LIST}COMPRESSION_CRF=21 COMPRESSION_TIER=High "
+eq    "High: source tags intact + compression tags" "$(taglist "$T/out/High.mkv")" "${SRC_LIST}${PROV}COMPRESSION_CRF=21 COMPRESSION_TIER=High "
 eq    "High: track-level COMPRESSION_CRF untouched" "$(tagval "$T/out/High.mkv" COMPRESSION_CRF track)" "track-level stays"
 check "High: pane shows the tags"                "logged mh 'Recording compression tags: COMPRESSION_CRF=21 COMPRESSION_TIER=High'"
 check "High: job ok"                             "logged mh 'All encodes finished: 1 ok, 0 failed'"
+# gcounts FILE  ->  how many global values each compression tag has
+gcounts() { local n; for n in COMPRESSION_TOOL MOVIE_COMPRESSER_VERSION COMPRESSION_DATE COMPRESSION_CRF COMPRESSION_TIER; do printf '%s ' "$(tagval "$1" "$n" | grep -c '')"; done; }
+eq    "High: each compression tag once after the retry" "$(gcounts "$T/out/High.mkv")" "1 1 1 1 1 "
+eq    "High: COMPRESSION_TOOL"                   "$(tagval "$T/out/High.mkv" COMPRESSION_TOOL)" movie-compresser
+eq    "High: version taken when the job was generated" "$(tagval "$T/out/High.mkv" MOVIE_COMPRESSER_VERSION)" "$TV"
+eq    "High: COMPRESSION_DATE today (UTC)"       "$(tagval "$T/out/High.mkv" COMPRESSION_DATE)" "$TD"
+check "High: job header holds the version"       "grep -qx 'JOB_COMPRESSER_VERSION=$TV' '$T/mh.job'"
+check "High: encode drops provenance copied from the source" \
+      "grep -q -- '-metadata COMPRESSION_TOOL= -metadata MOVIE_COMPRESSER_VERSION= -metadata COMPRESSION_DATE=' '$T/mh.job'"
+check "High: pane shows the version"             "logged mh 'MOVIE_COMPRESSER_VERSION=$TV COMPRESSION_DATE=$TD'"
 LEDGER="$W/logs/compression_tags.tsv"
 # ledger ROW_FILTER  ->  "file crf tier video_bytes" of matching ledger rows
 ledger() { awk -F'\t' -v p="$1" 'NR > 1 && $2 ~ p { o = $2; sub(/.*\//, "", o); printf "%s %s %s %s|", o, $3, $4, $5 }' "$LEDGER"; }
@@ -274,8 +319,10 @@ run_job mb movie 1 "$items" "$(sz 1:26 1.6) $(sz 1:25 1.9)" "[1]='$T/old_tags.xm
 eq    "Base: final output CRF 25"                "$(first "$T/out/Base.mkv")" 25
 eq    "Base: COMPRESSION_CRF=25"                 "$(tagval "$T/out/Base.mkv" COMPRESSION_CRF)" 25
 eq    "Base: COMPRESSION_TIER=Base"              "$(tagval "$T/out/Base.mkv" COMPRESSION_TIER)" Base
-eq    "Base: earlier compression values replaced, once" "$(taglist "$T/out/Base.mkv")" "${SRC_LIST}COMPRESSION_CRF=25 COMPRESSION_TIER=Base "
+eq    "Base: earlier compression values replaced, once" "$(taglist "$T/out/Base.mkv")" "${SRC_LIST}${PROV}COMPRESSION_CRF=25 COMPRESSION_TIER=Base "
 check "Base: no attempt files left"              "[[ -z \$(find '$T/out' -name 'Base.mkv.*') ]]"
+eq    "Base: the source's older versions not kept" "$(tagval "$T/out/Base.mkv" MOVIE_COMPRESSER_VERSION)" "$TV"
+eq    "Base: each compression tag once"          "$(gcounts "$T/out/Base.mkv")" "1 1 1 1 1 "
 
 echo
 echo "== movie Quality (CRF search): band retry"
@@ -290,6 +337,7 @@ eq    "Quality: CRF 20 then 19 encoded"          "$(tr '\n' ' ' < "$T/mq.encoded
 eq    "Quality: COMPRESSION_CRF=19"              "$(tagval "$T/out/Q.mkv" COMPRESSION_CRF)" 19
 eq    "Quality: COMPRESSION_TIER=Quality"        "$(tagval "$T/out/Q.mkv" COMPRESSION_TIER)" Quality
 eq    "Quality: tagged before verification"      "$(verified mq)" "1:19:19 "
+eq    "Quality: provenance, once"                "$(taglist "$T/out/Q.mkv")" "${SRC_LIST}${PROV}COMPRESSION_CRF=19 COMPRESSION_TIER=Quality "
 
 echo
 echo "== series shared season CRF"
@@ -309,8 +357,10 @@ check "series: season batch job"                 "grep -q '^job_crf_batch\$' '$T
 eq    "series: every episode tagged 17"          "$(for e in 1 2 3; do tagval "$T/out/Show/E0$e.mkv" COMPRESSION_CRF; done | tr '\n' ' ')" "17 17 17 "
 eq    "series: every episode tier High"          "$(for e in 1 2 3; do tagval "$T/out/Show/E0$e.mkv" COMPRESSION_TIER; done | tr '\n' ' ')" "High High High "
 eq    "series: tagged before verification"       "$(verified ss)" "1:17:17 2:17:17 3:17:17 "
-eq    "series: source tags intact"               "$(taglist "$T/out/Show/E02.mkv")" "${SRC_LIST}COMPRESSION_CRF=17 COMPRESSION_TIER=High "
+eq    "series: source tags intact"               "$(taglist "$T/out/Show/E02.mkv")" "${SRC_LIST}${PROV}COMPRESSION_CRF=17 COMPRESSION_TIER=High "
 eq    "series: ledger row per episode at 17"     "$(ledger '/Show/E0')" "E01.mkv 17 High $(gib 3.5)|E02.mkv 17 High $(gib 4.8)|E03.mkv 17 High $(gib 3.5)|"
+eq    "series: same version on every episode"    "$(for e in 1 2 3; do tagval "$T/out/Show/E0$e.mkv" MOVIE_COMPRESSER_VERSION; done | tr '\n' ' ')" "$TV $TV $TV "
+eq    "series: each tag once after the season retry" "$(for e in 1 2 3; do gcounts "$T/out/Show/E0$e.mkv"; done)" "1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 "
 
 echo
 echo "== Custom CRF"
@@ -320,6 +370,31 @@ run_job mc movie 1 "$items" "$(sz 1:23.5 3)" "[1]='$T/src_tags.xml'"
 eq    "Custom: COMPRESSION_CRF = user CRF"       "$(tagval "$T/out/C.mkv" COMPRESSION_CRF)" 23.5
 eq    "Custom: COMPRESSION_TIER=Custom"          "$(tagval "$T/out/C.mkv" COMPRESSION_TIER)" Custom
 eq    "Custom: no retry"                         "$(tr '\n' ' ' < "$T/mc.encoded")" "1:23.5 "
+eq    "Custom: provenance"                       "$(taglist "$T/out/C.mkv")" "${SRC_LIST}${PROV}COMPRESSION_CRF=23.5 COMPRESSION_TIER=Custom "
+
+echo
+echo "== movie Compact (scaled to 1080p); series Base / Compact / Custom episodes"
+
+items=$(emit_encode_item 1 "$T/in/K.mkv" "$T/out/K.mkv" Compact crf:27 "$DOWNSCALE_1080P_FILTER" "" 0 "$(gib 1)")
+run_job mk movie 1 "$items" "$(sz 1:27 1)" "[1]='$T/src_tags.xml'"
+check "Compact: scaled encode"                   "grep -q 'force_divisible_by=2' '$T/mk.job'"
+eq    "Compact: tags"                            "$(taglist "$T/out/K.mkv")" "${SRC_LIST}${PROV}COMPRESSION_CRF=27 COMPRESSION_TIER=Compact "
+mkdir -p "$T/in/Show2" "$T/out/Show2"
+items=""
+e=0
+for t in Base:24 Compact:28 Custom:22.5; do
+    ((e += 1))
+    echo "episode $e" > "$T/in/Show2/Show2.S01E0$e.mkv"
+    items+=$(emit_encode_item "$e" "$T/in/Show2/Show2.S01E0$e.mkv" "$T/out/Show2/E0$e.mkv" "${t%%:*}" "crf:${t#*:}" \
+        "$( ((e == 2)) && printf '%s' "$DOWNSCALE_1080P_FILTER")" "" 0 "$(gib 1)")$'\n'
+done
+run_job sb series 3 "$items" "$(sz 1:24 1) $(sz 2:28 1) $(sz 3:22.5 1)" "[1]='$T/old_tags.xml' [2]='$T/src_tags.xml'"
+eq    "series tiers: CRF / tier per episode"     "$(for e in 1 2 3; do printf '%s/%s ' "$(tagval "$T/out/Show2/E0$e.mkv" COMPRESSION_CRF)" "$(tagval "$T/out/Show2/E0$e.mkv" COMPRESSION_TIER)"; done)" \
+      "24/Base 28/Compact 22.5/Custom "
+eq    "series tiers: provenance on every episode" "$(for e in 1 2 3; do printf '%s|' "$(tagval "$T/out/Show2/E0$e.mkv" COMPRESSION_TOOL) $(tagval "$T/out/Show2/E0$e.mkv" MOVIE_COMPRESSER_VERSION) $(tagval "$T/out/Show2/E0$e.mkv" COMPRESSION_DATE)"; done)" \
+      "movie-compresser $TV $TD|movie-compresser $TV $TD|movie-compresser $TV $TD|"
+eq    "series tiers: each tag once (older provenance in a source replaced)" "$(for e in 1 2 3; do gcounts "$T/out/Show2/E0$e.mkv"; done)" "1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 "
+eq    "series tiers: untagged source gets only the compression tags" "$(taglist "$T/out/Show2/E03.mkv")" "${PROV}COMPRESSION_CRF=22.5 COMPRESSION_TIER=Custom "
 
 echo
 echo "== no CRF: stream copy, two-pass, untagged source"
@@ -335,7 +410,8 @@ eq    "two-pass: no COMPRESSION_CRF"             "$(tagval "$T/out/Abr.mkv" COMP
 eq    "two-pass: source tags unchanged"          "$(taglist "$T/out/Abr.mkv")" "$SRC_LIST"
 check "copy / two-pass: mkvpropedit not run on them" "! grep -qE '^(Copy|Abr)\\.mkv' '$STUB_LOG'"
 eq    "copy / two-pass: no ledger row"           "$(ledger '(Copy|Abr)[.]mkv$')" ""
-eq    "untagged source: only the compression tags" "$(taglist "$T/out/New.mkv")" "COMPRESSION_CRF=19 COMPRESSION_TIER=High "
+eq    "copy / two-pass: no provenance written"   "$(tagval "$T/out/Copy.mkv" MOVIE_COMPRESSER_VERSION)$(tagval "$T/out/Abr.mkv" MOVIE_COMPRESSER_VERSION)" ""
+eq    "untagged source: only the compression tags" "$(taglist "$T/out/New.mkv")" "${PROV}COMPRESSION_CRF=19 COMPRESSION_TIER=High "
 
 echo
 echo "== failures are warnings, never lose tags"
@@ -355,22 +431,68 @@ run_job nomkv movie 1 "$items" "$(sz 1:20 3)" "[1]='$T/src_tags.xml'" \
 check "no mkvtoolnix: item ok, warned"           "logged nomkv 'All encodes finished: 1 ok, 0 failed' && logged nomkv 'WARNING: compression tags not written (mkvtoolnix missing).'"
 eq    "no mkvtoolnix: tags unchanged"            "$(taglist "$T/out/N.mkv")" "$SRC_LIST"
 
+echo
+echo "== writes without a version (Validate + update): provenance kept, none invented"
+
+cp "$T/out/High.mkv" "$T/bf1.mkv"
+mkv_set_compression_tags "$T/bf1.mkv" 22 High "$T/bft1"
+eq    "backfill: written"                        "$?" 0
+eq    "backfill: CRF corrected, provenance of the encode kept" \
+      "$(taglist "$T/bf1.mkv")" "${SRC_LIST}${PROV}COMPRESSION_CRF=22 COMPRESSION_TIER=High "
+eq    "backfill: each compression tag once"      "$(gcounts "$T/bf1.mkv")" "1 1 1 1 1 "
+{ echo "1 1 21"; echo "#TAGS"; cat "$T/old_tags.xml"; } > "$T/bf2.mkv"
+mkv_set_compression_tags "$T/bf2.mkv" 21 High "$T/bft2"
+eq    "backfill: historical versions left exactly as stored" "$(tagval "$T/bf2.mkv" MOVIE_COMPRESSER_VERSION | tr '\n' ' ')" "v0.9.0 v0.8.0 "
+eq    "backfill: historical date kept"           "$(tagval "$T/bf2.mkv" COMPRESSION_DATE)" 2025-01-01
+{ echo "1 1 21"; echo "#TAGS"; cat "$T/src_tags.xml"; } > "$T/bf3.mkv"
+mkv_set_compression_tags "$T/bf3.mkv" 21 High "$T/bft3"
+eq    "backfill: older output gets no version"   "$(taglist "$T/bf3.mkv")" "${SRC_LIST}COMPRESSION_CRF=21 COMPRESSION_TIER=High "
+
+echo
+echo "== provenance values: XML escaping, invalid values refused"
+
+echo "1 1 20" > "$T/esc.mkv"
+mkv_set_compression_tags "$T/esc.mkv" 20 Custom "$T/esct" 'v2.0-rc&<x>' "$TD"
+eq    "special characters: written"              "$?" 0
+eq    "special characters: read back unchanged"  "$(sed '1,/^#TAGS$/d' "$T/esc.mkv" > "$T/esc.xml"; mkv_global_tag_values "$T/esc.xml" MOVIE_COMPRESSER_VERSION)" 'v2.0-rc&<x>'
+cp "$T/esc.mkv" "$T/esc0.mkv"
+mkv_set_compression_tags "$T/esc.mkv" 20 Custom "$T/esct2" 'has space' "$TD"
+eq    "version with a space refused"             "$?" 2
+mkv_set_compression_tags "$T/esc.mkv" 20 Custom "$T/esct3" v1.0 "19/10/2026"
+eq    "non-ISO date refused"                     "$?" 2
+check "refused writes leave the file unchanged"  "cmp -s '$T/esc.mkv' '$T/esc0.mkv'"
+
+echo
+echo "== compression tags stored more than once (compression_tag_duplicates)"
+
+eq    "conflicting values reported"              "$(compression_tag_duplicates "$T/bf2.mkv")" $'MOVIE_COMPRESSER_VERSION\tconflict\tv0.9.0, v0.8.0'
+eq    "clean output: nothing reported"           "$(compression_tag_duplicates "$T/out/High.mkv")" ""
+{ echo "1 1 21"; echo "#TAGS"; sed 's/v0\.8\.0/v0.9.0/' "$T/old_tags.xml"; } > "$T/dup.mkv"
+eq    "same value twice: duplicate, not conflict" "$(compression_tag_duplicates "$T/dup.mkv")" $'MOVIE_COMPRESSER_VERSION\tduplicate\tv0.9.0, v0.9.0'
+
 # ------------------------------------------------------------
 echo
 echo "== verification report lines (ffprobe stand-in)"
 
 FAKE_TAGS=""
 ffprobe() { [[ -n "$FAKE_TAGS" ]] && printf '%s\n' "$FAKE_TAGS"; return 0; }
+NR3=$'Compression tool\tNot recorded\nCompressor version\tNot recorded\nCompression date\tNot recorded'
+FAKE_TAGS=$'TAG:title=Test Movie\r\nTAG:COMPRESSION_TOOL=movie-compresser\r\nTAG:MOVIE_COMPRESSER_VERSION=v1.4.2-5-ga3f8c21-dirty\r\nTAG:COMPRESSION_DATE=2026-10-19\r\nTAG:COMPRESSION_CRF=23\r\nTAG:COMPRESSION_TIER=Base\r\nTAG:ENCODER=Lavf61.7.100\r'
+eq    "current output: all five rows"            "$(compression_tag_lines x.mkv)" \
+      $'Compression tool\tmovie-compresser\nCompressor version\tv1.4.2-5-ga3f8c21-dirty\nCompression date\t2026-10-19\nCompression tier\tBase\nCompression CRF\t23'
+eq    "provenance values"                        "$(compression_provenance x.mkv)" $'movie-compresser\tv1.4.2-5-ga3f8c21-dirty\t2026-10-19'
 FAKE_TAGS=$'TAG:title=Test Movie\r\nTAG:COMPRESSION_CRF=21\r\nTAG:COMPRESSION_TIER=High\r'
-eq    "tagged: CRF / tier"                       "$(compression_tag_lines x.mkv)" $'Compression CRF\t21\nCompression tier\tHigh'
+eq    "tagged before version tagging: Not recorded, nothing invented" "$(compression_tag_lines x.mkv)" "$NR3"$'\nCompression tier\tHigh\nCompression CRF\t21'
 FAKE_TAGS=$'TAG:title=Old Output\nTAG:ENCODER=Lavf61.7.100'
-eq    "earlier output: not recorded"             "$(compression_tag_lines x.mkv)" $'Compression CRF\tnot recorded\nCompression tier\tnot recorded'
+eq    "earlier output: Not recorded (ENCODER is not the compressor version)" "$(compression_tag_lines x.mkv)" "$NR3"$'\nCompression tier\tNot recorded\nCompression CRF\tNot recorded'
 FAKE_TAGS=""
-eq    "no tags at all: not recorded"             "$(compression_tag_lines x.mkv)" $'Compression CRF\tnot recorded\nCompression tier\tnot recorded'
+eq    "no tags at all: Not recorded"             "$(compression_tag_lines x.mkv)" "$NR3"$'\nCompression tier\tNot recorded\nCompression CRF\tNot recorded'
 FAKE_TAGS=$'TAG:MOVIE/COMPRESSION_CRF=18\nTAG:compression_tier=Quality'
 eq    "target-prefixed / lower-case keys"        "$(compression_tags x.mkv)" $'18\tQuality'
+FAKE_TAGS=$'TAG:MOVIE/MOVIE_COMPRESSER_VERSION=abc1234\nTAG:compression_tool=movie-compresser'
+eq    "provenance: target-prefixed / lower-case keys" "$(compression_provenance x.mkv)" $'movie-compresser\tabc1234\t-'
 FAKE_TAGS=$'TAG:COMPRESSION_CRF=22'
-eq    "CRF without a tier"                       "$(compression_tag_lines x.mkv)" $'Compression CRF\t22\nCompression tier\tnot recorded'
+eq    "CRF without a tier"                       "$(compression_tag_lines x.mkv)" "$NR3"$'\nCompression tier\tNot recorded\nCompression CRF\t22'
 unset -f ffprobe
 
 # ------------------------------------------------------------
@@ -434,15 +556,33 @@ if (( HAVE_FFMPEG == 1 )); then
         -metadata title=Old "$VH/compress/out/Old HEVC High.mkv"
     ffmpeg -v error -y -i "$VH/compress/out/Old HEVC High.mkv" -map 0 -c copy \
         -metadata COMPRESSION_CRF=21 -metadata COMPRESSION_TIER=High "$VH/compress/out/New HEVC High.mkv"
+    ffmpeg -v error -y -i "$VH/compress/out/Old HEVC High.mkv" -map 0 -c copy \
+        -metadata COMPRESSION_TOOL=movie-compresser -metadata MOVIE_COMPRESSER_VERSION=v1.4.2-5-ga3f8c21-dirty \
+        -metadata COMPRESSION_DATE=2026-10-19 -metadata COMPRESSION_CRF=23 -metadata COMPRESSION_TIER=Base \
+        "$VH/compress/out/Prov HEVC High.mkv"
+    # what an encode command does with a source carrying provenance
+    # (emit_encode_item: the -metadata NAME= line before -map_metadata 0)
+    ffmpeg -v error -y -i "$VH/compress/out/Prov HEVC High.mkv" -map 0 -c copy \
+        -metadata COMPRESSION_TOOL= -metadata MOVIE_COMPRESSER_VERSION= -metadata COMPRESSION_DATE= \
+        -map_metadata 0 "$T/reencoded.mkv"
+    eq    "ffmpeg: source provenance not carried into a new encode" "$(compression_provenance "$T/reencoded.mkv")" $'-\t-\t-'
+    eq    "ffmpeg: other source tags still carried" "$(compression_tags "$T/reencoded.mkv")" $'23\tBase'
     printf '2\n1\n' | HOME="$VH" bash "$VH/compress/verify.sh" > "$T/verify.log" 2>&1
     tr -d '\r' < "$T/verify.log" > "$T/verify.txt"
     # vsec NAME  ->  the rows verify.sh printed for "NAME HEVC High.mkv"
     vsec() { awk -v n="$1 HEVC High.mkv" '/^[^ =]/ { cur = $0 } cur == n' "$T/verify.txt"; }
-    check "verify.sh: both files checked"        "grep -q 'Files checked: *2' '$T/verify.txt'"
-    check "verify.sh: old output CRF not recorded" "vsec Old | grep -qE '^  Compression CRF +not recorded\$'"
-    check "verify.sh: old output tier not recorded" "vsec Old | grep -qE '^  Compression tier +not recorded\$'"
+    check "verify.sh: all files checked"         "grep -q 'Files checked: *3' '$T/verify.txt'"
+    check "verify.sh: old output CRF Not recorded" "vsec Old | grep -qE '^  Compression CRF +Not recorded\$'"
+    check "verify.sh: old output tier Not recorded" "vsec Old | grep -qE '^  Compression tier +Not recorded\$'"
+    check "verify.sh: old output version Not recorded" "vsec Old | grep -qE '^  Compressor version +Not recorded\$'"
     check "verify.sh: tagged output CRF"         "vsec New | grep -qE '^  Compression CRF +21\$'"
     check "verify.sh: tagged output tier"        "vsec New | grep -qE '^  Compression tier +High\$'"
+    check "verify.sh: CRF-only output: version Not recorded" "vsec New | grep -qE '^  Compressor version +Not recorded\$'"
+    check "verify.sh: compression tool"          "vsec Prov | grep -qE '^  Compression tool +movie-compresser\$'"
+    check "verify.sh: compressor version"        "vsec Prov | grep -qE '^  Compressor version +v1\\.4\\.2-5-ga3f8c21-dirty\$'"
+    check "verify.sh: compression date"          "vsec Prov | grep -qE '^  Compression date +2026-10-19\$'"
+    eq    "verify.sh: row order" "$(vsec Prov | grep -oE '^  (Compression (tool|date|tier|CRF)|Compressor version)' | tr -s ' ' | tr '\n' '|')" \
+          " Compression tool| Compressor version| Compression date| Compression tier| Compression CRF|"
     check "verify.sh: no errors"                 "! grep -qiE 'command not found|unbound variable|syntax error' '$T/verify.txt'"
 else
     SKIPPED+=("verify.sh report (needs ffmpeg)")
@@ -469,7 +609,7 @@ if (( HAVE_FFMPEG == 1 && HAVE_MKV == 1 )); then
         -map 0 -map 1 -map_metadata 2 -map_chapters 2 -c:v mpeg4 -c:a ac3 \
         -metadata:s:v:0 TRACK_NOTE=video-tag -metadata:s:a:0 language=ger -metadata:s:a:0 TRACK_NOTE=audio-tag \
         "$R/a.mkv"
-    gtags() { ffprobe -v error -show_entries format_tags -of default=nw=1 "$1" | tr -d '\r' | grep -v '^TAG:COMPRESSION_' | sort; }
+    gtags() { ffprobe -v error -show_entries format_tags -of default=nw=1 "$1" | tr -d '\r' | grep -vE '^TAG:(COMPRESSION_|MOVIE_COMPRESSER_VERSION)' | sort; }
     stags() { ffprobe -v error -show_entries stream_tags -of default=nw=1 "$1" | tr -d '\r' | grep -vE '^TAG:(BPS|DURATION|NUMBER_OF|_STATISTICS)' ; }
     chaps() { ffprobe -v error -show_chapters -of csv=p=0 "$1" | tr -d '\r'; }
     G0=$(gtags "$R/a.mkv"); S0=$(stags "$R/a.mkv"); C0=$(chaps "$R/a.mkv")
@@ -488,8 +628,22 @@ if (( HAVE_FFMPEG == 1 && HAVE_MKV == 1 )); then
     eq    "real: one COMPRESSION_CRF only"       "$(grep -c '<Name>COMPRESSION_CRF</Name>' "$R/after.xml")" 1
     eq    "real: global tags still kept"         "$(gtags "$R/a.mkv")" "$G0"
 
+    mkv_set_compression_tags "$R/a.mkv" 23 Base "$R/t4" v1.4.2-5-ga3f8c21-dirty 2026-10-19
+    eq    "real: provenance written"             "$?" 0
+    eq    "real: provenance read back"           "$(compression_provenance "$R/a.mkv")" $'movie-compresser\tv1.4.2-5-ga3f8c21-dirty\t2026-10-19'
+    mkv_set_compression_tags "$R/a.mkv" 24 Base "$R/t5" v1.5.0 2026-10-20
+    mkvextract "$R/a.mkv" tags "$R/after2.xml" > /dev/null 2>&1
+    eq    "real: a new encode's provenance replaces, once each" \
+          "$(for n in COMPRESSION_TOOL MOVIE_COMPRESSER_VERSION COMPRESSION_DATE COMPRESSION_CRF COMPRESSION_TIER; do mkv_global_tag_values "$R/after2.xml" "$n"; done | tr '\n' ' ')" \
+          "movie-compresser v1.5.0 2026-10-20 24 Base "
+    eq    "real: no duplicates reported"         "$(compression_tag_duplicates "$R/a.mkv")" ""
+    mkv_set_compression_tags "$R/a.mkv" 19 Quality "$R/t6"
+    eq    "real: a write without a version keeps it" "$(compression_provenance "$R/a.mkv")" $'movie-compresser\tv1.5.0\t2026-10-20'
+    eq    "real: global tags still kept (2)"     "$(gtags "$R/a.mkv")" "$G0"
+
     refresh_mkv_stats "$R/a.mkv" > /dev/null 2>&1
     eq    "real: tags survive the statistics refresh" "$(compression_tags "$R/a.mkv")" $'19\tQuality'
+    eq    "real: provenance survives the statistics refresh" "$(compression_provenance "$R/a.mkv")" $'movie-compresser\tv1.5.0\t2026-10-20'
     eq    "real: track tags after refresh"       "$(stags "$R/a.mkv")" "$S0"
 
     ffmpeg -v error -y -f lavfi -i "testsrc2=s=320x240:r=24:d=1" -c:v mpeg4 -fflags +bitexact "$R/bare.mkv"
@@ -518,8 +672,12 @@ if (( HAVE_FFMPEG == 1 && HAVE_MKV == 1 )); then
         refresh_mkv_stats "$BO/$1 HEVC High.mkv" > /dev/null 2>&1
     }
     mkb Missing 3; mkb Stale 5; mkb NoRecord 7; mkb Kept 9
-    mkv_set_compression_tags "$BO/Stale HEVC High.mkv" 30 Base "$T/bt1" > /dev/null
+    # Stale: encoded by an earlier version of the scripts (its provenance
+    # must survive the CRF correction unchanged)
+    mkv_set_compression_tags "$BO/Stale HEVC High.mkv" 30 Base "$T/bt1" v1.0.0-3-gdeadbee 2026-01-02 > /dev/null
     mkv_set_compression_tags "$BO/Kept HEVC High.mkv" 18 High "$T/bt2" > /dev/null
+    provs() { local n; for n in Missing Stale NoRecord Kept; do printf '%s=%s ' "$n" "$(compression_provenance "$BO/$n HEVC High.mkv" | tr '\t' /)"; done; }
+    PV0="Missing=-/-/- Stale=movie-compresser/v1.0.0-3-gdeadbee/2026-01-02 NoRecord=-/-/- Kept=-/-/- "
     vb() { media_stream_totals "$BO/$1 HEVC High.mkv" | awk '{ print $1 }'; }
     compression_ledger_add "$BH/compress/work/logs" "/old/out/Missing HEVC High.mkv" 21 High "$(vb Missing)" s1 /old/in/Missing.mkv
     compression_ledger_add "$BH/compress/work/logs" "/old/out/Stale HEVC High.mkv" 20 High "$(vb Stale)" s1 /old/in/Stale.mkv
@@ -544,14 +702,16 @@ if (( HAVE_FFMPEG == 1 && HAVE_MKV == 1 )); then
     sums()  { (cd "$BO" && md5sum -- *.mkv); }
     crfs()  { local n; for n in Missing Stale NoRecord Kept; do printf '%s=%s ' "$n" "$(compression_tags "$BO/$n HEVC High.mkv" | tr '\t' /)"; done; }
     ncrf()  { local n; for n in Missing Stale NoRecord Kept; do mkvextract "$BO/$n HEVC High.mkv" tags "$T/n.xml" > /dev/null 2>&1; printf '%s ' "$(grep -c '<Name>COMPRESSION_CRF</Name>' "$T/n.xml")"; done; }
-    rows()  { tr -d '\r' < "$T/$1.log" | awk -v n="$2 HEVC High.mkv" '/^[^ =]/ { cur = $0 } cur == n && /Compression/'; }
+    rows()  { tr -d '\r' < "$T/$1.log" | awk -v n="$2 HEVC High.mkv" '/^[^ =]/ { cur = $0 } cur == n && /Compress/'; }
     M0=$(for n in Missing Stale NoRecord Kept; do meta "$n"; done)
     S0=$(sums)
 
     printf '2\n1\n' | HOME="$BH" bash "$BH/compress/verify.sh" > "$T/bv.log" 2>&1
     eq    "Verify: no file modified"             "$(sums)" "$S0"
-    check "Verify: missing tags reported, not failed" "rows bv Missing | grep -qE '^  Compression CRF +not recorded\$'"
+    check "Verify: missing tags reported, not failed" "rows bv Missing | grep -qE '^  Compression CRF +Not recorded\$'"
+    check "Verify: missing version reported, not failed" "rows bv Missing | grep -qE '^  Compressor version +Not recorded\$'"
     check "Verify: stale value reported as stored" "rows bv Stale | grep -qE '^  Compression CRF +30\$'"
+    check "Verify: historical version reported"  "rows bv Stale | grep -qE '^  Compressor version +v1\\.0\\.0-3-gdeadbee\$'"
     check "Verify: no backfill"                  "! grep -q 'Compression tags' '$T/bv.log'"
     check "Verify: missing audio title reported" "grep -q 'no title - MISSING' '$T/bv.log' && grep -q 'Titles to correct: 4' '$T/bv.log'"
     atitles() { local n; for n in Missing Stale NoRecord Kept; do printf '%s ' "$(ffprobe -v error -select_streams a:0 -show_entries stream_tags=title -of default=nw=1:nk=1 "$BO/$n HEVC High.mkv" | tr -d '\r')"; done; }
@@ -567,6 +727,8 @@ if (( HAVE_FFMPEG == 1 && HAVE_MKV == 1 )); then
     check "Validate + update: existing tags without a record left unchanged" "rows bu1 Kept | grep -q 'not recovered (no job record of this encode); existing tags left unchanged'"
     check "Validate + update: summary"           "grep -q 'CRF tags written:  2' '$T/bu1.log' && grep -q 'CRF not recovered: 2' '$T/bu1.log'"
     eq    "Validate + update: unrelated metadata unchanged" "$(for n in Missing Stale NoRecord Kept; do meta "$n"; done)" "$M0"
+    eq    "Validate + update: historical version kept, none invented" "$(provs)" "$PV0"
+    eq    "Validate + update: no duplicate tags"     "$(for n in Missing Stale NoRecord Kept; do compression_tag_duplicates "$BO/$n HEVC High.mkv"; done)" ""
     eq    "Validate + update: standard audio titles" "$(atitles)" "German | AC-3 | 1.0 German | AC-3 | 1.0 German | AC-3 | 1.0 German | AC-3 | 1.0 "
     eq    "Validate + update: stream data unchanged" "$(pay)" "$P0"
 
@@ -575,6 +737,7 @@ if (( HAVE_FFMPEG == 1 && HAVE_MKV == 1 )); then
     eq    "repeat: one COMPRESSION_CRF per file" "$(ncrf)" "1 1 0 1 "
     check "repeat: reported UNCHANGED, nothing written" "rows bu2 Missing | grep -q 'UNCHANGED (CRF 21, High' && rows bu2 Stale | grep -q 'UNCHANGED (CRF 20, High' && ! grep -q 'CRF tags written:  [1-9]' '$T/bu2.log'"
     eq    "repeat: unrelated metadata unchanged" "$(for n in Missing Stale NoRecord Kept; do meta "$n"; done)" "$M0"
+    eq    "repeat: historical version still kept" "$(provs)" "$PV0"
     check "repeat: titles already correct, none rewritten" "grep -q 'Titles correct:    4' '$T/bu2.log' && grep -q 'Titles updated:    0' '$T/bu2.log'"
     S2=$(sums)
     printf '2\n1\n' | HOME="$BH" bash "$BH/compress/verify.sh" > "$T/bv2.log" 2>&1

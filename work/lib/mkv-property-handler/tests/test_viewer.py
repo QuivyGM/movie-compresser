@@ -17,7 +17,7 @@ import viewer  # noqa: E402
 
 VIEWER = HERE.parent / "viewer.py"
 UNICODE_NAME = "영화 テスト ★ with spaces.mkv"
-CURRENT = {"tier": "Compact", "crf": "23.5", "video_encoder": "Lavc61.19.101 libx265",
+CURRENT = {"tool": "", "version": "", "date": "", "tier": "Compact", "crf": "23.5", "video_encoder": "Lavc61.19.101 libx265",
            "video_stream_size": "4.21 GB (4,523,456,789 bytes)",
            "writing_app": "mkvmerge v88.0 ('All I Know') 64-bit",
            "muxing_app": "libebml v1.4.5 + libmatroska v1.7.1"}
@@ -71,6 +71,22 @@ class ViewerTests(unittest.TestCase):
 
     def test_pre_tagging_output(self):
         self.assertFields(self.read("legacy_no_compression_tags.mkv"), crf="", tier="", video_encoder="Lavc60 libx265")
+
+    def test_provenance_tags(self):
+        self.assertFields(self.read("provenance_current.mkv"), tool="movie-compresser",
+                          version="v1.4.2-5-ga3f8c21-dirty", date="2026-10-19", tier="Base", crf="23")
+
+    def test_provenance_first_global_value_and_track_decoy(self):
+        i = self.read("provenance_conflict.mkv")
+        self.assertEqual(i.version, "v1.4.2-5-ga3f8c21-dirty")   # first one, as the scripts read it
+        self.assertEqual(i.global_tags["MOVIE_COMPRESSER_VERSION"], ["v1.4.2-5-ga3f8c21-dirty", "v1.3.0"])
+        i = self.read("provenance_on_track.mkv")
+        self.assertEqual(i.version, "")                          # a track's tag is not the file's
+        self.assertIn(("MOVIE_COMPRESSER_VERSION", "v9.9.9"), i.misplaced)
+
+    def test_historical_files_have_no_provenance(self):
+        for name in ("current_mkvpropedit.mkv", "old_ffmpeg_tags.mkv", "legacy_no_compression_tags.mkv", "no_tags.mkv"):
+            self.assertFields(self.read(name), tool="", version="", date="")
 
     def test_no_tags(self):
         i = self.read("no_tags.mkv")
@@ -128,19 +144,39 @@ class ViewerTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.splitlines(), [
             f"File: {self.unicode_file}",
-            "  Compression tier:    Compact",
-            "  Compression CRF:     23.5",
-            "  Video encoder:       Lavc61.19.101 libx265",
-            "  Video stream size:   4.21 GB (4,523,456,789 bytes)",
-            "  Writing application: mkvmerge v88.0 ('All I Know') 64-bit",
-            "  Muxing application:  libebml v1.4.5 + libmatroska v1.7.1",
+            "  Compression tool:     Not recorded",   # tagged before the version existed: nothing invented
+            "  Compressor version:   Not recorded",
+            "  Compression date:     Not recorded",
+            "  Compression tier:     Compact",
+            "  Compression CRF:      23.5",
+            "  Video encoder:        Lavc61.19.101 libx265",
+            "  Video stream size:    4.21 GB (4,523,456,789 bytes)",
+            "  Writing application:  mkvmerge v88.0 ('All I Know') 64-bit",
+            "  Muxing application:   libebml v1.4.5 + libmatroska v1.7.1",
         ])
         self.assertNotIn("Press Enter", r.stdout)   # no pause outside Explorer
+
+    def test_terminal_output_provenance(self):
+        f = self.dir / "provenance_current.mkv"
+        r = self.run_viewer(f)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.splitlines()[:6], [
+            f"File: {f}",
+            "  Compression tool:     movie-compresser",
+            "  Compressor version:   v1.4.2-5-ga3f8c21-dirty",
+            "  Compression date:     2026-10-19",
+            "  Compression tier:     Base",
+            "  Compression CRF:      23",
+        ])
+        # the x265 / FFmpeg / MKVToolNix versions stay in their own fields
+        self.assertRegex(r.stdout, r"Video encoder:\s+Lavc61 libx265")
+        self.assertRegex(r.stdout, r"Writing application:\s+mkvmerge v88\.0")
 
     def test_terminal_missing_tags(self):
         r = self.run_viewer(self.dir / "no_tags.mkv", self.dir / "crf_only.mkv")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertRegex(r.stdout, r"Compression tier:\s+Not recorded")
+        self.assertRegex(r.stdout, r"Compressor version:\s+Not recorded")
         self.assertRegex(r.stdout, r"Video stream size:\s+Not recorded")
         self.assertRegex(r.stdout, r"Compression CRF:\s+18")
         self.assertIn("\n\nFile: ", r.stdout)   # blank line between files

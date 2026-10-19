@@ -731,16 +731,38 @@ compression_tags() {
             END { printf "%s\t%s\n", (crf != "" ? crf : "-"), (tier != "" ? tier : "-") }'
 }
 
-# compression_tag_lines FILE  ->  "Compression CRF<TAB>VALUE" and
-# "Compression tier<TAB>VALUE" ("not recorded" when absent). Report
-# only: a missing tag is never an error.
+# compression_provenance FILE  ->  "TOOL<TAB>VERSION<TAB>DATE" from the
+# global COMPRESSION_TOOL / MOVIE_COMPRESSER_VERSION / COMPRESSION_DATE
+# tags (encode_common.sh mkv_set_compression_tags); "-" for a tag that is
+# not there (outputs of earlier versions, stream copies, two-pass). The
+# movie-compresser version is only ever read from its own tag, never
+# from ENCODER / x265 / MKVToolNix version strings.
+compression_provenance() {
+    ffprobe -v error -show_entries format_tags -of default=nw=1 "$1" 2>/dev/null |
+        awk '
+            { sub(/\r$/, ""); k = toupper($0); v = substr($0, index($0, "=") + 1) }
+            k ~ /^TAG:([^=]*\/)?COMPRESSION_TOOL=/         && tool == "" { tool = v }
+            k ~ /^TAG:([^=]*\/)?MOVIE_COMPRESSER_VERSION=/ && ver == ""  { ver = v }
+            k ~ /^TAG:([^=]*\/)?COMPRESSION_DATE=/         && date == "" { date = v }
+            END { printf "%s\t%s\t%s\n", (tool != "" ? tool : "-"), (ver != "" ? ver : "-"), (date != "" ? date : "-") }'
+}
+
+# compression_tag_lines FILE  ->  "LABEL<TAB>VALUE" rows: Compression
+# tool, Compressor version, Compression date, Compression tier,
+# Compression CRF ("Not recorded" when absent). Report only: a missing
+# tag is never an error, and nothing is filled in for it.
 compression_tag_lines() {
-    local crf tier
+    local crf tier tool ver date
 
     IFS=$'\t' read -r crf tier <<< "$(compression_tags "$1")"
-    [[ -n "$crf" && "$crf" != "-" ]] || crf="not recorded"
-    [[ -n "$tier" && "$tier" != "-" ]] || tier="not recorded"
-    printf 'Compression CRF\t%s\nCompression tier\t%s\n' "$crf" "$tier"
+    IFS=$'\t' read -r tool ver date <<< "$(compression_provenance "$1")"
+    [[ -n "$tool" && "$tool" != "-" ]] || tool="Not recorded"
+    [[ -n "$ver" && "$ver" != "-" ]] || ver="Not recorded"
+    [[ -n "$date" && "$date" != "-" ]] || date="Not recorded"
+    [[ -n "$tier" && "$tier" != "-" ]] || tier="Not recorded"
+    [[ -n "$crf" && "$crf" != "-" ]] || crf="Not recorded"
+    printf 'Compression tool\t%s\nCompressor version\t%s\nCompression date\t%s\n' "$tool" "$ver" "$date"
+    printf 'Compression tier\t%s\nCompression CRF\t%s\n' "$tier" "$crf"
 }
 
 # stream_tag FILE STREAM_INDEX TAG  ->  tag value (empty if missing)

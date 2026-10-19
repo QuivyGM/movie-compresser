@@ -63,6 +63,7 @@ class State:
     target: str = ""          # program the command runs
     broken: bool = False      # ours, but its program or viewer.py is missing
     viewer_present: bool = False
+    viewer_outdated: bool = False   # the installed viewer.py copy differs from this one (install refreshes it)
     legacy_files: list = field(default_factory=list)
 
 
@@ -141,6 +142,11 @@ def get_state(cfg=None):
     cfg = cfg or Config()
     s = State(viewer_present=(cfg.viewer_dir / "viewer.py").exists(),
               legacy_files=[n for n in LEGACY_FILES if (cfg.viewer_dir / n).exists()])
+    if s.viewer_present:
+        try:
+            s.viewer_outdated = (cfg.viewer_dir / "viewer.py").read_bytes() != VIEWER_SOURCE.read_bytes()
+        except OSError:
+            pass
     k = _open(cfg, cfg.verb_key)
     if not k:
         return s

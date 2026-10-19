@@ -1,7 +1,11 @@
-"""Shows the movie-compresser MKV compression tags (tier, CRF, encoder, ...)
-read-only, in the terminal or from Explorer's right-click menu.
+"""Shows and validates the movie-compresser MKV metadata (tier, CRF, encoder,
+codecs, track titles, ...) read-only, in the terminal or from Explorer's
+right-click menu.
 
-    python window_tagger.py view FILE.mkv...   print the fields in the terminal
+    python window_tagger.py                    interactive menu (validate / Windows
+                                               integration for a file or a folder)
+    python window_tagger.py validate PATH...   validate MKV files / folders (recursive)
+    python window_tagger.py view PATH...       print the compression fields
     python window_tagger.py install            Explorer: right-click an .mkv >
                                                Show more options > Compression info
                                                (opens a console window with the fields)
@@ -19,6 +23,7 @@ from pathlib import Path
 COMPONENT = Path(__file__).resolve().parent / "work" / "lib" / "mkv-property-handler"
 sys.path.insert(0, str(COMPONENT))
 
+import batch  # noqa: E402
 import viewer  # noqa: E402
 
 
@@ -42,7 +47,9 @@ def cmd_status(_args):
                   "foreign": "present but NOT created by this tool (left alone)"}[s.kind]
         + (" - BROKEN: its program is missing (run install or uninstall)" if s.broken else ""))
     row("Command", s.command or "-")
-    row("Viewer copy", cfg.viewer_dir / "viewer.py" if s.viewer_present else "absent")
+    row("Viewer copy", (f"{cfg.viewer_dir / 'viewer.py'}" + (" - OUTDATED (run install to update it)"
+                                                                if s.viewer_outdated else ""))
+        if s.viewer_present else "absent")
     if s.legacy_files:
         row("Old PowerShell files", ", ".join(s.legacy_files))
     row("Python (for the menu)", installer.console_python())
@@ -69,8 +76,25 @@ def cmd_uninstall(args):
 
 
 def cmd_view(args):
-    argv = (["--stats"] if args.stats else []) + ["--"] + args.files
+    files = []
+    for f in args.files:   # a folder stands for its MKV files (recursive, links not followed)
+        files += [str(p) for p in batch.collect(f).mkv] if Path(f).is_dir() else [f]
+    if not files:
+        print("No MKV files found.", file=sys.stderr)
+        return viewer.EXIT_NOT_MATROSKA
+    argv = (["--stats"] if args.stats else []) + ["--"] + files
     return viewer.main(argv)
+
+
+def cmd_validate(args):
+    status = 0
+    for path in args.paths:
+        if not Path(path).exists():
+            print(f"Not found: {path}", file=sys.stderr)
+            status = max(status, 3)
+            continue
+        status = max(status, batch.run_validation(batch.collect(path), titles=not args.no_titles))
+    return status
 
 
 def cmd_test(_args):
@@ -83,10 +107,16 @@ def cmd_test(_args):
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if sys.stdin and not sys.stdin.isatty() and hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8")   # piped answers / paths (a console is read as Unicode anyway)
     p = argparse.ArgumentParser(prog="window_tagger.py", description=__doc__.split("\n\n")[0])
-    sub = p.add_subparsers(dest="command", required=True)
+    sub = p.add_subparsers(dest="command")
+    q = sub.add_parser("validate", help="validate MKV metadata (read-only); exit 0 OK, 1 issues, 3 invalid files")
+    q.add_argument("paths", nargs="+", metavar="PATH", help="MKV file or folder (searched recursively)")
+    q.add_argument("--no-titles", action="store_true", help="skip verify.sh's track-title rules (faster)")
+    q.set_defaults(fn=cmd_validate)
     v = sub.add_parser("view", help="print the compression tags of MKV files")
-    v.add_argument("files", nargs="+", metavar="FILE")
+    v.add_argument("files", nargs="+", metavar="PATH")
     v.add_argument("--stats", action="store_true", help="also print how many bytes were read")
     v.set_defaults(fn=cmd_view)
     for name, fn, text in (("install", cmd_install, "add the Explorer menu entry (per user)"),
@@ -97,6 +127,8 @@ def main():
     sub.add_parser("status", help="show what is installed").set_defaults(fn=cmd_status)
     sub.add_parser("test", help="run the lightweight tests").set_defaults(fn=cmd_test)
     args = p.parse_args()
+    if not args.command:
+        return batch.menu()
     return args.fn(args) or 0
 
 

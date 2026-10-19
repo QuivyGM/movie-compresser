@@ -1,23 +1,99 @@
-# MKV compression info viewer
+# MKV metadata manager
 
-A read-only terminal viewer for the compression tags that the Linux
-scripts write into MKV outputs. On Windows it can also be added to
-Explorer's right-click menu.
+A read-only terminal tool for the metadata that the Linux compression
+scripts write into MKV outputs. It shows the compression fields and
+validates them. On Windows it can also be added to Explorer's right-click
+menu.
 
 - **Launcher:** `window_tagger.py` in the repository root.
-- **Requirements:** Python 3 with the standard library only.
+- **Requirements:** Python 3 with the standard library only. The optional
+  track-title check also uses bash and ffprobe.
 - **No admin needed:** nothing requires administrator rights.
 
 ```text
-python window_tagger.py view FILE.mkv ...     print the fields (--stats: also bytes read)
+python window_tagger.py                       interactive menu (see below)
+python window_tagger.py validate PATH ...     validate MKV files / folders (--no-titles: faster)
+python window_tagger.py view PATH ...         print the fields (--stats: also bytes read)
 python window_tagger.py install [--dry-run]   right-click .mkv > Show more options > Compression info
 python window_tagger.py uninstall [--dry-run]
 python window_tagger.py status
-python window_tagger.py test                  about 10 s
+python window_tagger.py test                  about 5 s
 ```
 
-`view` works on any OS. `install`, `uninstall` and `status` are
-Windows-only.
+`view` and `validate` work on any OS. `install`, `uninstall` and `status`
+are Windows-only.
+
+How paths are handled:
+
+- A PATH is an MKV file or a folder. Folders are searched recursively.
+- Directory symlinks and junctions are never followed; they are listed
+  as skipped. OneDrive and other cloud folders are searched normally.
+- Other media files (`.mp4`, `.avi`, …) are reported as unsupported.
+- One failing file never stops a batch.
+
+## Interactive menu
+
+```text
+MKV Metadata Manager
+
+1) Validate MKV metadata
+2) Windows metadata integration
+3) Exit
+
+Select [1-3]:
+Enter MKV file or directory path:
+>
+```
+
+- **Path input:** it may contain spaces and Unicode characters. A quoted
+  path, as from Explorer's "Copy as path" or drag and drop, is accepted.
+  An empty answer goes back to the menu.
+- **1) Validate:** a per-file report, then a summary. The checks are
+  described under "Validation" below.
+- **2) Windows integration:** shows each MKV's compression fields, then
+  reports the right-click entry. An entry that is already installed, or
+  one this tool did not create, is left unchanged. If it is missing or
+  broken, the tool offers to install it per user; the default is no.
+  Properties > Details is reported as unavailable (see "Why not
+  Properties > Details").
+
+## Validation
+
+Validation is read-only: no file is written, re-encoded or remuxed.
+
+| Check               | Reported as                                                                 |
+|---------------------|-----------------------------------------------------------------------------|
+| Compression tags    | INVALID: CRF not a number or outside 0-51; tier not one of `compression_tier_name`'s names (read from `encode_common.sh`); COMPRESSION_* tags targeting a track or chapter |
+|                     | INCONSISTENT: conflicting duplicate values; tier without CRF; tags on non-HEVC video |
+| Compressor version  | INVALID: `COMPRESSION_TOOL` not `movie-compresser`; `COMPRESSION_DATE` not YYYY-MM-DD; a version that is an FFmpeg / x265 / MKVToolNix version string; the tags targeting a track |
+|                     | INCONSISTENT: only some of the three provenance tags; conflicting duplicate values; provenance without CRF |
+|                     | INFO: `Not recorded` (compressed before version tagging, not a problem); `unknown`; `-dirty` |
+| CRF vs. the stream  | INCONSISTENT: the tag differs from the `rc=crf crf=…` x265 stored in the video track's CodecPrivate, or the stream is two-pass / ABR |
+|                     | OUTDATED: an x265 CRF stream without the tag (probably from before tagging existed) |
+| Statistics tags     | MISSING: BPS / NUMBER_OF_BYTES absent |
+|                     | INVALID: the byte counts exceed the file size |
+|                     | OUTDATED: written before the last mux (Segment DateUTC) |
+| Codecs              | every track listed with codec, size or channels, language and flags |
+| Track titles        | the rules of `verify.sh`'s own `check_track_titles`, run in Verify mode by `verify_titles.sh` |
+| Structure           | INVALID: not Matroska, or an element truncated |
+
+How the track-title check works:
+
+- **With bash and ffprobe:** `verify_titles.sh` takes `check_track_titles`
+  from `verify.sh` and calls it in Verify mode (`VALIDATE=0`), which
+  never writes. As an extra safeguard, `mkvpropedit` is replaced by a
+  function that refuses. Its verdicts are reported as STALE
+  (INCONSISTENT), NOT STANDARD (OUTDATED) or MISSING.
+- **Which bash:** on Windows, Git for Windows' bash is used, never WSL's.
+- **Without bash or ffprobe:** only missing audio titles are reported.
+
+Exit status of `validate`:
+
+| Code | Meaning                                                   |
+|------|-----------------------------------------------------------|
+| 0    | no issues                                                 |
+| 1    | metadata issues found                                     |
+| 3    | invalid, unreadable or unsupported files were in the batch |
 
 Example output:
 
@@ -48,6 +124,9 @@ The MKV is the only source. Nothing is written, generated or copied.
 
 | Field                | Source in the MKV                                         |
 |----------------------|-----------------------------------------------------------|
+| Compression tool     | global tag `COMPRESSION_TOOL` (`movie-compresser`)        |
+| Compressor version   | global tag `MOVIE_COMPRESSER_VERSION`                     |
+| Compression date     | global tag `COMPRESSION_DATE` (YYYY-MM-DD, UTC)           |
 | Compression tier     | global tag `COMPRESSION_TIER`                             |
 | Compression CRF      | global tag `COMPRESSION_CRF`                              |
 | Video encoder        | `ENCODER` tag of the first video track                    |
@@ -61,8 +140,16 @@ The MKV is the only source. Nothing is written, generated or copied.
 - **Tag layouts:** both layouts are read: the current
   `mkv_set_compression_tags` (mkvpropedit, `TargetTypeValue 50`, appended
   after the clusters) and the older `ffmpeg -metadata` (empty Targets).
+- **Compressor version** is the `git describe --tags --always --dirty` of
+  the movie-compresser checkout, taken once when the encode job was
+  created (`unknown` when Git or the repository was not available). It is
+  never the FFmpeg, x265 or MKVToolNix version; those stay in *Video
+  encoder*, *Video encode* and the application fields.
 - **Missing information** is shown as `Not recorded`. That covers files from
-  before tagging existed, stream copies and two-pass encodes.
+  before tagging existed (also files with a CRF but no version: they were
+  compressed before version tagging), stream copies and two-pass encodes.
+  No version is ever filled in for them, and verify.sh's Validate + update
+  never writes or changes a version.
 
 ## Reading limits
 
@@ -132,7 +219,15 @@ Tests are in `tests/`, use `unittest`, and are run by
 `python window_tagger.py test`. They work as follows:
 
 - **Fixtures:** synthetic MKVs from `make_test_mkvs.py`, with no encoding.
-  They include a sparse 256 MiB file, of which under 4 KiB may be read.
+  They include a sparse 256 MiB file, of which under 4 KiB may be read,
+  and one case per validation finding (CRF mismatch, outdated statistics, …).
+- **Batch tests** (`test_batch.py`):
+  - a Unicode folder tree with a junction and a symlink that must not be
+    followed;
+  - the menu, driven both through stdin and in-process, including the
+    install offer and the "already installed: left unchanged" path;
+  - a check that `verify_titles.sh` loads `check_track_titles` from
+    `verify.sh`.
 - **Install tests:** they use a sandbox key
   (`HKCU\Software\movie-compresser-tests\<pid>`). They run the registered
   command exactly as Explorer would, with the Enter prompt answered.

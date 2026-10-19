@@ -77,15 +77,82 @@ refresh_mkv_stats() {
         --add-track-statistics-tags
 }
 
-# _compression_tags_strip  (filter)  ->  mkvextract tags XML without the
-# COMPRESSION_CRF / COMPRESSION_TIER simple tags of global tags (Targets
-# without a track / edition / chapter / attachment UID); a global Tag
-# left without any simple tag is dropped. Everything else is printed
-# unchanged. Expects mkvextract's layout (one element per line).
+# Global tags of a CRF encode (mkv_set_compression_tags), as extended
+# regular expressions over the upper-case tag name: the CRF / tier, and
+# the provenance of the encode (which pipeline, which Git version, when).
+COMPRESSION_CRF_TAG_NAMES="COMPRESSION_CRF|COMPRESSION_TIER"
+COMPRESSION_PROVENANCE_TAG_NAMES="COMPRESSION_TOOL|MOVIE_COMPRESSER_VERSION|COMPRESSION_DATE"
+COMPRESSION_ALL_TAG_NAMES="$COMPRESSION_CRF_TAG_NAMES|$COMPRESSION_PROVENANCE_TAG_NAMES"
+COMPRESSION_TOOL_NAME="movie-compresser"
+
+# compresser_version  ->  `git describe --tags --always --dirty` of the
+# movie-compresser checkout this library belongs to (work/lib/../..,
+# symlinks resolved; the caller's working directory does not matter), or
+# "unknown" when Git is missing, that directory is not the top of a Git
+# work tree (copied without .git, or only inside some other repository)
+# or describe fails. Never fails. A job calls it once, when it is
+# generated (emit_job_header), and records that value in every output.
+compresser_version() {
+    local lib root top v
+
+    lib=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) &&
+    root=$(cd -P -- "$lib/../.." 2>/dev/null && pwd -P) &&
+    command -v git >/dev/null 2>&1 &&
+    top=$(GIT_OPTIONAL_LOCKS=0 git -C "$root" rev-parse --show-toplevel 2>/dev/null) &&
+    [[ -n "$top" && "$(cd -P -- "$top" 2>/dev/null && pwd -P)" == "$root" ]] &&
+    v=$(GIT_OPTIONAL_LOCKS=0 git -C "$root" describe --tags --always --dirty 2>/dev/null) &&
+    [[ "$v" =~ ^[[:graph:]]{1,128}$ ]] || v=unknown
+
+    printf '%s\n' "$v"
+}
+
+# compression_date_now  ->  today's date, ISO 8601 (YYYY-MM-DD), in UTC
+compression_date_now() {
+    date -u +%Y-%m-%d
+}
+
+# _xml_escape TEXT  ->  TEXT for an XML element value
+_xml_escape() {
+    local s="$1"
+    # quoted replacements: a bare & means "the match" in bash >= 5.2
+    s="${s//&/"&amp;"}"
+    s="${s//</"&lt;"}"
+    s="${s//>/"&gt;"}"
+    printf '%s' "$s"
+}
+
+# mkv_global_tag_values XML NAME  ->  the value of every top-level simple
+# tag NAME (case-insensitive) of the global tags (same rule as
+# _compression_tags_strip) in an mkvextract tags XML, one per line, in
+# file order, XML entities decoded
+mkv_global_tag_values() {
+    awk -v want="${2^^}" '
+        function unesc(s) {
+            gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); gsub(/&quot;/, "\"", s)
+            gsub(/&apos;/, "\047", s); gsub(/&amp;/, "\\&", s)
+            return s
+        }
+        { sub(/\r$/, "") }
+        /<Tag>/ && !intag { intag = 1; global = 1; sdepth = 0; n = 0; next }
+        intag && sdepth == 0 && /<(TrackUID|EditionUID|ChapterUID|AttachmentUID)>/ { global = 0 }
+        intag && /<Simple>/ { if (++sdepth == 1) { name = ""; val = ""; hasval = 0 } }
+        intag && sdepth == 1 && name == "" && match($0, /<Name>[^<]*<\/Name>/) { name = substr($0, RSTART + 6, RLENGTH - 13) }
+        intag && sdepth == 1 && !hasval && match($0, /<String>.*<\/String>/) { val = substr($0, RSTART + 8, RLENGTH - 17); hasval = 1 }
+        intag && /<\/Simple>/ { if (sdepth == 1 && toupper(name) == want) vals[n++] = val; sdepth-- }
+        intag && /<\/Tag>/ { if (global) for (i = 0; i < n; i++) print unesc(vals[i]); intag = 0 }' "$1"
+}
+
+# _compression_tags_strip [NAMES]  (filter)  ->  mkvextract tags XML
+# without the simple tags of global tags (Targets without a track /
+# edition / chapter / attachment UID) whose upper-case name matches the
+# extended regular expression NAMES (default: COMPRESSION_CRF /
+# COMPRESSION_TIER); a global Tag left without any simple tag is
+# dropped. Everything else is printed unchanged. Expects mkvextract's
+# layout (one element per line).
 _compression_tags_strip() {
-    awk '
+    awk -v names="^(${1:-$COMPRESSION_CRF_TAG_NAMES})$" '
         function flush_simple() {
-            if (sbuf != "" && !(global && sname ~ /^COMPRESSION_(CRF|TIER)$/)) { tbuf = tbuf sbuf; kept++ }
+            if (sbuf != "" && !(global && toupper(sname) ~ names)) { tbuf = tbuf sbuf; kept++ }
             sbuf = ""; sname = ""
         }
         /<Tag>/ && !intag { intag = 1; tbuf = $0 "\n"; global = 1; kept = 0; sdepth = 0; next }
@@ -110,13 +177,13 @@ _compression_tags_strip() {
         { print }'
 }
 
-# _compression_tags_canon  (filter)  ->  the content of a tags XML for
-# comparison: Tag / Simple nesting, targets, names and values, without
-# the compression tags (_compression_tags_strip), the XML header /
-# indentation and the attributes mkvpropedit normalises on writing
-# (TagLanguage / TagLanguageIETF / TagDefault, TargetTypeValue 50)
+# _compression_tags_canon [NAMES]  (filter)  ->  the content of a tags
+# XML for comparison: Tag / Simple nesting, targets, names and values,
+# without the compression tags (_compression_tags_strip NAMES), the XML
+# header / indentation and the attributes mkvpropedit normalises on
+# writing (TagLanguage / TagLanguageIETF / TagDefault, TargetTypeValue 50)
 _compression_tags_canon() {
-    _compression_tags_strip | awk '
+    _compression_tags_strip "${1:-}" | awk '
         { sub(/\r$/, ""); gsub(/^[ \t]+|[ \t]+$/, "") }
         /^<(TagLanguage|TagLanguageIETF|TagDefault)>/ || /^<TargetTypeValue>50<\/TargetTypeValue>$/ { next }
         /^<\/?(Tag|Simple)>$/ || /^<[A-Za-z]+>.*<\/[A-Za-z]+>$/ { print }'
@@ -386,24 +453,36 @@ mkv_track_map() {
     printf '%s\n' "${out[@]+"${out[@]}"}"
 }
 
-# mkv_set_compression_tags FILE CRF TIER WORKDIR
+# mkv_set_compression_tags FILE CRF TIER WORKDIR [VERSION DATE]
 #
 # Writes the global Matroska tags COMPRESSION_CRF=CRF and (when TIER is
-# not empty) COMPRESSION_TIER=TIER into FILE with mkvpropedit. Every
-# existing tag (global, track, edition, chapter, attachment) is kept:
-# the file's tags are extracted, earlier COMPRESSION_* global values are
-# replaced, the new tag is appended and the whole set is written back
-# (--tags all:). Afterwards the tags are read back; when anything other
-# than the compression tags differs, the original tag set is restored.
-# Only tags change (no remux). Returns non-zero when the tags were not
-# written (FILE unchanged); WORKDIR keeps the XML and tool logs.
+# not empty) COMPRESSION_TIER=TIER into FILE with mkvpropedit. With
+# VERSION (a new encode: the job's compresser_version, "unknown"
+# included) also COMPRESSION_TOOL=movie-compresser,
+# MOVIE_COMPRESSER_VERSION=VERSION and COMPRESSION_DATE=DATE
+# (YYYY-MM-DD, UTC); any earlier values of those (e.g. copied from the
+# source by -map_metadata) are replaced. Without VERSION (Validate +
+# update backfill) existing provenance tags are left exactly as they are
+# and none are added: a historical version is never rewritten or
+# invented. Every other existing tag (global, track, edition, chapter,
+# attachment) is kept: the file's tags are extracted, earlier global
+# values of the written names are removed, the new tag is appended and
+# the whole set is written back (--tags all:), so each name is stored
+# once. Afterwards the tags are read back; when anything else differs or
+# a written value is not there exactly once, the original tag set is
+# restored. Only tags change (no remux). Returns non-zero when the tags
+# were not written (FILE unchanged); WORKDIR keeps the XML and tool logs.
 mkv_set_compression_tags() {
-    local file="$1" crf="$2" tier="$3" dir="$4"
+    local file="$1" crf="$2" tier="$3" dir="$4" version="${5:-}" date="${6:-}"
     local orig="$dir/tags_source.xml" new="$dir/tags_compression.xml"
     local back="$dir/tags_written.xml" log="$dir/mkvpropedit_tags.log"
-    local rc restore
+    local rc restore names="$COMPRESSION_CRF_TAG_NAMES" n v
 
     [[ "$crf" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 2
+    if [[ -n "$version" ]]; then
+        [[ "$version" =~ ^[[:graph:]]{1,128}$ && "$date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 2
+        names="$COMPRESSION_ALL_TAG_NAMES"
+    fi
     command -v mkvextract >/dev/null 2>&1 && command -v mkvpropedit >/dev/null 2>&1 || return 3
     mkdir -p "$dir" || return 4
 
@@ -417,15 +496,23 @@ mkv_set_compression_tags() {
         restore="all:"
     fi
 
+    # NAME=VALUE pairs of the new global tag, in writing order
+    local -a want=()
+    [[ -n "$version" ]] &&
+        want+=("COMPRESSION_TOOL=$COMPRESSION_TOOL_NAME" "MOVIE_COMPRESSER_VERSION=$version" "COMPRESSION_DATE=$date")
+    want+=("COMPRESSION_CRF=$crf")
+    [[ -n "$tier" ]] && want+=("COMPRESSION_TIER=$tier")
+
     {
-        _compression_tags_strip < "$orig" | sed '/<\/Tags>/,$d'
+        _compression_tags_strip "$names" < "$orig" | sed '/<\/Tags>/,$d'
         echo '  <Tag>'
         echo '    <Targets>'
         echo '      <TargetTypeValue>50</TargetTypeValue>'
         echo '    </Targets>'
-        printf '    <Simple>\n      <Name>COMPRESSION_CRF</Name>\n      <String>%s</String>\n    </Simple>\n' "$crf"
-        [[ -n "$tier" ]] &&
-            printf '    <Simple>\n      <Name>COMPRESSION_TIER</Name>\n      <String>%s</String>\n    </Simple>\n' "$tier"
+        for n in "${want[@]}"; do
+            printf '    <Simple>\n      <Name>%s</Name>\n      <String>%s</String>\n    </Simple>\n' \
+                "${n%%=*}" "$(_xml_escape "${n#*=}")"
+        done
         echo '  </Tag>'
         echo '</Tags>'
     } > "$new"
@@ -434,16 +521,52 @@ mkv_set_compression_tags() {
     rc=$?
     (( rc <= 1 )) || return 6
 
-    # read back: the other tags must be exactly the ones extracted before
+    # read back: every written value exactly once, and the other tags
+    # exactly the ones extracted before
     if mkvextract "$file" tags "$back" >> "$log" 2>&1 &&
-       grep -q '<Name>COMPRESSION_CRF</Name>' "$back" &&
-       [[ "$(_compression_tags_canon < "$back")" == "$(_compression_tags_canon < "$orig")" ]]; then
-        return 0
+       [[ "$(_compression_tags_canon "$names" < "$back")" == "$(_compression_tags_canon "$names" < "$orig")" ]]; then
+        rc=0
+        for n in "${want[@]}"; do
+            v=$(mkv_global_tag_values "$back" "${n%%=*}")
+            [[ "$v" == "${n#*=}" ]] || { rc=1; echo "read back: ${n%%=*} is \"${v//$'\n'/\", \"}\", not \"${n#*=}\"" >> "$log"; }
+        done
+        (( rc == 0 )) && return 0
     fi
 
     echo "tags read back differ from the source tags: original tags restored" >> "$log"
     mkvpropedit "$file" --tags "$restore" >> "$log" 2>&1
     return 7
+}
+
+# compression_tag_duplicates FILE  ->  one line per compression tag name
+# (COMPRESSION_ALL_TAG_NAMES) stored more than once in the global tags:
+#   NAME<TAB>conflict|duplicate<TAB>VALUE, VALUE, ...
+# "conflict" when the values differ (readers disagree on which one
+# counts), "duplicate" when they are all the same. Nothing printed for a
+# clean file. Read-only (mkvextract into a temporary directory). Returns
+# 3 when MKVToolNix is missing, 5 when the tags cannot be read.
+compression_tag_duplicates() {
+    local file="$1" tmp n vals
+
+    command -v mkvextract >/dev/null 2>&1 || return 3
+    tmp=$(mktemp -d) || return 5
+    if ! mkvextract "$file" tags "$tmp/tags.xml" > /dev/null 2>&1; then
+        rm -rf -- "$tmp"
+        return 5
+    fi
+    if [[ -s "$tmp/tags.xml" ]]; then
+        for n in ${COMPRESSION_ALL_TAG_NAMES//|/ }; do
+            vals=$(mkv_global_tag_values "$tmp/tags.xml" "$n")
+            (( $(grep -c '' <<< "$vals") > 1 )) || continue
+            if (( $(sort -u <<< "$vals" | grep -c '') > 1 )); then
+                printf '%s\tconflict\t%s\n' "$n" "$(paste -sd, <<< "$vals" | sed 's/,/, /g')"
+            else
+                printf '%s\tduplicate\t%s\n' "$n" "$(paste -sd, <<< "$vals" | sed 's/,/, /g')"
+            fi
+        done
+    fi
+    rm -rf -- "$tmp"
+    return 0
 }
 
 # compression_tier_name TIER  ->  TIER when it is a menu CRF tier
@@ -2854,11 +2977,17 @@ build_stream_map() {
 # ------------------------------------------------------------
 
 # emit_job_header SESSION TYPE ITEM_COUNT
+#
+# The movie-compresser version (compresser_version) is taken here, once,
+# when the job is created, and written into the job as a constant: every
+# output of the job records this value, even if the checkout changes
+# while it runs.
 emit_job_header() {
     echo '#!/usr/bin/env bash'
     echo '# Generated by the compress menus. Runs inside tmux.'
     echo 'set -uo pipefail'
     echo
+    printf 'JOB_COMPRESSER_VERSION=%q\n' "$(compresser_version)"
     printf 'WORK_DIR=%q\n' "$WORK_DIR"
     echo 'source "$WORK_DIR/lib/media_probe.sh"'
     echo 'source "$WORK_DIR/lib/media_stats.sh"'
@@ -3284,6 +3413,9 @@ _emit_final_encode() {
     [[ -n "$MAP_META_ARGS" ]] && printf '      %s\\\n' "$MAP_META_ARGS"
     [[ -n "${MAP_ATITLE_ARGS:-}" ]] && printf '      %s\\\n' "$MAP_ATITLE_ARGS"
     printf '      %s\\\n' "$stale"
+    # a source compressed earlier must not lend its provenance to this
+    # encode (item_tag_compression writes the job's own)
+    printf '      -metadata COMPRESSION_TOOL= -metadata MOVIE_COMPRESSER_VERSION= -metadata COMPRESSION_DATE= \\\n'
     printf '      -map_metadata 0 -map_chapters 0 -max_muxing_queue_size 4096 %s\\\n' "$(matroska_mux_args)"
     emit_part_and_covers "$in"
 }

@@ -111,8 +111,12 @@ class InstallerTests(unittest.TestCase):
         self.assertIn(f"File: {self.mkv}", r.stdout)
         self.assertRegex(r.stdout, r"Compression tier:\s+Compact")
         self.assertTrue(r.stdout.rstrip().endswith("Press Enter to close..."))
-        self.install()   # reinstall: same result, no duplicates
+        self.assertFalse(s.viewer_outdated)
+        (self.cfg.viewer_dir / "viewer.py").write_bytes(b"# viewer.py of an earlier version\n")
+        self.assertTrue(installer.get_state(self.cfg).viewer_outdated)
+        self.install()   # reinstall: same result, no duplicates, copy refreshed
         self.assertEqual(installer.get_state(self.cfg).command, s.command)
+        self.assertFalse(installer.get_state(self.cfg).viewer_outdated)
         self.uninstall()
         s = installer.get_state(self.cfg)
         self.assertFalse(s.present or s.viewer_present)
