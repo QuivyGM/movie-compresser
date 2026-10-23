@@ -148,8 +148,8 @@ title_overrides() {
     local i
     for ((i=0; i<AUDIO_COUNT; i++)); do
         [[ "${ACTION[$i]:-}" == "encode" ]] || continue
-        printf '%s\t%s\t-\t%s\t%s\n' "$i" "$(encoder_codec "${TARGET_CODEC[$i]}")" \
-            "${TARGET_CH[$i]}" "${TARGET_LAYOUT[$i]}"
+        printf '%s\t%s\t-\t%s\t%s\t%s\n' "$i" "$(encoder_codec "${TARGET_CODEC[$i]}")" \
+            "${TARGET_CH[$i]}" "${TARGET_LAYOUT[$i]}" "${TARGET_KBPS[$i]}"
     done
 }
 
@@ -697,6 +697,8 @@ while true; do
     else
         echo "  Title: \"$new_title\" (already standard)"
     fi
+    title_warn=$(audio_title_warning "${TITLE[$idx]}" "${LANGUAGE[$idx]}")
+    [[ -n "$title_warn" ]] && echo "  WARNING: $title_warn"
 
     echo
 
@@ -829,6 +831,9 @@ for ((i=0; i<AUDIO_COUNT; i++)); do
     fi
 done
 TITLE_ARGS=$(audio_std_title_args "$IN" "$(title_overrides)")
+# the copied video gets its standard title too (the CRF only when the
+# stream records it); item_finalize_titles confirms both after the mux
+[[ -n "$VIDX" ]] && TITLE_ARGS+=$(_video_title_arg "$(video_std_title_of "$IN" "$VIDX" auto)")
 
 # ============================================================
 # GENERATE JOB

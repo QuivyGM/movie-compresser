@@ -108,6 +108,8 @@ job_init() {
     ITEM_KEPT_KIND=""         # verify-failed | finalize-failed
     ITEM_CHILD=""
     ITEM_TMP=""
+    ITEM_TITLES_STATE=""      # final | mux:REASON (item_finalize_titles)
+    ITEM_STATS_FRESH=0        # statistics refreshed before the rename
     declare -gA ITEM_EXP=()
 
     # CRF retry state (item_crf_encode / job_crf_batch)
@@ -241,6 +243,8 @@ item_begin() {
     ITEM_KEPT_KIND=""
     ITEM_TMP="$JOB_LOG_DIR/item-$ITEM_INDEX.tmp"
     ITEM_EXP=()
+    ITEM_TITLES_STATE=""
+    ITEM_STATS_FRESH=0
     ITEM_CRF_RUN=""
     ITEM_OVER_CEILING=0
     ITEM_BELOW_FLOOR=0
@@ -585,6 +589,109 @@ item_tag_compression() {
     return 0
 }
 
+# item_title_crf  ->  the CRF the finalized video title names: the final
+# CRF of a CRF encode (ITEM_EXP[crf], after every retry / season
+# decision), "auto" for a copied video (the CRF its x265 settings
+# record, video_stream_crf), "" otherwise (two-pass)
+item_title_crf() {
+    if [[ "${ITEM_EXP[mode]:-}" == crf ]]; then
+        printf '%s' "${ITEM_EXP[crf]:-}"
+    elif [[ "${ITEM_EXP[video]:-}" == copy ]]; then
+        printf auto
+    fi
+}
+
+# item_title_transcoded FILE  ->  FFmpeg stream indexes of the output
+# audio tracks that were transcoded (ITEM_EXP atrans: source audio
+# indexes; amap: source -> output audio index)
+item_title_transcoded() {
+    local -a aidx=() pairs=()
+    local -A out=()
+    local v s o
+
+    mapfile -t aidx < <(ffprobe -v error -select_streams a -show_entries stream=index \
+        -of csv=p=0 "$1" 2>/dev/null | tr -d '\r')
+    IFS=, read -ra pairs <<< "${ITEM_EXP[amap]:-}"
+    for v in "${pairs[@]+"${pairs[@]}"}"; do
+        s="${v%%:*}" o="${v#*:}"
+        [[ "$s" =~ ^[0-9]+$ && "$o" =~ ^[0-9]+$ ]] && out[$s]="$o"
+    done
+    for s in ${ITEM_EXP[atrans]:+${ITEM_EXP[atrans]//,/ }}; do
+        o="${out[$s]:-$s}"
+        [[ -n "${aidx[$o]:-}" ]] && printf '%s ' "${aidx[$o]}"
+    done
+    return 0
+}
+
+# item_finalize_titles
+#
+# Gives the main video and every audio track of "$ITEM_PART" its
+# standard title (mkv_std_track_titles), built from the finished output
+# itself: the video's codec / resolution / bit depth / HDR format and
+# the final CRF (item_title_crf), each audio track's codec / channels /
+# language / description and actual bit rate (its constant rate, else
+# the measured average of its packets). The mux already wrote the titles
+# that were known before the encode; this adds what only the result
+# knows and corrects anything that differs. Called by item_succeeded
+# after the last remux / restore step and the compression tags, before
+# the verification (which checks the titles against the same streams).
+#
+# The track statistics are refreshed first (refresh_mkv_stats: the
+# measured rates; ITEM_STATS_FRESH=1 so they are not rewritten after the
+# rename). Track names only (mkv_write_track_titles: mkvpropedit, no
+# remux, no stream data touched, nothing written unless the FFmpeg ->
+# Matroska track mapping is certain). Sets ITEM_TITLES_STATE: final
+# (standard titles of the output) | mux:REASON (not finalized; the
+# titles written by the mux stay). A failure is a warning only.
+item_finalize_titles() {
+    local crf trans measured="" idx kind cur new rc n=0
+    local -A twant=()
+
+    ITEM_TITLES_STATE="mux:not an MKV output"
+    ITEM_STATS_FRESH=0
+    [[ "${ITEM_OUTPUT,,}" == *.mkv ]] || return 0
+    if ! command -v mkvpropedit >/dev/null 2>&1 || ! command -v mkvmerge >/dev/null 2>&1; then
+        ITEM_TITLES_STATE="mux:MKVToolNix not found"
+        echo "WARNING: track titles not finalized (mkvtoolnix missing; the titles written by the mux stay)."
+        return 0
+    fi
+
+    echo "Finalizing track titles from the output streams..."
+    # measured rates: the refreshed statistics, else a packet scan (the
+    # verification reads them the same way)
+    if refresh_mkv_stats "$ITEM_PART" >> "$ITEM_LOG" 2>&1; then
+        ITEM_STATS_FRESH=1
+    fi
+    stats_load "$ITEM_PART" "" tags || stats_load "$ITEM_PART"
+    measured="$STATS_LINES"
+
+    crf=$(item_title_crf)
+    trans=$(item_title_transcoded "$ITEM_PART")
+    local w
+    while IFS=$'\t' read -r idx kind cur new; do
+        if [[ "$kind" == audio ]]; then
+            w=$(audio_title_warning "$cur" "$(stream_tag "$ITEM_PART" "$idx" language)")
+            [[ -n "$w" ]] && echo "WARNING: audio stream $idx \"$cur\": $w"
+        fi
+        [[ -n "$idx" && -n "$new" && "$cur" != "$new" ]] || continue
+        twant[$idx]="$new"
+        ((n += 1))
+        echo "  ${kind^} title: $([[ "$cur" == - ]] && echo "(none)" || echo "\"$cur\"") -> \"$new\""
+    done < <(mkv_std_track_titles "$ITEM_PART" "$crf" "$trans" "$(audio_measured_kbps "$measured")")
+
+    mkv_write_track_titles "$ITEM_PART" twant
+    rc=$?
+    if (( rc == 0 )); then
+        ITEM_TITLES_STATE="final"
+        (( n > 0 )) && echo "Track titles finalized ($n updated; track names only)." ||
+            echo "Track titles already standard."
+    else
+        ITEM_TITLES_STATE="mux:$MKV_TITLES_MSG"
+        echo "WARNING: track titles not finalized ($MKV_TITLES_MSG; the titles written by the mux stay)."
+    fi
+    return 0
+}
+
 # item_part_complete  ->  0 when "$ITEM_PART" was written and covers the
 # whole source (ffmpeg exits 0 when stopped with 'q'); otherwise 1 with
 # ITEM_FAIL_REASON set
@@ -622,6 +729,10 @@ item_succeeded() {
     # the final CRF (CRF encodes only), after the last restore step and
     # before the verification reports it
     item_tag_compression
+
+    # standard track titles from the finished output (final CRF, actual
+    # audio bit rates), before the verification checks them
+    item_finalize_titles
 
     # Metadata verification before the output gets its final name: a
     # Dolby Vision / HDR10+ preservation that did not survive, or lost
@@ -667,8 +778,10 @@ item_succeeded() {
         rm -f -- "$ITEM_PASSLOG" "$ITEM_PASSLOG".*
     fi
 
+    # already refreshed by item_finalize_titles (nothing changed the
+    # tracks since: the rename keeps the file as it is)
     echo "Refreshing MKV track statistics metadata..."
-    if refresh_mkv_stats "$final" >/dev/null; then
+    if (( ${ITEM_STATS_FRESH:-0} == 1 )) || refresh_mkv_stats "$final" >/dev/null; then
         echo "MKV statistics updated from actual output."
     else
         echo "WARNING: MKV statistics update failed (is mkvtoolnix installed?)."

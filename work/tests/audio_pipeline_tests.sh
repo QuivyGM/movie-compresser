@@ -18,7 +18,7 @@
 #  3. The Raid 2 case: DTS 5.1(side) Compact -> AC-3 5.1(side); per-
 #     channel tone identity; copied tracks payload-identical; language /
 #     default / forced / commentary kept, standard titles (Language |
-#     Codec | Channels | Type) on every track; no "Multiple -codec"
+#     Codec | Channels | Bitrate | Type) on every track; no "Multiple -codec"
 #  4. eight tracks, different codecs and layouts, video not first:
 #     AC-3 2.1 / 5.0(side) / layout-less PCM stereo 44.1 kHz / FLAC
 #     5.1(back) 96 kHz / PCM mono transcoded, Opus stereo High -> AC-3,
@@ -89,6 +89,15 @@ dominant_tones() {
 
 probe_a() {   # FILE AUDIO_INDEX ENTRIES  ->  csv
     ffprobe -v error -select_streams "a:$2" -show_entries "$3" -of csv=p=0 "$1" 2>/dev/null | tr -d '\r'
+}
+# mk_rate FILE AUDIO_INDEX  ->  " | N kbps": the measured rate a
+# variable-rate track's title carries once the titles are finalized
+# (statistics tags, MKVToolNix); "" without MKVToolNix
+mk_rate() {
+    local b
+    (( HAVE_MKV == 1 )) || return 0
+    b=$(probe_a "$1" "$2" stream_tags=BPS | head -n 1)
+    [[ "$b" =~ ^[0-9]+$ ]] && printf ' | %d kbps' $(( (b + 500) / 1000 ))
 }
 
 # ------------------------------------------------------------
@@ -335,9 +344,9 @@ else
     done
     eq    "output: languages / dispositions"          "$(ffprobe -v error -select_streams a -show_entries stream_tags=language:stream_disposition=default,forced,comment -of csv=p=0 "$OA" | tr -d '\r' | tr '\n' ' ')" \
                                                       "$(ffprobe -v error -select_streams a -show_entries stream_tags=language:stream_disposition=default,forced,comment -of csv=p=0 "$RAID" | tr -d '\r' | tr '\n' ' ')"
-    eq    "output: AC-3 track standard title"         "$(probe_a "$OA" 1 stream_tags=title)" "Indonesian | AC-3 | 5.1"
-    eq    "output: copied tracks standard titles"     "$(probe_a "$OA" 0 stream_tags=title)/$(probe_a "$OA" 2 stream_tags=title)" "English | E-AC-3 | 5.1/English | AAC | 2.0 | Commentary"
-    check "menu: planned title shown"                "grep -q 'Title: \"Indonesian DTS 5.1\" -> \"Indonesian | AC-3 | 5.1\"' '$T/raid_menu.log'"
+    eq    "output: AC-3 track standard title"         "$(probe_a "$OA" 1 stream_tags=title)" "Indonesian | AC-3 | 5.1 | 384 kbps"
+    eq    "output: copied tracks standard titles"     "$(probe_a "$OA" 0 stream_tags=title)/$(probe_a "$OA" 2 stream_tags=title)" "English | E-AC-3 | 5.1 | 384 kbps/English | AAC | 2.0$(mk_rate "$OA" 2) | Commentary"
+    check "menu: planned title shown"                "grep -q 'Title: \"Indonesian DTS 5.1\" -> \"Indonesian | AC-3 | 5.1 | 384 kbps\"' '$T/raid_menu.log'"
     check "job: atitle=std, one title per audio track" "has '$JA' 'atitle=std' && (( \$(grep -oE -- '-metadata:s:a:[0-9]+ title=' '$JA' | sort -u | wc -l) == 3 ))"
     check "verify: titles as planned"                "grep -q 'Track titles: *AS PLANNED (3 audio title' '$T/raid_run.log'"
     eq    "output: subtitles kept"                    "$(ffprobe -v error -select_streams s -show_entries stream_tags=language:stream_disposition=default,forced -of csv=p=0 "$OA" | tr -d '\r' | tr '\n' ' ')" "1,0,eng 0,1,ind "
@@ -409,9 +418,9 @@ check "verify: every bit rate as planned"          "[[ \$(grep -cE 'Audio [0-9]+
 check "verify: 6.0 / 7.1 hash-matched"             "grep -q 'Audio track 2: *COPIED (FLAC 6.0, 48000 Hz, payload MD5 MATCH)' '$T/mix_run.log' && grep -q 'Audio track 6: *COPIED (FLAC 7.1, 48000 Hz, payload MD5 MATCH)' '$T/mix_run.log'"
 check "verify: no failure"                         "! grep -q 'RESULT: FAILED' '$T/mix_run.log'"
 eq    "output: every track its standard title"     "$(ffprobe -v error -select_streams a -show_entries stream_tags=title -of csv=p=0 "$OB" | tr -d '\r' | tr '\n' '/')" \
-      "English | AC-3 | 2.1/French | FLAC | 6.0/German | AC-3 | 5.0/Spanish | AC-3 | 2.0/Italian | AC-3 | 5.1/Japanese | FLAC | 7.1/Korean | AC-3 | 1.0 | Commentary/Portuguese | AC-3 | 2.0/"
+      "English | AC-3 | 2.1 | 256 kbps/French | FLAC | 6.0$(mk_rate "$OB" 1)/German | AC-3 | 5.0 | 256 kbps/Spanish | AC-3 | 2.0 | 192 kbps/Italian | AC-3 | 5.1 | 256 kbps/Japanese | FLAC | 7.1$(mk_rate "$OB" 5)/Korean | AC-3 | 1.0 | 96 kbps | Commentary/Portuguese | AC-3 | 2.0 | 320 kbps/"
 eq    "output: titles / dispositions"              "$(probe_a "$OB" 4 stream_tags=title)|$(probe_a "$OB" 7 stream_tags=title)|$(ffprobe -v error -select_streams a -show_entries stream_disposition=default,comment -of csv=p=0 "$OB" | tr -d '\r' | tr '\n' ' ')" \
-      "Italian | AC-3 | 5.1|Portuguese | AC-3 | 2.0|$(ffprobe -v error -select_streams a -show_entries stream_disposition=default,comment -of csv=p=0 "$MIX" | tr -d '\r' | tr '\n' ' ')"
+      "Italian | AC-3 | 5.1 | 256 kbps|Portuguese | AC-3 | 2.0 | 320 kbps|$(ffprobe -v error -select_streams a -show_entries stream_disposition=default,comment -of csv=p=0 "$MIX" | tr -d '\r' | tr '\n' ' ')"
 
 # ------------------------------------------------------------
 echo

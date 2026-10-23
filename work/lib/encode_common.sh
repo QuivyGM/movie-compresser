@@ -61,12 +61,13 @@ cleanup_finished_jobs() {
 }
 
 # Refresh MKV track statistics tags (BPS, NUMBER_OF_BYTES, ...) from
-# the actual file contents. Returns non-zero when not possible.
+# the actual file contents (an MKV, or a job's "<output>.mkv.part").
+# Returns non-zero when not possible.
 refresh_mkv_stats() {
     local file="$1"
 
     case "${file,,}" in
-        *.mkv) ;;
+        *.mkv|*.mkv.part) ;;
         *) return 2 ;;
     esac
 
@@ -373,7 +374,9 @@ mkv_track_map() {
         return 1
     fi
 
-    while IFS=, read -r k w h; do
+    # newer ffprobe appends an empty field for streams with side data
+    # (HDR10 mastering metadata, ...): the rest goes to _
+    while IFS=, read -r k w h _; do
         [[ "$k" =~ ^[0-9]+$ ]] && dims[$k]="${w%$'\r'}x${h%$'\r'}"
     done < <(ffprobe -v error -show_entries stream=index,width,height -of csv=p=0 "$file" 2>/dev/null)
 
@@ -2253,7 +2256,8 @@ audio_codec_name() {
 }
 
 # audio_channel_notation LAYOUT CHANNELS  ->  "5.1", "2.0", "7.1.4";
-# "6ch" when the layout is unknown or does not have CHANNELS channels
+# "6ch" when the layout is unknown (1 / 2 channels: "1.0" / "2.0") or
+# does not have CHANNELS channels
 audio_channel_notation() {
     local l="${1:-}" n="${2:-}" r="" c
     local -a list=()
@@ -2303,29 +2307,77 @@ audio_channel_notation() {
         for main in "${list[@]}"; do ((c += main)); done
         (( c == n )) || r=""
     fi
+    # no stored layout (Matroska PCM never has one): 1 and 2 channels have
+    # only one standard order (mono / stereo); more are not guessed
+    if [[ -z "$r" && ( -z "${1:-}" || "$1" == - || "$1" == unknown ) ]]; then
+        case "$n" in 1) r=1.0 ;; 2) r=2.0 ;; esac
+    fi
     if [[ -z "$r" && "$n" =~ ^[1-9][0-9]*$ ]]; then
         r="${n}ch"
     fi
     printf '%s' "$r"
 }
 
-# audio_title_description TITLE LANG_CODE COMMENT HI VI  ->  the Type
-# part(s): the descriptive rest of TITLE (no codec / channel / language
-# / rate claims), plus what the dispositions say when the rest does not
-# already say it. " | "-separated; "" = none.
-audio_title_description() {
-    local t="${1:-}" code="${2:-}" name re="" r lc
-    local -a parts=()
+# Release information in a track title (resolution, source, video codec,
+# dynamic range), as one lower-case token: never part of an audio
+# description. Only tokens that cannot be ordinary words of a
+# description ("Complete", "Hybrid", initials such as "DV" can be part
+# of a commentary credit: they are not listed).
+AUDIO_DESC_RELEASE_RE='^(4320p|2160p|1440p|1080[pi]|720p|576[pi]|480[pi]|4k|8k|uhd|blu-?ray|bdremux|bdrip|brrip|remux|web-?dl|web-?rip|webrip|hdtv|hdrip|dvdrip|hevc|avc|av1|vp9|[xh]\.?26[45]|hdr10|hdr10\+|hdr10plus|dovi|(8|10)-?bit)$'
+
+# _audio_desc_strip_release TEXT  ->  TEXT without release information:
+# AUDIO_DESC_RELEASE_RE tokens and a release group tag: "-FGT" as the
+# last word, "[FGT]" / "{FGT}" as the first or last word (upper-case
+# letters / digits, 2-8 characters: a credit such as "[John Smith]" or
+# "-nolan" is not one)
+_audio_desc_strip_release() {
+    local t="${1:-}" w lw out=() n i
+
+    [[ -n "$t" ]] || return 0
+    read -ra w <<< "$t"
+    n=${#w[@]}
+    for ((i = 0; i < n; i++)); do
+        lw="${w[$i],,}"
+        lw="${lw#[\[\(\{]}"; lw="${lw%[\]\)\},;:]}"
+        [[ "$lw" =~ $AUDIO_DESC_RELEASE_RE ]] && continue
+        (( i == n - 1 )) && [[ "${w[$i]}" =~ ^-[A-Z0-9]{2,8}$ ]] && continue
+        (( i == 0 || i == n - 1 )) && [[ "${w[$i]}" =~ ^[\[\{][A-Z0-9]{2,8}[\]\}]$ ]] && continue
+        out+=("${w[$i]}")
+    done
+    printf '%s' "${out[*]-}"
+}
+
+# audio_desc_meaningful TEXT  ->  0 when the (lower-case) rest of a title
+# names a distinction worth keeping: commentary, audio description /
+# narration, SDH, a mix / version / cut, an isolated score, a dub, or a
+# regional language variant (Latin American Spanish, Castilian, ...)
+audio_desc_meaningful() {
+    local t="${1,,}"
+
+    [[ "$t" =~ comment|kommentar|descri|narrat|(^|[^a-z])(ad|sdh|alt|m\&e|cut|ost)($|[^a-z])|hearing|dialog|mix|theatrical|theat(er|re)|original|home\ ?video|remaster|restor|alternat|isolated|score|music|effects|dub|karaoke|instrumental|cast|director|crew|writer|producer|bonus|extended|edition|version|imax|latin|castilian|european|brazil|canad|quebec|parisian|flemish|swiss|simplified|traditional|mandarin|cantonese ]] ||
+    [[ "$1" == *副音声* || "$1" == *解説* || "$1" == *コメンタリー* || "$1" == *吹替* || "$1" == *オリジナル* ]]
+}
+
+# _audio_title_rest TITLE LANG_CODE  ->  the descriptive rest of TITLE,
+# exactly as written: every codec / object-audio / channel / rate /
+# bit-depth / sample-rate claim, the track's own language and release
+# information removed, connectors left at either end dropped; "" when
+# only filler remains ("Audio", "Surround", "Track 2", ...)
+_audio_title_rest() {
+    local t="${1:-}" code="${2:-}" name re="" r
 
     [[ "$t" == "-" ]] && t=""
+    [[ -n "$t" ]] || return 0
     name=$(audio_lang_name "$code")
     code="${code,,}"; code="${code%%[-_]*}"
     for r in "${name,,}" "$code"; do
         [[ -n "$r" && "$r" != - && "$r" =~ ^[a-z\ ]+$ ]] && re+="${re:+|}$r"
     done
 
-    r=""
-    [[ -n "$t" ]] && r=$(_audio_title_awk residue "$t" "" "" "" "" "$re")
+    # release text: in the title as written (a group tag is a word of its
+    # own there) and in what is left once the claims are removed
+    r=$(_audio_title_awk residue "$(_audio_desc_strip_release "$t")" "" "" "" "" "$re")
+    r=$(_audio_desc_strip_release "$r")
     # connectors left over from removed claims ("TrueHD with Atmos" ->
     # "with"): dropped at either end; inside the text they stay
     local conn='(with|and|plus|in|on|feat\.?|featuring|w/|&|\+)' sep='[][[:space:]|/,;:@()-]'
@@ -2335,13 +2387,59 @@ audio_title_description() {
     while [[ "${r,,}" =~ (^|${sep}+)${conn}$ ]]; do
         r="${r:0:$(( ${#r} - ${#BASH_REMATCH[0]} ))}"
     done
-    while [[ "$r" =~ ^${sep} ]]; do r="${r:1}"; done
-    while [[ "$r" =~ ${sep}$ ]]; do r="${r:0:$(( ${#r} - 1 ))}"; done
-    lc="${r,,}"
-    # nothing meaningful left ("Audio", "Surround", "Track 2", ...)
-    if [[ "$lc" =~ ^((main|original)\ )?(audio|sound|track|surround|audio\ track)(\ #?[0-9]+)?$ ]]; then
-        r="" lc=""
+    # separators at either end; a bracket that closes / opens one inside
+    # the text stays ("Commentary (Complete)", "[John Smith] Commentary")
+    while [[ "$r" =~ ^${sep} ]]; do
+        [[ ( "${r:0:1}" == "(" && "$r" == *")"* ) || ( "${r:0:1}" == "[" && "$r" == *"]"* ) ]] && break
+        r="${r:1}"
+    done
+    while [[ "$r" =~ ${sep}$ ]]; do
+        [[ ( "${r: -1}" == ")" && "$r" == *"("* ) || ( "${r: -1}" == "]" && "$r" == *"["* ) ]] && break
+        r="${r:0:$(( ${#r} - 1 ))}"
+    done
+    [[ "${r,,}" =~ ^((main|original)\ )?(audio|sound|track|surround|audio\ track)(\ #?[0-9]+)?$ ]] && r=""
+    printf '%s' "$r"
+}
+
+# audio_title_unparsed TITLE LANG_CODE  ->  the rest of TITLE that was
+# not understood with confidence: a rest that is no recognised
+# description (a name, a credit without "commentary", ...), or one that
+# is not found verbatim in TITLE (removing claims from the middle of it,
+# or a dotted name such as "D.V.", would change the wording); "" when
+# the whole title was understood. A title with such a rest is never
+# rewritten (audio_std_title keeps it) and is reported for a check.
+audio_title_unparsed() {
+    local r
+
+    r=$(_audio_title_rest "$1" "${2:-}")
+    [[ -n "$r" ]] || return 0
+    if ! audio_desc_meaningful "$r" || [[ "$1" != *"$r"* ]]; then
+        printf '%s' "$r"
     fi
+    return 0
+}
+
+# audio_title_warning TITLE LANG_CODE  ->  the warning for a title whose
+# description is not understood ("" = none): the same text everywhere
+# (compression jobs, verify.sh, audio_titles.sh)
+audio_title_warning() {
+    local u
+
+    u=$(audio_title_unparsed "$1" "${2:-}")
+    [[ -n "$u" ]] && printf 'description "%s" not recognised: kept as written, check manually' "$u"
+    return 0
+}
+
+# audio_title_description TITLE LANG_CODE COMMENT HI VI  ->  the Type
+# part(s): the descriptive rest of TITLE, kept exactly as written
+# (commentary credits included), plus what the dispositions say when the
+# rest does not already say it. " | "-separated; "" = none.
+audio_title_description() {
+    local r lc
+    local -a parts=()
+
+    r=$(_audio_title_rest "${1:-}" "${2:-}")
+    lc="${r,,}"
     [[ -n "$r" ]] && parts+=("$r")
 
     [[ "${3:-0}" == 1 && "$lc" != *comment* ]] && parts+=("Commentary")
@@ -2372,15 +2470,24 @@ _title_join() {
 }
 
 # audio_std_title LANG CODEC PROFILE CHANNELS LAYOUT OLD_TITLE COMMENT
-#                 HI VI COPIED
-#   ->  "English | AC-3 | 5.1 | Commentary"
+#                 HI VI COPIED [KBPS]
+#   ->  "English | AC-3 | 5.1 | 640 kbps | Commentary"
 # COPIED=1: the stream is copied, so object audio named only in the old
 # title (older FFmpeg, see audio_object_kind) still describes it; a
-# transcoded track never has object audio.
+# transcoded track never has object audio. KBPS: the bit rate of the
+# track (audio_title_kbps; "" = unknown: left out).
+# An old title whose description cannot be parsed with confidence
+# (audio_title_unparsed) is kept: a copied track keeps it unchanged; a
+# transcoded one (whose old codec / channel claims would be untrue) gets
+# the standard title with that text kept verbatim as its description.
 audio_std_title() {
-    local old="${6:-}" object="" out=() p cname
+    local old="${6:-}" object="" out=() p cname kbps="${11:-}"
 
     [[ "$old" == "-" ]] && old=""
+    if [[ -n "$old" && "${10:-0}" == 1 && -n "$(audio_title_unparsed "$old" "$1")" ]]; then
+        printf '%s' "$old"
+        return 0
+    fi
     cname=$(audio_codec_name "$2" "$3")
     if [[ "${10:-0}" == 1 ]]; then
         object=$(audio_object_kind "$2" "$3" "$old")
@@ -2391,8 +2498,9 @@ audio_std_title() {
         [[ "$2" =~ ^(ac3|eac3)$ ]] && audio_title_ex "$old" && cname+=" EX"
     fi
 
+    [[ "$kbps" =~ ^[1-9][0-9]*$ ]] && kbps+=" kbps" || kbps=""
     for p in "$(audio_lang_name "$1")" "$cname" \
-             "$(audio_channel_notation "$5" "$4")" \
+             "$(audio_channel_notation "$5" "$4")" "$kbps" \
              "$(audio_title_description "$old" "$1" "${7:-0}" "${8:-0}" "${9:-0}")"; do
         [[ -n "$p" ]] && out+=("$p")
     done
@@ -2400,29 +2508,82 @@ audio_std_title() {
     _title_join "${out[@]+"${out[@]}"}"
 }
 
+# audio_title_kbps CODEC PROFILE BIT_RATE BITS_PER_RAW_SAMPLE SAMPLE_RATE
+#                  CHANNELS [MEASURED_KBPS]  ->  whole kb/s for the title
+# The constant rate the stream itself states (AC-3 / E-AC-3 / DTS core /
+# PCM, audio_title_stream_facts), else MEASURED_KBPS (the average of the
+# actual packets: statistics tags / packet scan, audio_measured_kbps);
+# "" when neither is known. A variable-rate stream's bit_rate field (the
+# DTS core rate of DTS-HD MA, ...) is never used.
+audio_title_kbps() {
+    local n
+
+    read -r n _ <<< "$(audio_title_stream_facts "$1" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}")"
+    if [[ "$n" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%d' $(( (n + 500) / 1000 ))
+    elif [[ "${7:-}" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%d' "$7"
+    fi
+    return 0
+}
+
+# audio_title_facts FILE  ->  "index<TAB>bit_rate<TAB>bits_per_raw_sample
+# <TAB>sample_rate" per audio stream ("" = not reported)
+audio_title_facts() {
+    # key=value: ffprobe prints csv fields in its own order
+    ffprobe -v error -select_streams a \
+        -show_entries stream=index,bit_rate,bits_per_raw_sample,sample_rate \
+        -of default=nw=1 "$1" 2>/dev/null |
+    awk -F= '
+        function flush() { if (i != "") printf "%s\t%s\t%s\t%s\n", i, v["bit_rate"], v["bits_per_raw_sample"], v["sample_rate"] }
+        { sub(/\r$/, "") }
+        $1 == "index" { flush(); i = $2; split("", v); next }
+        { v[$1] = ($2 ~ /^[0-9]+$/) ? $2 : "" }
+        END { flush() }'
+}
+
+# audio_measured_kbps STATS_LINES  ->  "index<TAB>kbps" per audio stream
+# of stats_load's STATS_LINES (statistics tags or packet scan of the
+# actual file; kbps whole kb/s)
+audio_measured_kbps() {
+    awk '$2 == "audio" && $5 ~ /^[0-9]+$/ && $5 > 0 { printf "%s\t%s\n", $1, $5 }' <<< "${1:-}"
+}
+
 # audio_std_title_plan FILE [OVERRIDES]
 #   ->  "src_index<TAB>old title<TAB>new title" for every audio track of
 #       FILE (source order; old "-" = none). OVERRIDES: lines
-#       "src_index<TAB>codec<TAB>profile<TAB>channels<TAB>layout" with
-#       the output properties of transcoded tracks; every other track is
-#       copied (its own properties).
+#       "src_index<TAB>codec<TAB>profile<TAB>channels<TAB>layout[<TAB>kbps]"
+#       with the output properties of transcoded tracks (kbps: the
+#       encoder's rate; only titled for a constant rate codec); every
+#       other track is copied (its own properties and its stated constant
+#       rate). The rate of a variable-rate track is only known after the
+#       mux: item_finalize_titles adds it.
 audio_std_title_plan() {
-    local file="$1" i=0 oc op och ol copied
+    local file="$1" i=0 oc op och ol ok copied kbps br raw sr
     local -a f o
-    local -A ov=()
+    local -A ov=() fact=()
 
     while IFS=$'\t' read -r -a o; do
-        [[ "${o[0]:-}" =~ ^[0-9]+$ ]] && ov[${o[0]}]="${o[1]:--}"$'\t'"${o[2]:--}"$'\t'"${o[3]:--}"$'\t'"${o[4]:--}"
+        [[ "${o[0]:-}" =~ ^[0-9]+$ ]] && ov[${o[0]}]="${o[1]:--}"$'\t'"${o[2]:--}"$'\t'"${o[3]:--}"$'\t'"${o[4]:--}"$'\t'"${o[5]:--}"
     done <<< "${2:-}"
+
+    while IFS=$'\t' read -r -a o; do
+        [[ "${o[0]:-}" =~ ^[0-9]+$ ]] && fact[${o[0]}]="${o[1]:-}|${o[2]:-}|${o[3]:-}"
+    done < <(audio_title_facts "$file")
 
     while IFS=$'\t' read -r -a f; do
         oc="${f[2]}" op="${f[3]}" och="${f[4]}" ol="${f[5]}" copied=1
+        IFS='|' read -r br raw sr <<< "${fact[${f[0]}]:-||}"
         if [[ -n "${ov[$i]:-}" ]]; then
-            IFS=$'\t' read -r oc op och ol <<< "${ov[$i]}"
+            IFS=$'\t' read -r oc op och ol ok <<< "${ov[$i]}"
             copied=0
+            # the encoder's rate is the stream's rate for CBR codecs only
+            br="" raw=""
+            [[ "$oc" =~ ^(ac3|eac3|mp2)$ && "$ok" =~ ^[0-9]+$ ]] && br=$(( ok * 1000 ))
         fi
+        kbps=$(audio_title_kbps "$oc" "$op" "$br" "$raw" "$sr" "$och")
         printf '%s\t%s\t%s\n' "$i" "${f[13]}" \
-            "$(audio_std_title "${f[12]}" "$oc" "$op" "$och" "$ol" "${f[13]}" "${f[8]}" "${f[9]}" "${f[10]}" "$copied")"
+            "$(audio_std_title "${f[12]}" "$oc" "$op" "$och" "$ol" "${f[13]}" "${f[8]}" "${f[9]}" "${f[10]}" "$copied" "$kbps")"
         ((i += 1))
     done < <(_audio_rows "$file")
 }
@@ -2444,11 +2605,292 @@ audio_std_title_args() {
 }
 
 # ------------------------------------------------------------
-# Video track titles. There is no standard video title (a video title
-# is usually the movie name or a release name): only claims the stream
-# disproves are found / removed (codec, resolution, HDR / Dolby Vision /
-# HDR10+, bit depth); neutral text and true claims stay, and a missing
-# title is never created.
+# Standard titles of an existing file (finalization / verification)
+# ------------------------------------------------------------
+
+# mkv_std_track_titles FILE [CRF [TRANSCODED [MEASURED [audio]]]]
+#   ->  "ffmpeg_index<TAB>video|audio<TAB>current title<TAB>standard
+#       title" for the main video and every audio track of FILE, built
+#       from the streams of FILE itself (current "-" = none; an empty
+#       standard title: nothing known to build one from).
+# CRF: of the main video (video_std_title_of: a value, "auto", "").
+# TRANSCODED: FFmpeg stream indexes (comma / space list) of audio tracks
+# that were re-encoded (object audio named only in a title is not kept
+# for them). MEASURED: "index<TAB>kbps" lines (audio_measured_kbps) for
+# tracks without a stated constant rate. The current title only lends
+# an audio track its description (audio_title_description). "audio":
+# the audio tracks only (no video probe at all: stream headers only).
+mkv_std_track_titles() {
+    local file="$1" crf="${2:-}" vidx t idx kbps br raw sr copied
+    local -a f
+    local -A trans=() meas=() fact=()
+
+    for idx in ${3:+${3//,/ }}; do trans[$idx]=1; done
+    while IFS=$'\t' read -r idx kbps; do
+        [[ "$idx" =~ ^[0-9]+$ ]] && meas[$idx]="$kbps"
+    done <<< "${4:-}"
+
+    vidx=""
+    [[ "${5:-}" == audio ]] || vidx=$(main_video_index "$file")
+    if [[ -n "$vidx" ]]; then
+        t="-"
+        while IFS=$'\t' read -r -a f; do
+            [[ "${f[0]}" == "$vidx" ]] && { t="${f[13]}"; break; }
+        done < <(stream_meta "$file")
+        printf '%s\tvideo\t%s\t%s\n' "$vidx" "$t" "$(video_std_title_of "$file" "$vidx" "$crf")"
+    fi
+
+    while IFS=$'\t' read -r -a f; do
+        [[ "${f[0]:-}" =~ ^[0-9]+$ ]] && fact[${f[0]}]="${f[1]:-}|${f[2]:-}|${f[3]:-}"
+    done < <(audio_title_facts "$file")
+
+    while IFS=$'\t' read -r -a f; do
+        IFS='|' read -r br raw sr <<< "${fact[${f[0]}]:-||}"
+        copied=1
+        [[ -n "${trans[${f[0]}]:-}" ]] && copied=0
+        kbps=$(audio_title_kbps "${f[2]}" "${f[3]}" "$br" "$raw" "$sr" "${f[4]}" "${meas[${f[0]}]:-}")
+        printf '%s\taudio\t%s\t%s\n' "${f[0]}" "${f[13]}" \
+            "$(audio_std_title "${f[12]}" "${f[2]}" "${f[3]}" "${f[4]}" "${f[5]}" "${f[13]}" \
+                "${f[8]}" "${f[9]}" "${f[10]}" "$copied" "$kbps")"
+    done < <(_audio_rows "$file")
+}
+
+# mkv_write_track_titles FILE WANT_ARRAY_NAME
+#
+# Writes track names into the MKV FILE with mkvpropedit: WANT is an
+# associative array FFmpeg stream index -> title ("-" removes it).
+# Track names only: no remux, no stream data, no other metadata touched.
+# FFmpeg streams are matched to Matroska track numbers by MKVToolNix
+# identification first (mkv_track_map; the numberings are never assumed
+# to line up); tracks the two cannot tell apart must all get the same
+# title. Nothing is written unless the mapping is certain. The titles are
+# read back through MKVToolNix and FFmpeg.
+# Returns 0 (written and read back; nothing to write is success too),
+# 3 MKVToolNix missing, 4 mapping not certain, 5 identical tracks need
+# different titles, 6 a stream has no Matroska track, 7 mkvpropedit
+# failed, 8 the read-back differs; MKV_TITLES_MSG says why.
+mkv_write_track_titles() {
+    local file="$1" map ffi nums x
+    local -n W="$2"
+    local -a edits=() f
+    local -A gwant=() byno=()
+
+    MKV_TITLES_MSG=""
+    (( ${#W[@]} )) || return 0
+    if ! command -v mkvpropedit >/dev/null 2>&1 || ! command -v mkvmerge >/dev/null 2>&1; then
+        MKV_TITLES_MSG="MKVToolNix (mkvpropedit / mkvmerge) not found"
+        return 3
+    fi
+    if ! map=$(mkv_track_map "$file"); then
+        MKV_TITLES_MSG="track mapping not certain (${map#ERR$'\t'})"
+        return 4
+    fi
+    while IFS=$'\t' read -r ffi nums; do
+        [[ -n "$ffi" ]] || continue
+        x="${W[$ffi]-$'\001'}"
+        if [[ -n "${gwant[$nums]+x}" && "${gwant[$nums]}" != "$x" ]]; then
+            MKV_TITLES_MSG="tracks $nums look identical but need different titles"
+            return 5
+        fi
+        gwant[$nums]="$x"
+    done <<< "$map"
+    for ffi in "${!W[@]}"; do
+        grep -q "^$ffi"$'\t' <<< "$map" || {
+            MKV_TITLES_MSG="FFmpeg stream $ffi has no Matroska track"
+            return 6
+        }
+    done
+    for nums in "${!gwant[@]}"; do
+        [[ "${gwant[$nums]}" != $'\001' ]] || continue
+        IFS=, read -ra f <<< "$nums"
+        for x in "${f[@]}"; do
+            byno[$x]="${gwant[$nums]}"
+            if [[ "${gwant[$nums]}" == "-" ]]; then
+                edits+=(--edit "track:@$x" --delete name)
+            else
+                edits+=(--edit "track:@$x" --set "name=${gwant[$nums]}")
+            fi
+        done
+    done
+
+    if ! mkvpropedit "$file" "${edits[@]}" > /dev/null 2>&1; then
+        MKV_TITLES_MSG="mkvpropedit failed"
+        return 7
+    fi
+
+    # read back, by Matroska track number (MKVToolNix) and by FFmpeg stream
+    local bad=0
+    while IFS=$'\t' read -r -a f; do
+        [[ -n "${byno[${f[2]}]+x}" && "${f[8]}" != "${byno[${f[2]}]}" ]] && bad=1
+    done < <(mkv_identify_tracks "$file")
+    while IFS=$'\t' read -r -a f; do
+        [[ -n "${W[${f[0]}]+x}" && "${f[13]}" != "${W[${f[0]}]}" ]] && bad=1
+    done < <(stream_meta "$file")
+    if (( bad == 1 )); then
+        MKV_TITLES_MSG="written, but the read-back differs"
+        return 8
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------
+# Standard video track titles:
+#   "Codec | Resolution | Bit Depth | HDR Format | CRF Value"
+#   "HEVC | 2160p | 10-bit | Dolby Vision + HDR10 | CRF 18",
+#   "HEVC | 1080p | 10-bit | HDR10 | CRF 22", "AVC | 720p | 8-bit"
+# Built from the properties of the OUTPUT stream only; the old title
+# (usually a movie or release name) contributes nothing. Unknown or
+# inapplicable parts are left out: no HDR format for SDR, no CRF unless
+# the encode is known (the job's CRF, or the x265 settings stored in the
+# stream). The compression tier is never part of it.
+# ------------------------------------------------------------
+
+# video_codec_label CODEC  ->  "HEVC", "AVC", "AV1", ... ("" unknown)
+video_codec_label() {
+    case "${1:-}" in
+        ""|-|unknown) ;;
+        hevc)       echo HEVC ;;
+        h264)       echo AVC ;;
+        av1)        echo AV1 ;;
+        vp9)        echo VP9 ;;
+        vp8)        echo VP8 ;;
+        mpeg2video) echo MPEG-2 ;;
+        mpeg1video) echo MPEG-1 ;;
+        mpeg4)      echo MPEG-4 ;;
+        vc1)        echo VC-1 ;;
+        *)          echo "${1^^}" ;;
+    esac
+}
+
+# video_resolution_label WIDTHxHEIGHT [FIELD_ORDER]  ->  "2160p", "1080p",
+# "1080i", "576p", ... ("" unknown). Named by the frame size the way
+# release names do: a letterboxed / cropped 1920x800 frame is 1080p, a
+# 3840x1600 frame 2160p (the same classes _video_title_awk accepts).
+# Interlaced only when the stream says so (tt / bb / tb / bt).
+video_resolution_label() {
+    local w h s="p"
+
+    [[ "${1:-}" =~ ^([0-9]+)x([0-9]+)$ ]] || return 0
+    w="${BASH_REMATCH[1]}" h="${BASH_REMATCH[2]}"
+    (( w > 0 && h > 0 )) || return 0
+    [[ "${2:-}" =~ ^(tt|bb|tb|bt)$ ]] && s="i"
+
+    if   (( w >= 6000 || h >= 3400 )); then echo 4320p
+    elif (( w >= 3000 || h >= 1500 )); then echo 2160p
+    elif (( w >= 2200 || h >= 1250 )); then echo 1440p
+    elif (( w >= 1500 || h >= 900 ));  then echo "1080$s"
+    elif (( w >= 1000 || h >= 600 ));  then echo 720p
+    else echo "$h$s"
+    fi
+}
+
+# video_hdr_label HDR_KIND DV DV_PROFILE HDR10PLUS  ->  "HDR10",
+# "HDR10+", "HLG", "Dolby Vision + HDR10", "Dolby Vision" (profile 5:
+# no HDR10 base layer); "" for SDR. HDR10PLUS: 1 = present.
+video_hdr_label() {
+    local kind="${1:-}" dv="${2:-0}" prof="${3:-}" base=""
+
+    case "$kind" in
+        HDR10) base=HDR10; [[ "${4:-0}" == 1 ]] && base="HDR10+" ;;
+        HLG)   base=HLG ;;
+    esac
+    if [[ "$dv" == 1 ]]; then
+        [[ "$prof" == 5 ]] && base=""
+        printf 'Dolby Vision%s' "${base:+ + $base}"
+    else
+        printf '%s' "$base"
+    fi
+}
+
+# video_crf_label CRF  ->  "CRF 22" / "CRF 21.5" ("" when not a CRF)
+video_crf_label() {
+    local c="${1:-}"
+
+    [[ "$c" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
+    if [[ "$c" == *.* ]]; then
+        while [[ "$c" == *0 ]]; do c="${c%0}"; done
+        c="${c%.}"
+    fi
+    printf 'CRF %s' "$c"
+}
+
+# video_std_title CODEC RES BITS HDR_KIND DV DV_PROFILE HDR10PLUS CRF
+#                 [FIELD_ORDER]
+#   ->  "HEVC | 1080p | 10-bit | HDR10 | CRF 22"
+# RES: "WIDTHxHEIGHT"; BITS: video_pix_bits; CRF: "" = not known.
+video_std_title() {
+    local out=() p bits=""
+
+    [[ "${3:-}" =~ ^[0-9]+$ ]] && bits="${3}-bit"
+    for p in "$(video_codec_label "$1")" "$(video_resolution_label "${2:-}" "${9:-}")" "$bits" \
+             "$(video_hdr_label "${4:-}" "${5:-0}" "${6:-}" "${7:-0}")" "$(video_crf_label "${8:-}")"; do
+        [[ -n "$p" ]] && out+=("$p")
+    done
+    _title_join "${out[@]+"${out[@]}"}"
+}
+
+# video_stream_crf FILE VIDX  ->  the CRF the video stream was encoded
+# with, from reliable records only: the x265 settings the encoder wrote
+# into the stream (rate control "crf"), else, when the stream carries no
+# x265 settings at all, the COMPRESSION_CRF tag a movie-compresser encode
+# recorded for it. "" otherwise (two-pass / ABR, another encoder,
+# nothing recorded): a CRF is never guessed.
+video_stream_crf() {
+    local rc crf tool
+
+    rc=$(x265_rate_control "$1" "$2")
+    case "$rc" in
+        "crf "*) printf '%s' "${rc#crf }"; return 0 ;;
+        ?*)      return 0 ;;
+    esac
+    [[ "$(ffprobe -v error -select_streams "$2" -show_entries stream=codec_name \
+        -of default=nw=1:nk=1 "$1" 2>/dev/null | tr -d '\r')" == hevc ]] || return 0
+    IFS=$'\t' read -r crf _ <<< "$(compression_tags "$1")"
+    IFS=$'\t' read -r tool _ <<< "$(compression_provenance "$1")"
+    [[ "$tool" == "$COMPRESSION_TOOL_NAME" && "$crf" =~ ^[0-9]+([.][0-9]+)?$ ]] && printf '%s' "$crf"
+    return 0
+}
+
+# video_std_title_of FILE VIDX [CRF]  ->  the standard title of video
+# stream VIDX of FILE, from the stream itself (codec, frame size, bit
+# depth, field order, HDR / Dolby Vision / HDR10+ via probe_hdr). CRF:
+# a value (the job's final CRF), "auto" (video_stream_crf) or "" (none).
+# Runs probe_hdr in a subshell: the caller's HDR_* globals are kept.
+video_std_title_of() {
+    local file="$1" vidx="$2" crf="${3:-}" k v codec="" pix="" w="" h="" fo=""
+
+    while IFS='=' read -r k v; do
+        v="${v%$'\r'}"
+        case "$k" in
+            codec_name)  codec="$v" ;;
+            pix_fmt)     pix="$v" ;;
+            width)       w="$v" ;;
+            height)      h="$v" ;;
+            field_order) fo="$v" ;;
+        esac
+    done < <(ffprobe -v error -select_streams "$vidx" \
+        -show_entries stream=codec_name,pix_fmt,width,height,field_order -of default=nw=1 "$file" 2>/dev/null)
+    [[ -n "$codec" ]] || return 0
+    [[ "$crf" == auto ]] && crf=$(video_stream_crf "$file" "$vidx")
+
+    (
+        probe_hdr "$file" "$vidx"
+        video_std_title "$codec" "${w}x${h}" "$(video_pix_bits "$pix")" "$HDR_KIND" \
+            "$HDR_DV" "$HDR_DV_PROFILE" "$HDR_HDR10PLUS" "$crf" "$fo"
+    )
+}
+
+# _video_title_arg TITLE  ->  shell-quoted -metadata:s:v:0 title=TITLE
+# ("-" or "": no standard title can be built; the source title stays)
+_video_title_arg() {
+    [[ -n "$1" && "$1" != "-" ]] || return 0
+    printf '%q ' -metadata:s:v:0 "title=$1"
+}
+
+# ------------------------------------------------------------
+# Claims in an existing video title the stream disproves (codec,
+# resolution, HDR / Dolby Vision / HDR10+, bit depth): verify.sh and the
+# job verification report them as STALE.
 # ------------------------------------------------------------
 
 # video_pix_bits PIX_FMT  ->  8 / 10 / 12 ("" unknown)
@@ -2568,36 +3010,6 @@ video_title_false_claims() {
 # the disproved claims removed ("" = nothing left)
 video_title_rewrite() {
     _video_title_awk rewrite "$@"
-}
-
-# video_title_fix FILE VIDX CODEC RES HDR DV HDR10P BITS  ->  the title
-# the OUTPUT video should carry when the source title (stream VIDX of
-# FILE) makes claims the output stream disproves: the cleaned title, or
-# "-" (nothing left: no title). Prints nothing when the source title can
-# stay (no title, or nothing disproved). The other arguments describe
-# the output video as for video_title_false_claims.
-video_title_fix() {
-    local file="$1" vidx="$2" title="-" idx type new
-    shift 2
-
-    while IFS=$'\t' read -r idx type _ _ _ _ _ _ _ _ _ _ _ title _; do
-        [[ "$idx" == "$vidx" ]] && break
-        title="-"
-    done < <(stream_meta "$file")
-    [[ "$idx" == "$vidx" && "$title" != "-" ]] || return 0
-    [[ -n "$(video_title_false_claims "$title" "$@")" ]] || return 0
-
-    new=$(video_title_rewrite "$title" "$@")
-    printf '%s' "${new:--}"
-}
-
-# _video_title_arg FIX  ->  shell-quoted -metadata:s:v:0 title=... for a
-# video_title_fix result ("-": empty title, which removes it)
-_video_title_arg() {
-    local t="$1"
-
-    [[ "$t" == "-" ]] && t=""
-    printf '%q ' -metadata:s:v:0 "title=$t"
 }
 
 # _encoded_size FILE VIDX FILTER  ->  "WIDTHxHEIGHT" of the encoded
@@ -2969,6 +3381,13 @@ build_stream_map() {
     # its own, with the transcoded tracks' output properties)
     MAP_ATITLE_ARGS=""
     (( MAP_AUDIO_COUNT > 0 )) && MAP_ATITLE_ARGS=$(audio_std_title_args "$file")
+    local -a ar
+    local an=0 w
+    while IFS=$'\t' read -r -a ar; do
+        ((an += 1))
+        w=$(audio_title_warning "${ar[13]}" "${ar[12]}")
+        [[ -n "$w" ]] && MAP_NOTES+=("WARNING: audio $an \"${ar[13]}\": $w")
+    done < <(_audio_rows "$file")
     return 0
 }
 
@@ -3031,8 +3450,8 @@ source_video_tag_args() {
 
     while IFS=$'\t' read -r idx type _ _ _ _ def forced comment hi vi _ lang title _ _; do
         [[ "$idx" == "$vidx" ]] || continue
-        # FIX (video_title_fix): the corrected title, "-" = none
-        [[ -n "$fix" ]] && title="$fix"
+        # FIX: the standard title of the encoded video (video_std_title)
+        [[ -n "$fix" && "$fix" != "-" ]] && title="$fix"
         [[ "$lang" != "-" ]] && a+=(-metadata:s:v:0 "language=$lang")
         [[ "$title" != "-" ]] && a+=(-metadata:s:v:0 "title=$title")
         (( def == 1 )) && d+=(default)
@@ -3376,12 +3795,13 @@ emit_encode_item() {
 # _emit_final_encode  ->  the final encode + mux of emit_encode_item
 # into "$ITEM_PART" (covers, chapters); reads emit_encode_item's locals
 _emit_final_encode() {
-    # source video title claims the encoded video disproves (codec,
-    # resolution, HDR / Dolby Vision / HDR10+, bit depth) are removed
+    # standard title of the encoded video (the source title is replaced);
+    # without the CRF, which a CRF retry / season decision can still
+    # change: item_finalize_titles adds the final one after the encode
     local vfix
-    vfix=$(video_title_fix "$in" "$vidx" hevc "$(_encoded_size "$in" "$vidx" "$filter")" "$HDR_KIND" \
-        "$( [[ "$dv_policy" == "preserve" ]] && echo 1 || echo 0)" \
-        "$( [[ "$h10p_policy" == "preserve" ]] && echo 1 || echo 0)" 10)
+    vfix=$(video_std_title hevc "$(_encoded_size "$in" "$vidx" "$filter")" 10 "$HDR_KIND" \
+        "$( [[ "$dv_policy" == "preserve" ]] && echo 1 || echo 0)" "$dv_out_profile" \
+        "$( [[ "$h10p_policy" == "preserve" ]] && echo 1 || echo 0)" "")
 
     if [[ "$dv_policy" == "preserve" ]]; then
         # Final encode -> raw HEVC, RPU injected, wrapped by mkvmerge (DV
@@ -3440,14 +3860,11 @@ _emit_x265_lines() {
 # kept. Dolby Vision and HDR10+ stay in the copied stream (verified).
 emit_copy_item() {
     local index="$1" in="$2" out="$3" tier="$4" overwrite="$5" vidx="$6"
-    local vfix vcodec vpix
+    local vfix
 
-    # the copied video is the source video: only title claims the source
-    # stream itself disproves are removed
-    IFS=, read -r vcodec vpix < <(ffprobe -v error -select_streams "$vidx" \
-        -show_entries stream=codec_name,pix_fmt -of csv=p=0 "$in" 2>/dev/null | tr -d '\r')
-    vfix=$(video_title_fix "$in" "$vidx" "$vcodec" "$(_encoded_size "$in" "$vidx" "")" "$HDR_KIND" \
-        "$HDR_DV" "$( ((HDR_HDR10PLUS == 1)) && echo 1 || echo "?")" "$(video_pix_bits "$vpix")")
+    # the copied video is the source video: its standard title, with the
+    # CRF only when the stream records it (x265 settings)
+    vfix=$(video_std_title_of "$in" "$vidx" auto)
 
     printf '# ---- item %s  (source video kept: stream copy)\n' "$index"
     printf 'if item_begin %q %q %q %q %q "" &&\n' "$index" "$in" "$out" "$tier" "$overwrite"

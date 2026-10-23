@@ -944,10 +944,11 @@ item_verify_output() {
 
         # ---- video stream properties (as planned by the job)
         local sv_codec sv_w sv_h sv_pix ov_codec ov_w ov_h ov_pix
+        # (CR: ffprobe on Windows ends its lines with CRLF)
         IFS=, read -r sv_codec sv_w sv_h sv_pix < <(ffprobe -v error -select_streams "$vidx" \
-            -show_entries stream=codec_name,width,height,pix_fmt -of csv=p=0 "$src" 2>/dev/null | head -n 1)
+            -show_entries stream=codec_name,width,height,pix_fmt -of csv=p=0 "$src" 2>/dev/null | head -n 1 | tr -d '\r')
         IFS=, read -r ov_codec ov_w ov_h ov_pix < <(ffprobe -v error -select_streams "${ovidx:-0}" \
-            -show_entries stream=codec_name,width,height,pix_fmt -of csv=p=0 "$out" 2>/dev/null | head -n 1)
+            -show_entries stream=codec_name,width,height,pix_fmt -of csv=p=0 "$out" 2>/dev/null | head -n 1 | tr -d '\r')
         line="${ov_codec:-?} ${ov_w:-?}x${ov_h:-?} ${ov_pix:-?}"
 
         # rate control as written by x265 into the stream ("" = unknown)
@@ -1049,6 +1050,38 @@ item_verify_output() {
 
     local -A trans=()
     local exp_titles=() updated=0
+
+    # bit rate of output audio track I for its title: the constant rate
+    # the output stream states, else (titles finalized) the measured
+    # average from the output's refreshed statistics, the same rule as
+    # item_finalize_titles
+    local -A o_fact=() o_meas=()
+    local fi_ fb_ fr_ fs_
+    while IFS=$'\t' read -r fi_ fb_ fr_ fs_; do
+        [[ -n "$fi_" ]] && o_fact[$fi_]="$fb_|$fr_|$fs_"
+    done < <(audio_title_facts "$out")
+    if [[ "${ITEM_TITLES_STATE:-}" == final ]]; then
+        stats_load "$out" "" tags || stats_load "$out"
+        while IFS=$'\t' read -r fi_ fb_; do
+            [[ -n "$fi_" ]] && o_meas[$fi_]="$fb_"
+        done < <(audio_measured_kbps "$STATS_LINES")
+    fi
+    # a description the naming cannot parse is kept as written: a warning
+    _title_warn() {
+        local w
+        w=$(audio_title_warning "$2" "$(_field "${S_A[$1]}" 9)")
+        [[ -n "$w" ]] || return 0
+        _rep "Audio $(($1 + 1)) title" "WARNING: $w" >&3
+        warns+=("audio $(($1 + 1)) title: $w")
+    }
+    _out_kbps() {
+        local oi br raw sr
+        oi=$(_field "${O_A[$1]}" 12)
+        IFS='|' read -r br raw sr <<< "${o_fact[$oi]:-||}"
+        audio_title_kbps "$(_field "${O_A[$1]}" 1)" "$(_field "${O_A[$1]}" 2)" "$br" "$raw" "$sr" \
+            "$(_field "${O_A[$1]}" 11)" "${o_meas[$oi]:-}"
+    }
+
     if [[ -n "${ITEM_EXP[atrans]+x}" ]]; then
         for v in ${ITEM_EXP[atrans]//,/ }; do trans[$v]=1; done
     fi
@@ -1125,9 +1158,11 @@ item_verify_output() {
 
         if [[ -z "${trans[$i]:-}" ]]; then
             if [[ "${ITEM_EXP[atitle]:-}" == std ]]; then
-                # standard title from the (copied, so unchanged) track
+                # standard title from the (copied, so unchanged) track,
+                # with the output track's bit rate
                 et=$(audio_std_title "$(_field "${S_A[$i]}" 9)" "$sc" "$sp" "$sch" "$sl" "$st" \
-                    "$(_field "${S_A[$i]}" 6)" "$(_field "${S_A[$i]}" 7)" "$(_field "${S_A[$i]}" 8)" 1)
+                    "$(_field "${S_A[$i]}" 6)" "$(_field "${S_A[$i]}" 7)" "$(_field "${S_A[$i]}" 8)" 1 \
+                    "$( (( i < ${#O_A[@]} )) && _out_kbps "$i")")
                 exp_titles+=("$et")
             else
                 exp_titles+=("$st")      # jobs without atitle: titles copied
@@ -1144,6 +1179,7 @@ item_verify_output() {
                 else
                     _rep "Audio $((i + 1)) title" "KEPT \"$ot\" (already standard)" >&3
                 fi
+                _title_warn "$i" "$st"
             fi
             continue
         fi
@@ -1224,7 +1260,8 @@ item_verify_output() {
         # (atitle=std: the standard title of the actual output track)
         if [[ "${ITEM_EXP[atitle]:-}" == std ]]; then
             et=$(audio_std_title "$(_field "${S_A[$i]}" 9)" "$oc" "$op" "$och" "$ol" "$st" \
-                "$(_field "${S_A[$i]}" 6)" "$(_field "${S_A[$i]}" 7)" "$(_field "${S_A[$i]}" 8)" 0)
+                "$(_field "${S_A[$i]}" 6)" "$(_field "${S_A[$i]}" 7)" "$(_field "${S_A[$i]}" 8)" 0 \
+                "$( (( i < ${#O_A[@]} )) && _out_kbps "$i")")
         elif [[ "$st" == "-" ]]; then
             et="-"
         else
@@ -1256,6 +1293,7 @@ item_verify_output() {
         else
             _rep "Audio $((i + 1)) title" "KEPT \"$ot\" (still accurate)" >&3
         fi
+        [[ "${ITEM_EXP[atitle]:-}" == std ]] && _title_warn "$i" "$st"
     done
 
     n=0
@@ -1400,6 +1438,44 @@ item_verify_output() {
         _rep "Track titles" "MATCH" >&3
     fi
 
+    # main video title: the standard title of the actual output stream
+    # (finalized: with the final CRF; otherwise as the mux wrote it, the
+    # CRF of an encode not yet known then); a claim the stream disproves
+    # fails the item like a stale audio title
+    if [[ -n "$vidx" && -n "$ovidx" ]]; then
+        local vt vexp vcrf="" vbits
+        vbits=$(video_pix_bits "$ov_pix")
+        vt=$(stream_meta "$out" | awk -F'\t' -v i="$ovidx" '$1 == i { print $14; exit }')
+        if [[ "${ITEM_TITLES_STATE:-}" == final ]]; then
+            vcrf=$(item_title_crf)
+        elif [[ "$video" == copy ]]; then
+            vcrf=auto
+        fi
+        vexp=$(video_std_title_of "$out" "$ovidx" "$vcrf")
+        claims=""
+        [[ -n "$vt" && "$vt" != "-" ]] &&
+            claims=$(video_title_false_claims "$vt" "$ov_codec" "${ov_w}x${ov_h}" "$O_KIND" "$O_DV" \
+                "$( ((O_HDR10PLUS == 1)) && echo 1 || echo "?")" "$vbits")
+        if [[ -n "$claims" ]]; then
+            _rep "Video title" "STALE: \"$vt\" claims $claims" >&3
+            fails+=("video title is not true for the output (\"$vt\": $claims)")
+        elif [[ -z "$vexp" ]]; then
+            _rep "Video title" "\"$vt\" (stream properties unknown: no standard title)" >&3
+        elif [[ "$vt" != "$vexp" ]]; then
+            _rep "Video title" "UNEXPECTED: \"$vt\" (expected \"$vexp\")" >&3
+            warns+=("video title differs from the standard title")
+        else
+            _rep "Video title" "AS PLANNED \"$vt\"" >&3
+        fi
+    fi
+    case "${ITEM_TITLES_STATE:-}" in
+        final) _rep "Title finalization" "DONE (standard titles of the output streams)" >&3 ;;
+        mux:*)
+            _rep "Title finalization" "NOT DONE (${ITEM_TITLES_STATE#mux:}; mux titles kept: no CRF / measured rates)" >&3
+            warns+=("track titles not finalized")
+            ;;
+    esac
+
     s=$(format_title "$src")
     o=$(format_title "$out")
     if [[ -n "$s" ]]; then
@@ -1429,7 +1505,7 @@ item_verify_output() {
     fi
 
     exec 3>&-
-    unset -f _flags_line _verify_copied_audio
+    unset -f _flags_line _verify_copied_audio _out_kbps _title_warn
 
     (( ${#fails[@]} == 0 ))
 }

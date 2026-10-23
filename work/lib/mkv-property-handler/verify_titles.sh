@@ -39,5 +39,8 @@ vidx=$(main_video_index "$file")
 vidx="${vidx%$'\r'}"
 [[ -n "$vidx" ]] || { printf 'ERROR\tno video stream\n'; exit 4; }
 probe_hdr "$file" "$vidx"
-check_track_titles "$file" "$vidx" 0
+# measured audio rates for the titles: stored statistics only (no packet
+# scan, which could outlast the caller's timeout on a large file)
+stats_load "$file" "" tags || STATS_LINES=""
+check_track_titles "$file" "$vidx" 0 "$STATS_LINES"
 exit 0   # the report is in the lines; check_track_titles' status is not meaningful

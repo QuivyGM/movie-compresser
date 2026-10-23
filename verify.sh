@@ -18,7 +18,8 @@
 #                      MOVIE_COMPRESSER_VERSION / COMPRESSION_DATE) are
 #                      never written or changed here: only an encode
 #                      records them.
-#                      Track titles that are wrong are corrected
+#                      Track titles that are not the standard titles of
+#                      the actual streams are corrected
 #                      (check_track_titles; track names only).
 #
 # Both modes report the compression tags (compression tool, compressor
@@ -233,21 +234,32 @@ inspect_file() {
         echo "  Symlink: statistics tags not updated (the link target is never modified)."
     fi
 
-    check_track_titles "$file" "$vidx" "$validate"
+    # measured audio rates for the titles: Verify has them from stats_load;
+    # Validate + update reads the stored statistics (just refreshed for an
+    # updated MKV; read only, never a second scan)
+    local measured=""
+    if (( validate == 0 )); then
+        measured="$STATS_LINES"
+    elif stats_load "$file" "$dur" tags; then
+        measured="$STATS_LINES"
+    fi
+    check_track_titles "$file" "$vidx" "$validate" "$measured"
 
     ((CHECKED++))
 }
 
-# check_track_titles FILE VIDX VALIDATE
+# check_track_titles FILE VIDX VALIDATE [MEASURED]
 #
 # Audio titles against the standard title of the ACTUAL track
-# (audio_std_title: codec / profile / channels / layout / language /
-# dispositions from the stream; the old title only keeps its description
-# such as "Director's Commentary"), with the claims the stream disproves
-# (audio_title_false_claims). The main video title against the stream
-# (video_title_false_claims: codec, resolution, HDR / Dolby Vision /
-# HDR10+, bit depth); video titles have no standard form, so only
-# disproved claims are removed and a missing title stays missing.
+# (audio_std_title: codec / profile / channels / layout / bit rate /
+# language / dispositions from the stream; the old title only keeps its
+# description such as "Director's Commentary"), with the claims the
+# stream disproves (audio_title_false_claims). The bit rate is the
+# stream's constant rate, else the measured average of MEASURED
+# (stats_load STATS_LINES; "" = unknown, left out). The main video title
+# against its standard title (video_std_title_of: codec, resolution, bit
+# depth, HDR format, the CRF the stream records); a title the stream
+# disproves (video_title_false_claims) is reported STALE.
 #
 # Verify only reports. Validate + update writes the corrected titles to
 # an MKV (not a symlink) with mkvpropedit: track names only, no remux,
@@ -258,8 +270,8 @@ inspect_file() {
 # match); when that mapping is not certain nothing is written. The
 # titles are read back through MKVToolNix and FFmpeg.
 check_track_titles() {
-    local file="$1" vidx="$2" validate="$3"
-    local -a edits=() f
+    local file="$1" vidx="$2" validate="$3" measured="${4:-}"
+    local -a f
     local -A want=()          # FFmpeg stream index -> new title ("-" = none)
     local vcodec="" vprof="" vpix="" res vbits vtitle="-" claims new h10p
     # HDR10+ is looked for in the first frames only: not finding it does
@@ -288,36 +300,42 @@ check_track_titles() {
     done < <(stream_meta "$file")
 
     row "Video stream" "$vcodec${vprof:+ $vprof}, ${res:-?}${vbits:+, $vbits-bit}, $HDR_KIND$( ((HDR_DV == 1)) && echo " + Dolby Vision")$( ((HDR_HDR10PLUS == 1)) && echo " + HDR10+")"
-    if [[ "$vtitle" == "-" ]]; then
-        row "Video title" "none (no video title is invented)"
+    # main video against its standard title (codec / resolution / bit
+    # depth / HDR format of the stream; the CRF only from the x265
+    # settings in the stream or this tool's COMPRESSION_CRF tag)
+    new=$(video_std_title_of "$file" "$vidx" auto)
+    if [[ -z "$new" ]]; then
+        row "Video title" "$([[ "$vtitle" == "-" ]] && echo "none" || echo "\"$vtitle\"") (stream properties unknown: no standard title)"
+    elif [[ "$vtitle" == "$new" ]]; then
+        row "Video title" "\"$vtitle\" - STANDARD"
     else
-        claims=$(video_title_false_claims "$vtitle" "$vcodec" "$res" "$HDR_KIND" "$HDR_DV" "$h10p" "$vbits")
-        if [[ -z "$claims" ]]; then
-            row "Video title" "\"$vtitle\" - OK (nothing in it contradicts the stream)"
+        if [[ "$vtitle" == "-" ]]; then
+            row "Video title" "no title - MISSING"
         else
-            new=$(video_title_rewrite "$vtitle" "$vcodec" "$res" "$HDR_KIND" "$HDR_DV" "$h10p" "$vbits")
-            row "Video title" "\"$vtitle\" - STALE (the stream is not: $claims)"
-            row "" "-> $([[ -n "$new" ]] && echo "\"$new\"" || echo "title removed (nothing else in it)")"
-            want[$vidx]="${new:--}"
-            ((fixes += 1))
+            claims=$(video_title_false_claims "$vtitle" "$vcodec" "$res" "$HDR_KIND" "$HDR_DV" "$h10p" "$vbits")
+            if [[ -n "$claims" ]]; then
+                row "Video title" "\"$vtitle\" - STALE (the stream is not: $claims)"
+            else
+                row "Video title" "\"$vtitle\" - NOT STANDARD"
+            fi
         fi
+        row "" "-> \"$new\""
+        want[$vidx]="$new"
+        ((fixes += 1))
     fi
 
     # audio stream facts a title's bit rate / bit depth / sample rate can
-    # be checked against (audio_title_stream_facts; unknown = "")
-    local -A afact=()
-    local ai="" abr="" araw="" asr=""
-    while IFS='=' read -r k v; do
-        v="${v%$'\r'}"
-        case "$k" in
-            index)               [[ -n "$ai" ]] && afact[$ai]="$abr|$araw|$asr"; ai="$v" abr="" araw="" asr="" ;;
-            bit_rate)            abr="$v" ;;
-            bits_per_raw_sample) araw="$v" ;;
-            sample_rate)         asr="$v" ;;
-        esac
-    done < <(ffprobe -v error -select_streams a -show_entries stream=index,bit_rate,bits_per_raw_sample,sample_rate \
-        -of default=nw=1 "$file" 2>/dev/null)
-    [[ -n "$ai" ]] && afact[$ai]="$abr|$araw|$asr"
+    # be checked against (audio_title_stream_facts; unknown = ""), and
+    # the measured average rate of the actual packets (MEASURED:
+    # statistics tags / packet scan) for tracks without a constant rate
+    local -A afact=() ameas=()
+    local ai="" abr="" araw="" asr="" kb
+    while IFS=$'\t' read -r ai abr araw asr; do
+        [[ -n "$ai" ]] && afact[$ai]="$abr|$araw|$asr"
+    done < <(audio_title_facts "$file")
+    while IFS=$'\t' read -r ai kb; do
+        [[ -n "$ai" ]] && ameas[$ai]="$kb"
+    done < <(audio_measured_kbps "$measured")
 
     # audio: every track against its standard title
     local fn fb fr unk
@@ -328,8 +346,9 @@ check_track_titles() {
         [[ "$fb" == - ]] && fb=""
         [[ "$fr" == - ]] && fr=""
         ((an += 1))
+        kb=$(audio_title_kbps "${f[2]}" "${f[3]}" "$abr" "$araw" "$asr" "${f[4]}" "${ameas[${f[0]}]:-}")
         new=$(audio_std_title "${f[12]}" "${f[2]}" "${f[3]}" "${f[4]}" "${f[5]}" "${f[13]}" \
-            "${f[8]}" "${f[9]}" "${f[10]}" 1)
+            "${f[8]}" "${f[9]}" "${f[10]}" 1 "$kb")
         lang="${f[12]}"; [[ "$lang" == "-" ]] && lang="und"
         label="$(audio_track_label "${f[2]}" "${f[3]}" "${f[5]}" "${f[4]}"), $lang"
         (( f[6] == 1 )) && label+=", default"
@@ -343,8 +362,13 @@ check_track_titles() {
             note+="; ${obj%% (*} named only in the title (the stream does not report it; kept, not confirmed)"
         [[ "${f[2]}" =~ ^(ac3|eac3)$ ]] && audio_title_ex "${f[13]}" &&
             note+="; Dolby Digital EX named only in the title (the stream flag is not read; kept, not confirmed)"
-        unk=$(audio_title_unverified "${f[13]}" "${f[2]}" "${f[4]}" "${f[3]}" "$fn" "$fb" "$fr")
+        # a rate is checked against the measured average when there is
+        # no constant rate
+        unk=$(audio_title_unverified "${f[13]}" "${f[2]}" "${f[4]}" "${f[3]}" \
+            "${fn:-${ameas[${f[0]}]:+$(( ameas[${f[0]}] * 1000 ))}}" "$fb" "$fr")
         [[ -n "$unk" ]] && note+="; UNKNOWN (cannot be checked against the stream): $unk"
+        unk=$(audio_title_warning "${f[13]}" "${f[12]}")
+        [[ -n "$unk" ]] && note+="; WARNING: $unk"
 
         if [[ "${f[13]}" == "$new" ]]; then
             row "Audio $an" "$label | \"${f[13]}\" - STANDARD${note}"
@@ -385,75 +409,22 @@ check_track_titles() {
         ((TITLES_FIX++))
         return
     fi
-    if ! command -v mkvpropedit >/dev/null 2>&1 || ! command -v mkvmerge >/dev/null 2>&1; then
-        row "Track titles" "$fixes to correct; MKVToolNix (mkvpropedit / mkvmerge) not found: not updated - CHECK REQUIRED"
-        ((CHECK_REQUIRED++))
-        return
-    fi
-    # FFmpeg stream -> Matroska track number(s), certain before any write.
-    # Tracks that MKVToolNix and FFmpeg cannot tell apart (identical in
-    # every compared property) must all get the same title, else nothing
-    # is written.
-    local map ffi nums x
-    local -A gwant=() byno=()
-    if ! map=$(mkv_track_map "$file"); then
-        row "Track titles" "NOT UPDATED: track mapping not certain (${map#ERR$'\t'}) - CHECK REQUIRED"
-        ((CHECK_REQUIRED++))
-        return
-    fi
-    while IFS=$'\t' read -r ffi nums; do
-        [[ -n "$ffi" ]] || continue
-        x="${want[$ffi]-$'\001'}"
-        if [[ -n "${gwant[$nums]+x}" && "${gwant[$nums]}" != "$x" ]]; then
-            row "Track titles" "NOT UPDATED: tracks $nums look identical but need different titles - CHECK REQUIRED"
-            ((CHECK_REQUIRED++))
-            return
-        fi
-        gwant[$nums]="$x"
-    done <<< "$map"
-    for nums in "${!gwant[@]}"; do
-        [[ "${gwant[$nums]}" != $'\001' ]] || continue
-        IFS=, read -ra f <<< "$nums"
-        for x in "${f[@]}"; do
-            byno[$x]="${gwant[$nums]}"
-            if [[ "${gwant[$nums]}" == "-" ]]; then
-                edits+=(--edit "track:@$x" --delete name)
-            else
-                edits+=(--edit "track:@$x" --set "name=${gwant[$nums]}")
-            fi
-        done
-    done
-    for ffi in "${!want[@]}"; do
-        grep -q "^$ffi"$'\t' <<< "$map" || {
-            row "Track titles" "NOT UPDATED: FFmpeg stream $ffi has no Matroska track - CHECK REQUIRED"
-            ((CHECK_REQUIRED++))
-            return
-        }
-    done
-
-    if ! mkvpropedit "$file" "${edits[@]}" > /dev/null 2>&1; then
-        row "Track titles" "mkvpropedit FAILED: titles not updated - CHECK REQUIRED"
-        ((CHECK_REQUIRED++))
-        return
-    fi
-
-    # read back: every corrected title must now be the planned one, by
-    # Matroska track number (MKVToolNix) and by FFmpeg stream
-    local bad=0
-    while IFS=$'\t' read -r -a f; do
-        [[ -n "${byno[${f[2]}]+x}" && "${f[8]}" != "${byno[${f[2]}]}" ]] && bad=1
-    done < <(mkv_identify_tracks "$file")
-    while IFS=$'\t' read -r -a f; do
-        [[ -n "${want[${f[0]}]+x}" && "${f[13]}" != "${want[${f[0]}]}" ]] && bad=1
-    done < <(stream_meta "$file")
-
-    if (( bad == 0 )); then
-        row "Track titles" "UPDATED ($fixes title(s); track names only, streams untouched)"
-        ((TITLES_UPDATED++))
-    else
-        row "Track titles" "written, but the read-back differs - CHECK REQUIRED"
-        ((CHECK_REQUIRED++))
-    fi
+    # mapped to Matroska track numbers first, written only when that is
+    # certain, read back (mkv_write_track_titles)
+    local rc
+    mkv_write_track_titles "$file" want
+    rc=$?
+    case "$rc" in
+        0)
+            row "Track titles" "UPDATED ($fixes title(s); track names only, streams untouched)"
+            ((TITLES_UPDATED++))
+            ;;
+        3)  row "Track titles" "$fixes to correct; $MKV_TITLES_MSG: not updated - CHECK REQUIRED" ;;
+        7)  row "Track titles" "mkvpropedit FAILED: titles not updated - CHECK REQUIRED" ;;
+        8)  row "Track titles" "$MKV_TITLES_MSG - CHECK REQUIRED" ;;
+        *)  row "Track titles" "NOT UPDATED: $MKV_TITLES_MSG - CHECK REQUIRED" ;;
+    esac
+    (( rc == 0 )) || ((CHECK_REQUIRED++))
 }
 
 show_source() {

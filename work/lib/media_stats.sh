@@ -143,6 +143,7 @@ stored_tag_totals() {
 #
 # MODE "exact" (default) never uses estimated bit rates: callers that
 # need byte-accurate sizes (movie / audio menus) get tags or packets.
+# MODE "tags" uses step 1 only and returns 1 instead of scanning.
 #
 # "refresh" (compression menus): after a fallback packet scan of a
 # Matroska file, rewrite its track statistics tags with mkvpropedit so
@@ -612,6 +613,9 @@ stats_load() {
             return 0
         fi
     fi
+
+    # MODE "tags": stored statistics only, never a scan (STATS_LINES "")
+    [[ "$mode" == "tags" ]] && return 1
 
     if [[ "${STATS_PROGRESS:-0}" == 1 ]]; then
         if [[ -n "$STATS_REJECTED" ]]; then

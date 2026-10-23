@@ -729,7 +729,7 @@ if (( HAVE_FFMPEG == 1 && HAVE_MKV == 1 )); then
     eq    "Validate + update: unrelated metadata unchanged" "$(for n in Missing Stale NoRecord Kept; do meta "$n"; done)" "$M0"
     eq    "Validate + update: historical version kept, none invented" "$(provs)" "$PV0"
     eq    "Validate + update: no duplicate tags"     "$(for n in Missing Stale NoRecord Kept; do compression_tag_duplicates "$BO/$n HEVC High.mkv"; done)" ""
-    eq    "Validate + update: standard audio titles" "$(atitles)" "German | AC-3 | 1.0 German | AC-3 | 1.0 German | AC-3 | 1.0 German | AC-3 | 1.0 "
+    eq    "Validate + update: standard audio titles" "$(atitles)" "German | AC-3 | 1.0 | 96 kbps German | AC-3 | 1.0 | 96 kbps German | AC-3 | 1.0 | 96 kbps German | AC-3 | 1.0 | 96 kbps "
     eq    "Validate + update: stream data unchanged" "$(pay)" "$P0"
 
     printf '2\n2\n' | HOME="$BH" bash "$BH/compress/verify.sh" > "$T/bu2.log" 2>&1

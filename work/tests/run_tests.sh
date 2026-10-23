@@ -8,7 +8,7 @@
 #     codec names, bitrates, commentary text kept)
 #  3. SDR source, audio copied: two-pass job (generic bitrate path, no DV
 #     steps) and single-pass CRF job (Quality / High / Base / Custom path); tracks,
-#     flags, languages, titles (unchanged), chapters, attachments kept
+#     flags, languages, standard titles, chapters, attachments kept
 #  4. HDR10 source: HDR10 metadata kept; all audio copied unchanged and
 #     verified (codec / layout / payload hash)
 #  5. MP4 source with styled mov_text: conversion + styling loss reported
@@ -56,6 +56,9 @@
 #     per stream, audio menu jobs incl. The Raid 2 DTS 5.1(side) case,
 #     per-channel tone identity, verification failures
 #     (audio_pipeline_tests.sh)
+# 17. standard video / audio track titles (final CRF, actual audio rates)
+#     for movie / copy / audio-menu / combined jobs, names-only writes,
+#     verify.sh Verify / Validate + update (track_title_tests.sh)
 #
 # Runs in a temporary copy of work/ so real logs/jobs are untouched.
 # Everything here is synthetic: it proves the mechanics, not behaviour
@@ -771,8 +774,8 @@ make_extras() {
 # track; the commentary description is kept.
 A0_TITLE="English Dolby Digital 5.1 384 kbps"
 A1_TITLE="Director Commentary - AC-3"
-A0_STD="English | AC-3 | 5.1"
-A1_STD="English | AC-3 | 2.0 | Director Commentary"
+A0_STD="English | AC-3 | 5.1 | 384 kbps"
+A1_STD="English | AC-3 | 2.0 | 96 kbps | Director Commentary"
 
 # mux_source VIDEO OUT
 mux_source() {
@@ -1540,8 +1543,14 @@ if [[ -s "$MH/compress/in/Multi.mkv" ]]; then
     check "acopy 11: DTS copied"                      "grep -q 'Audio track 3: *COPIED (DTS 5.1(side), 48000 Hz, payload MD5 MATCH)' '$AC/movie_run.log'"
     check "acopy 8: commentary kept"                  "[[ \$(ffprobe -v error -select_streams a:3 -show_entries stream_disposition=comment -of default=nw=1:nk=1 '$mout') == 1 ]] && grep -q 'Audio track 4: *COPIED (AAC stereo' '$AC/movie_run.log'"
     check "acopy: titles / languages kept"            "grep -q 'Languages: *MATCH' '$AC/movie_run.log' && grep -q 'Track titles: *AS PLANNED (4 audio title' '$AC/movie_run.log'"
+    # variable-rate TrueHD / AAC: the measured rate (statistics tags; only
+    # finalized with MKVToolNix); E-AC-3 / DTS core: the rate they state
+    mk_rate() { (( HAVE_MKV == 1 )) || return 0; local b
+        b=$(ffprobe -v error -select_streams "a:$2" -show_entries stream_tags=BPS -of default=nw=1:nk=1 "$1" | tr -d '\r' | head -n 1)
+        [[ "$b" =~ ^[0-9]+$ ]] && printf ' | %d kbps' $(( (b + 500) / 1000 )); }
+    dts_kbps=$(( $(ffprobe -v error -select_streams a:2 -show_entries stream=bit_rate -of default=nw=1:nk=1 "$mout" | tr -d '\r') / 1000 ))
     eq    "acopy: standard titles (Atmos per title kept on the copy)" "$(ffprobe -v error -select_streams a -show_entries stream_tags=title -of csv=p=0 "$mout" | tr -d '\r' | tr '\n' '/')" \
-          "English | E-AC-3 Atmos | 5.1/English | TrueHD | 5.1/German | DTS | 5.1/English | AAC | 2.0 | Director Commentary/"
+          "English | E-AC-3 Atmos | 5.1 | 640 kbps/English | TrueHD | 5.1$(mk_rate "$mout" 1)/German | DTS | 5.1 | $dts_kbps kbps/English | AAC | 2.0$(mk_rate "$mout" 3) | Director Commentary/"
     check "acopy: job succeeded"                      "grep -q 'All encodes finished: 1 ok, 0 failed' '$AC/movie_run.log'"
     check "acopy: no blanket -c copy, one codec option per stream" \
         "! grep -q -- ' -c copy ' '$AC/movie_Quality_job.sh' && grep -q -- '-c:a copy' '$AC/movie_Quality_job.sh' && ! grep -q 'Multiple -codec' '$AC/movie_run.log'"
@@ -2043,6 +2052,11 @@ check "smoke series High: audio stream copy verified" "[[ \$(grep -cE 'Audio tra
 check "smoke series High: estimate vs actual logged" "[[ \$(grep -c 'Estimated video size: ' '$T/ss_high18_run.log') == 3 ]]"
 check "smoke series High: all 3 ok"            "grep -q 'All encodes finished: 3 ok, 0 failed' '$T/ss_high18_run.log'"
 eq    "smoke series High: outputs HEVC 10-bit" "$(for f in "$SH/compress/out"/Show*/*.mkv; do ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,pix_fmt -of csv=p=0 "$f"; done | sort -u)" "hevc,yuv420p10le"
+# standard video titles of the season: the final shared CRF is added when
+# the titles are finalized (MKVToolNix); the mux alone has none
+eq    "smoke series High: standard video titles" "$(for f in "$SH/compress/out"/Show*/*.mkv; do ffprobe -v error -select_streams v:0 -show_entries stream_tags=title -of default=nw=1:nk=1 "$f" | tr -d '\r'; echo; done | grep . | sort | uniq -c | awk '{ n = $1; $1 = ""; printf "%sx%s\n", n, $0 }')" \
+      "$( (( HAVE_MKV == 1 )) && echo "3x HEVC | 360p | 10-bit | CRF 18" || echo "3x HEVC | 360p | 10-bit")"
+eq    "smoke series High: E-AC-3 title with its rate" "$(for f in "$SH/compress/out"/Show*/*.mkv; do ffprobe -v error -select_streams a:0 -show_entries stream_tags=title -of default=nw=1:nk=1 "$f" | tr -d '\r'; done | sort -u)" "English | E-AC-3 | 5.1 | 640 kbps"
 
 # High, ceiling between the CRF 18 and 19 estimates of E01 / E02: 18 is
 # too large; the noisy E03 (an outlier) must fit the shared season CRF
@@ -2320,6 +2334,14 @@ grep -E '^  (ok|FAIL) ' "$T/compression_tags.out"
 PASS=$((PASS + $(grep -c '^  ok ' "$T/compression_tags.out")))
 FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/compression_tags.out")))
 while IFS= read -r s; do SKIPPED+=("${s#skipped: }"); done < <(grep '^skipped: ' "$T/compression_tags.out")
+
+echo
+echo "== standard video / audio track titles of every workflow (track_title_tests.sh)"
+bash "$SRC_WORK/tests/track_title_tests.sh" > "$T/track_titles.out" 2>&1
+grep -E '^  (ok|FAIL) ' "$T/track_titles.out"
+PASS=$((PASS + $(grep -c '^  ok ' "$T/track_titles.out")))
+FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/track_titles.out")))
+while IFS= read -r s; do SKIPPED+=("${s#skipped: }"); done < <(grep '^skipped: ' "$T/track_titles.out")
 
 echo
 echo "== movie-compresser Git version detection (compresser_version_tests.sh)"
