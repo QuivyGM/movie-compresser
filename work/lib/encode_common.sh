@@ -856,6 +856,12 @@ color_output_args() {
 # the CRF sample encodes, so samples behave like the real encode)
 X265_PRESET="slow"
 
+# x265 tune of the encode ("" = none; movie Custom: "grain" when film
+# grain is to be preserved). Set per item like DV_POLICY; the sample
+# encodes, their cache keys and the final encode all follow it. Given
+# with -tune: x265 ignores a "tune=" inside -x265-params.
+X265_TUNE=""
+
 # 1080p downscale of the movie / series menus (aspect kept, even sizes)
 DOWNSCALE_1080P_FILTER="scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2"
 
@@ -903,6 +909,7 @@ crf_sample_encode() {
 
     [[ -n "$filter" ]] && a+=(-filter:v:0 "$filter")
     libx265_has_option dolbyvision && a+=(-dolbyvision:v:0 0)
+    [[ -n "${X265_TUNE:-}" ]] && a+=(-tune:v:0 "$X265_TUNE")
 
     ffmpeg -nostdin -v error -y -ss "$start" -i "$file" -t "$len" \
         -map "0:$vidx" "${a[@]+"${a[@]}"}" \
@@ -942,7 +949,7 @@ crf_sample_title() {
 
     x265=$(crf_x265_params "$file" "$vidx")
     cache=$(_crf_cache_dir)
-    sig="$(readlink -f -- "$file")|$(stat -L -c '%s %Y' -- "$file")|$vidx|$filter|$x265|$X265_PRESET|$crf"
+    sig="$(readlink -f -- "$file")|$(stat -L -c '%s %Y' -- "$file")|$vidx|$filter|$x265|$X265_PRESET${X265_TUNE:+ tune=$X265_TUNE}|$crf"
     [[ -n "$cache" ]] && mkdir -p "$cache" 2>/dev/null
 
     tmp=$(mktemp "${TMPDIR:-/tmp}/crf-sample.XXXXXX") || return 1
@@ -1084,7 +1091,7 @@ crf_actual_sig() {
     [[ "$hdr" == ?*"|x265="* ]] || return 1
 
     sig="$CRF_ACTUAL_SCHEMA|stat=$st|dur=$dur|vidx=$vidx|out=${w}x$h|filter=$filter|enc=libx265 $enc"
-    sig+="|preset=$X265_PRESET|pix=yuv420p10le|range=$hdr|dv=$dv/$dvm|hdr10p=$h10p|src=$real"
+    sig+="|preset=$X265_PRESET${X265_TUNE:+ tune=$X265_TUNE}|pix=yuv420p10le|range=$hdr|dv=$dv/$dvm|hdr10p=$h10p|src=$real"
     [[ "$sig" == *$'\n'* || "$sig" == *$'\t'* ]] && return 1
     printf '%s' "$sig"
 }
@@ -3627,6 +3634,14 @@ emit_encode_item() {
             return 0
         fi
 
+        # profile 7 -> 8.1 discards the enhancement layer: only with the
+        # menu's decision on it (dv_el_policy), checked again by the job
+        if [[ "$dv_policy" == "preserve" && "$DV_MODE" == 2 && -z "${DV_EL_DISCARD:-}" ]]; then
+            emit_failed_item "$index" "$in" "$out" "$tier" "$overwrite" \
+                "Dolby Vision profile 7 found but discarding its enhancement layer was not decided"
+            return 0
+        fi
+
         if [[ "$dv_policy" == "preserve" ]]; then
             dv_out_profile="${DV_OUT%%.*}"
             dv_out_compat="${DV_OUT#*.}"
@@ -3699,6 +3714,9 @@ emit_encode_item() {
         "$( (( HDR_DV == 1 )) && echo "$dv_policy" || echo none)" \
         "$dv_out_profile" "$dv_out_compat" "$h10p_policy" "$scaled" \
         "$( [[ "$dv_policy" == "preserve" ]] && echo 1 || echo 0)" "${MAP_AMAP:-}")
+    # x265 tune (movie Custom film grain): checked in the output's x265
+    # settings SEI (item_verify_output)
+    [[ -n "${X265_TUNE:-}" ]] && expect+=$(printf ' tune=%q' "$X265_TUNE")
     [[ "$mode" == "crf" ]] &&
         expect+=$(printf ' ceiling_vbytes=%q crf_min=%q crf_max=%q down_headroom_pct=%q down_max=%q' "$rceil" "$rmin" "$rmax" "$rdpct" "$rdmax")
     [[ "$mode" == "crf" && -n "$qtarget" ]] &&
@@ -3731,13 +3749,16 @@ emit_encode_item() {
         expect+=$(printf ' crf_est=%q' "$crf_est")
 
     # CRF-independent preparation (run once, not per CRF attempt)
-    [[ "$dv_policy" == "preserve" ]] &&
+    if [[ "$dv_policy" == "preserve" && "$DV_MODE" == 2 ]]; then
+        steps+=("$(printf 'item_step rpu item_dv_extract %q %q %q %q' "$in" "$vidx" "$DV_MODE" "$DV_EL_DISCARD")")
+    elif [[ "$dv_policy" == "preserve" ]]; then
         steps+=("$(printf 'item_step rpu item_dv_extract %q %q %q' "$in" "$vidx" "$DV_MODE")")
+    fi
     [[ "$h10p_policy" == "preserve" ]] &&
         steps+=("$(printf 'item_step hdr10+ item_hdr10plus_extract %q %q' "$in" "$vidx")")
 
     printf '# ---- item %s%s\n' "$index" \
-        "$( [[ "$dv_policy" == "preserve" ]] && echo "  (Dolby Vision profile ${HDR_DV_PROFILE} -> $DV_OUT preserved)")$( [[ "$rbatch" == batch || "$rbatch" == season ]] && echo "  (season CRF batch: job_crf_batch)")"
+        "$( [[ "$dv_policy" == "preserve" && "$DV_MODE" == 2 ]] && echo "  (Dolby Vision profile 7 -> $DV_OUT: RPU kept, enhancement layer discarded)")$( [[ "$dv_policy" == "preserve" && "$DV_MODE" != 2 ]] && echo "  (Dolby Vision profile ${HDR_DV_PROFILE} -> $DV_OUT preserved)")$( [[ "$rbatch" == batch || "$rbatch" == season ]] && echo "  (season CRF batch: job_crf_batch)")"
 
     if [[ "$mode" == "crf" ]]; then
         # the final encode as a function: a CRF retry runs it again
@@ -3843,7 +3864,8 @@ _emit_final_encode() {
 # _emit_x265_lines RATE DV X265_PARAMS_QUOTED COLOR  ->  the libx265
 # option lines of a generated ffmpeg command
 _emit_x265_lines() {
-    printf '      -c:v:0 libx265 -preset %s %s -pix_fmt:v:0 yuv420p10le %s\\\n' "$X265_PRESET" "$1" "$2"
+    printf '      -c:v:0 libx265 -preset %s %s%s -pix_fmt:v:0 yuv420p10le %s\\\n' "$X265_PRESET" \
+        "${X265_TUNE:+-tune:v:0 $(printf '%q' "$X265_TUNE") }" "$1" "$2"
     if [[ -n "$3" ]]; then
         printf '      -x265-params:v:0 %s %s\\\n' "$3" "$4"
     elif [[ -n "$4" ]]; then

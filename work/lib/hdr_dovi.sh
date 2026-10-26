@@ -5,8 +5,9 @@
 #
 # Dolby Vision (single-layer output, robust path):
 #   1. RPU extracted from the source with dovi_tool (profile 7 -> 8.1
-#      with mode 2); L5 active-area offsets rescaled when the video is
-#      downscaled
+#      with mode 2, after its enhancement-layer type was checked against
+#      the menu decision: see dv_el_policy); L5 active-area offsets
+#      rescaled when the video is downscaled
 #   2. x265 encodes the base layer exactly like a non-DV encode (single
 #      pass CRF, or two-pass for a bitrate item); the final encode writes raw
 #      HEVC; ffmpeg's own RPU writing is off
@@ -216,20 +217,145 @@ dv_plan_source() {
     return 0
 }
 
-# confirm_dynamic_range LABEL  (after probe_hdr)
+# Frames read by dv_el_probe (menu time; the job checks every frame).
+DV_EL_PROBE_FRAMES=1000
+
+# dv_el_classify SUMMARY  ->  MEL | FEL | unknown
+#
+# Enhancement-layer type of a profile 7 RPU from a `dovi_tool info -s`
+# summary ("Profile: 7 (MEL)", "Profile: 7 (FEL)", "Profile: 7 (FEL,
+# MEL)"; dovi_tool >= 2.0). dovi_tool decides per RPU from the NLQ
+# parameters (MEL: all trivial), so a single FEL RPU makes the stream
+# FEL. Anything else (no subprofile, not profile 7, no summary) is
+# unknown, never assumed to be MEL.
+dv_el_classify() {
+    local sub
+
+    sub=$(tr -d '\r' 2>/dev/null < "$1" |
+        awk '/Profiles?:/ { if (match($0, /7 \([^)]*\)/)) print substr($0, RSTART + 3, RLENGTH - 4); exit }')
+
+    case "$sub" in
+        *FEL*) echo FEL ;;
+        MEL)   echo MEL ;;
+        *)     echo unknown ;;
+    esac
+}
+
+# dv_el_probe FILE VIDX  ->  MEL | FEL | unknown
+#
+# Enhancement-layer type from the unconverted RPUs of the first
+# DV_EL_PROBE_FRAMES frames. FEL is certain; MEL only holds for the
+# sample, so the job classifies every frame again (item_dv_extract) and
+# fails the item when it finds a type that was not confirmed.
+dv_el_probe() {
+    local file="$1" vidx="$2" tmp el=unknown
+
+    hdr_tools_detect
+    [[ -n "$DOVI_TOOL" && -n "$file" && -n "$vidx" ]] || { echo unknown; return 0; }
+    tmp=$(mktemp -d 2>/dev/null) || { echo unknown; return 0; }
+
+    if ffmpeg -v error -nostdin -i "$file" -map "0:$vidx" -c:v copy \
+            -frames:v "$DV_EL_PROBE_FRAMES" -bsf:v hevc_mp4toannexb -f hevc - 2>/dev/null |
+         "$DOVI_TOOL" extract-rpu - -o "$tmp/sample.rpu" > /dev/null 2>&1 &&
+       "$DOVI_TOOL" info -s -i "$tmp/sample.rpu" > "$tmp/summary.txt" 2>/dev/null; then
+        el=$(dv_el_classify "$tmp/summary.txt")
+    fi
+
+    rm -rf -- "$tmp"
+    echo "$el"
+}
+
+# _dv_el_name TYPE  ->  "FEL", "MEL", "enhancement layer of unknown type"
+_dv_el_name() {
+    case "$1" in
+        MEL|FEL) printf '%s' "$1" ;;
+        *)       printf 'enhancement layer of unknown type' ;;
+    esac
+}
+
+# dv_el_policy TIER LABEL  (after confirm_dynamic_range and the tier menu)
+#
+# Profile 7 is dual-layer; the single-layer profile 8.1 output keeps the
+# RPU only, the enhancement layer is discarded. Whether that needs a
+# confirmation depends on the tier and the EL type (DV_EL_TYPE):
+#
+#   tier                  MEL         FEL                     unknown
+#   Quality               automatic   warning + confirmation  confirmation
+#   High / Base / Compact automatic   automatic + warning     confirmation
+#   Custom                automatic   confirmation            confirmation
+#
+# (there are no explicit Dolby Vision preservation settings, so Custom
+# always asks for a FEL). Sets DV_EL_DISCARD, the EL types the job may
+# discard ("" = not a profile 7 conversion); item_dv_extract fails the
+# item when the whole source holds another type. Returns 1 when the
+# source should be skipped.
+dv_el_policy() {
+    local tier="$1" label="$2" ans
+
+    DV_EL_DISCARD=""
+    [[ "${DV_POLICY:-none}" == preserve && "${DV_MODE:-}" == 2 ]] || return 0
+
+    case "${DV_EL_TYPE:-unknown}:$tier" in
+        MEL:High|MEL:Base|MEL:Compact)
+            # a FEL found later by the job is discarded automatically too
+            DV_EL_DISCARD="MEL,FEL"
+            return 0
+            ;;
+        MEL:*)
+            DV_EL_DISCARD="MEL"
+            return 0
+            ;;
+        FEL:High|FEL:Base|FEL:Compact)
+            DV_EL_DISCARD="MEL,FEL"
+            echo
+            echo "$(ui_warn WARNING): $label: Dolby Vision profile 7 with a FEL (full enhancement layer)."
+            echo "  $tier discards it automatically: only the RPU is kept (profile 8.1);"
+            echo "  the FEL's additional picture data is not in the output."
+            return 0
+            ;;
+        FEL:*)
+            echo
+            echo "$(ui_warn WARNING): $label is Dolby Vision profile 7 with a FEL (full enhancement layer)."
+            echo "  A single-layer encode keeps only the RPU (converted to profile 8.1); the"
+            echo "  FEL's additional picture data is discarded and is not in the output."
+            read -rp "Discard the FEL and encode as profile 8.1? [y/N]: " ans
+            [[ "$ans" =~ ^[Yy]$ ]] || return 1
+            DV_EL_DISCARD="MEL,FEL"
+            ;;
+        *)
+            echo
+            echo "$(ui_warn WARNING): $label is Dolby Vision profile 7, but its enhancement layer type"
+            echo "  (MEL or FEL) could not be determined. The profile 8.1 conversion keeps only"
+            echo "  the RPU; the enhancement layer is discarded and may be a FEL with additional"
+            echo "  picture data."
+            read -rp "Discard the enhancement layer and encode as profile 8.1? [y/N]: " ans
+            [[ "$ans" =~ ^[Yy]$ ]] || return 1
+            DV_EL_DISCARD="MEL,FEL,unknown"
+            ;;
+    esac
+
+    return 0
+}
+
+# confirm_dynamic_range LABEL [FILE VIDX]  (after probe_hdr)
 #
 # Prints the dynamic range summary, decides what happens to Dolby
 # Vision / HDR10+ and asks where a choice is needed. Sets:
 #   DV_POLICY      none | preserve | drop
 #   DV_MODE        dovi_tool conversion mode ("" or 2)
+#   DV_EL_TYPE     profile 7 kept as 8.1: MEL | FEL | unknown (from FILE,
+#                  see dv_el_probe), otherwise ""
 #   HDR10P_POLICY  none | preserve | drop
+# The profile 7 enhancement-layer decision needs the tier: dv_el_policy.
 # Returns 1 when the source should be skipped.
 confirm_dynamic_range() {
-    local label="$1"
+    local label="$1" file="${2:-}" vidx="${3:-}"
     local ans verbose=0 tools_shown=0
 
     DV_POLICY="none"
     DV_MODE=""
+    DV_EL_TYPE=""
+    DV_EL_DISCARD=""
     HDR10P_POLICY="none"
 
     # Compact (normal) output: the menu header already shows the dynamic
@@ -321,23 +447,29 @@ confirm_dynamic_range() {
     if (( DV_SUPPORTED == 1 )) && (( DOVI_TOOL_OK == 1 )) && [[ -n "$MKVMERGE" ]]; then
         DV_POLICY="preserve"
 
-        if (( verbose == 1 )); then
+        if [[ "$DV_MODE" == 2 ]]; then
+            # profile 7 (dual-layer): the RPU is kept, the enhancement
+            # layer cannot be; dv_el_policy decides with the tier
+            DV_EL_TYPE=$(dv_el_probe "$file" "$vidx")
+
+            if (( verbose == 1 )); then
+                echo "Dolby Vision:   RPU PRESERVED as profile $DV_OUT (converted from profile 7 with"
+                echo "                dovi_tool mode 2, re-injected; $HDR_KIND base layer kept as fallback;"
+                echo "                verified after encoding)"
+                echo "                Enhancement layer: $DV_EL_TYPE$( [[ "$DV_EL_TYPE" != unknown ]] && echo " (first $DV_EL_PROBE_FRAMES frames; the job checks every frame)"), NOT kept:"
+                echo "                a single-layer encode carries the RPU only"
+            elif [[ "$DV_EL_TYPE" == MEL ]]; then
+                echo "Dolby Vision:   RPU $(ui_ok PRESERVED) as profile $DV_OUT; MEL enhancement layer discarded"
+            else
+                echo "Dolby Vision:   RPU $(ui_ok PRESERVED) as profile $DV_OUT; $(ui_warn "$(_dv_el_name "$DV_EL_TYPE") DISCARDED")"
+            fi
+        elif (( verbose == 1 )); then
             echo "Dolby Vision:   PRESERVED as profile $DV_OUT (RPU re-injected with dovi_tool;"
             echo "                $HDR_KIND base layer kept as fallback; verified after encoding)"
         elif [[ "$DV_OUT" == "${HDR_DV_PROFILE}.${HDR_DV_COMPAT}" ]]; then
             echo "Dolby Vision:   $(ui_ok PRESERVED)"
         else
             echo "Dolby Vision:   $(ui_ok PRESERVED) as profile $DV_OUT"
-        fi
-
-        if [[ "$HDR_DV_PROFILE" == "7" ]]; then
-            echo
-            echo "$(ui_warn NOTE): profile 7 is dual-layer. The enhancement layer (FEL or MEL) is NOT"
-            echo "  retained: a single-layer x265 encode can only carry the RPU, which is"
-            echo "  converted to profile 8.1 (dovi_tool mode 2). For FEL sources the extra"
-            echo "  detail of the enhancement layer is lost."
-            read -rp "Continue with profile 8.1 conversion? [Y/n]: " ans
-            [[ "$ans" =~ ^[Nn]$ ]] && return 1
         fi
 
         return 0
@@ -373,7 +505,13 @@ hdr_policy_summary() {
     local s=""
 
     case "${DV_POLICY:-none}" in
-        preserve) s="Dolby Vision preserved as profile ${DV_OUT:-8.1}" ;;
+        preserve)
+            if [[ -n "${DV_EL_TYPE:-}" ]]; then
+                s="Dolby Vision RPU preserved as profile ${DV_OUT:-8.1} (from profile 7; $(_dv_el_name "$DV_EL_TYPE") DISCARDED)"
+            else
+                s="Dolby Vision preserved as profile ${DV_OUT:-8.1}"
+            fi
+            ;;
         drop)     s="Dolby Vision DROPPED (base layer only, by choice)" ;;
     esac
 
@@ -386,14 +524,24 @@ hdr_policy_summary() {
 }
 
 # hdr_policy_short  ->  "DV/HDR10+ preserved", "HDR10+ preserved, DV
-# DROPPED", "HDR10", "SDR" (compact confirmation line; DROPPED in yellow)
+# DROPPED", "DV RPU preserved, DV FEL DISCARDED", "HDR10", "SDR" (compact
+# confirmation line; DROPPED / a discarded FEL in yellow)
 hdr_policy_short() {
     local kept=() s=""
 
-    [[ "${DV_POLICY:-none}" == preserve ]] && kept+=(DV)
+    if [[ "${DV_POLICY:-none}" == preserve ]]; then
+        [[ -n "${DV_EL_TYPE:-}" ]] && kept+=("DV RPU") || kept+=(DV)
+    fi
     [[ "${HDR10P_POLICY:-none}" == preserve ]] && kept+=(HDR10+)
     (( ${#kept[@]} )) && s="$(IFS=/; echo "${kept[*]}") preserved"
 
+    if [[ "${DV_POLICY:-none}" == preserve ]]; then
+        case "${DV_EL_TYPE:-}" in
+            MEL) s+=", DV MEL discarded" ;;
+            FEL) s+=", $(ui_warn "DV FEL DISCARDED")" ;;
+            ?*)  s+=", $(ui_warn "DV EL DISCARDED")" ;;
+        esac
+    fi
     [[ "${DV_POLICY:-none}" == drop ]] && s+="${s:+, }$(ui_warn "DV DROPPED")"
     [[ "${HDR10P_POLICY:-none}" == drop ]] && s+="${s:+, }$(ui_warn "HDR10+ DROPPED")"
 
@@ -448,33 +596,70 @@ _dv_fail() {
     return 1
 }
 
-# item_dv_extract SOURCE VIDX MODE
+# item_dv_extract SOURCE VIDX MODE [EL_DISCARD]
+#
+# The RPU is extracted unchanged. With a MODE (profile 7 -> 8.1), the
+# enhancement-layer type of every frame is read from it first
+# (dv_el_classify): the item fails unless that type is in EL_DISCARD,
+# the comma list confirmed in the menu (dv_el_policy; jobs written
+# before it was passed: any, the old menu asked for every profile 7
+# source). Only then is the RPU converted (dovi_tool editor, MODE).
 #
 # Writes to $ITEM_TMP:
 #   source.rpu      RPU as extracted (mode applied)
 #   inject.rpu      copy of it (item_dv_inject rescales L5 when needed)
 #   timestamps.txt  source frame timestamps (mkvmerge v2 format)
 #   rpu_frames      number of RPUs
+#   dv_el           MODE only: MEL | FEL | unknown (the discarded EL)
 item_dv_extract() {
-    local src="$1" vidx="$2" mode="$3"
+    local src="$1" vidx="$2" mode="$3" allow="${4-MEL,FEL,unknown}"
     local log="$ITEM_TMP/dovi_tool.log"
-    local frames n margs=()
+    local frames n el rpu="$ITEM_TMP/source.rpu"
 
     hdr_tools_detect
     [[ -n "$DOVI_TOOL" ]] || { _dv_fail "dovi_tool not found"; return 1; }
-    [[ -n "$mode" ]] && margs=(-m "$mode")
+    [[ -n "$mode" ]] && rpu="$ITEM_TMP/source_unconverted.rpu"
 
-    echo "Extracting Dolby Vision RPU${mode:+ (dovi_tool mode $mode)}..."
+    echo "Extracting Dolby Vision RPU..."
 
     if ! ffmpeg -v error -nostdin -i "$src" -map "0:$vidx" -c:v copy \
             -bsf:v hevc_mp4toannexb -f hevc - |
-         "$DOVI_TOOL" ${margs[@]+"${margs[@]}"} extract-rpu - -o "$ITEM_TMP/source.rpu" >> "$log" 2>&1; then
+         "$DOVI_TOOL" extract-rpu - -o "$rpu" >> "$log" 2>&1; then
         _dv_fail "RPU extraction failed (see $log)"
         return 1
     fi
 
+    if [[ -n "$mode" ]]; then
+        "$DOVI_TOOL" info -s -i "$rpu" > "$ITEM_TMP/source_unconverted_rpu_summary.txt" 2>> "$log"
+        el=$(dv_el_classify "$ITEM_TMP/source_unconverted_rpu_summary.txt")
+        echo "$el" > "$ITEM_TMP/dv_el"
+        echo "Enhancement layer: $el (all frames)"
+
+        if [[ ",$allow," != *",$el,"* ]]; then
+            _dv_fail "Dolby Vision profile 7 $(_dv_el_name "$el"): discarding it was not confirmed (confirmed: ${allow:-none}); queue the source again to decide"
+            return 1
+        fi
+        [[ "$el" != MEL ]] &&
+            echo "WARNING: the $(_dv_el_name "$el") is discarded: the single-layer output keeps the RPU only (profile 8.1)"
+
+        echo "Converting RPU (dovi_tool mode $mode)..."
+        printf '{"mode": %s}\n' "$mode" > "$ITEM_TMP/dv_convert.json"
+
+        if ! "$DOVI_TOOL" editor -i "$rpu" -j "$ITEM_TMP/dv_convert.json" \
+                -o "$ITEM_TMP/source.rpu" >> "$log" 2>&1; then
+            _dv_fail "RPU conversion (dovi_tool mode $mode) failed (see $log)"
+            return 1
+        fi
+        rm -f -- "$rpu"
+    fi
+
     "$DOVI_TOOL" info -s -i "$ITEM_TMP/source.rpu" > "$ITEM_TMP/source_rpu_summary.txt" 2>> "$log"
     cat "$ITEM_TMP/source_rpu_summary.txt"
+
+    if [[ -n "$mode" ]] && ! tr -d '\r' < "$ITEM_TMP/source_rpu_summary.txt" | grep -q 'Profile: 8[[:space:]]*$'; then
+        _dv_fail "RPU conversion (dovi_tool mode $mode) did not give profile 8"
+        return 1
+    fi
 
     frames=$(awk '/Frames:/ { print $2; exit }' "$ITEM_TMP/source_rpu_summary.txt")
     [[ "$frames" =~ ^[0-9]+$ ]] && (( frames > 0 )) ||
@@ -830,7 +1015,7 @@ item_verify_output() {
             line="$s -> $o"
             [[ "$dv" == "drop" ]] && line+="  (Dolby Vision dropped by choice)"
             [[ "$h10p" == "drop" ]] && line+="  (HDR10+ dropped by choice)"
-            [[ "$dv" == "preserve" && "$S_DV_PROFILE" == "7" ]] && line+="  (profile 7 converted to 8.1)"
+            [[ "$dv" == "preserve" && "$S_DV_PROFILE" == "7" ]] && line+="  (profile 7 RPU converted to 8.1; enhancement layer discarded)"
             _rep "HDR type" "$line" >&3
         fi
 
@@ -855,8 +1040,14 @@ item_verify_output() {
                         _rep "Dolby Vision RPU" "FAILED: $v" >&3
                         fails+=("Dolby Vision not verified: $v")
                     fi
+                    # the RPU is kept, the enhancement layer never is:
+                    # a FEL (or an unclassified layer) is a warning
                     if [[ "$S_DV_PROFILE" == "7" ]]; then
-                        _rep "DV enhancement" "DROPPED (FEL/MEL video cannot be carried by a single-layer encode)" >&3
+                        local el
+                        el=$(cat "$ITEM_TMP/dv_el" 2>/dev/null)
+                        _rep "DV enhancement" "$(_dv_el_name "$el") DISCARDED (only the RPU is kept; a single-layer encode cannot carry the enhancement layer)" >&3
+                        [[ "$el" == MEL ]] ||
+                            warns+=("Dolby Vision $(_dv_el_name "$el") discarded (RPU kept as profile 8.1)")
                     fi
                     ;;
                 drop)
@@ -965,6 +1156,15 @@ item_verify_output() {
             abr:*)   rc_bad="x265 rate control '$rc', planned two-pass" ;;
         esac
 
+        # x265 tune (movie Custom film grain): tune grain is the only one
+        # planned; its rc-grain flag is in the settings SEI
+        if [[ "$video" != "copy" && -z "$rc_bad" && -n "${ITEM_EXP[tune]:-}" ]]; then
+            if [[ "${ITEM_EXP[tune]}" != grain ]] ||
+               ! x265_sei_options "$out" "${ovidx:-0}" | grep -qx 'rc-grain'; then
+                rc_bad="x265 --tune ${ITEM_EXP[tune]} not found in the stream settings"
+            fi
+        fi
+
         if [[ "$video" == "copy" ]]; then
             if [[ "$ov_codec $ov_w $ov_h $ov_pix" == "$sv_codec $sv_w $sv_h $sv_pix" ]]; then
                 _rep "Video stream" "COPIED ($line, as the source)" >&3
@@ -992,6 +1192,7 @@ item_verify_output() {
                 "2pass "*) line+=", two-pass ${rc#2pass } kb/s" ;;
                 *)         [[ -n "${ITEM_EXP[crf]:-}" ]] && line+=", CRF ${ITEM_EXP[crf]}" ;;
             esac
+            [[ -n "${ITEM_EXP[tune]:-}" ]] && line+=", tune ${ITEM_EXP[tune]}"
             _rep "Video stream" "AS PLANNED ($line)" >&3
         fi
     fi

@@ -382,7 +382,7 @@ else
     [[ -n "$AVG_VIDEO" ]] && printf '%-16s%s\n' "Avg video:" "$AVG_VIDEO"
 fi
 
-if ! confirm_dynamic_range "this series"; then
+if ! confirm_dynamic_range "this series" "$REFERENCE" "${EP_VIDX[0]}"; then
     echo "Compression cancelled."
     exit 0
 fi
@@ -481,6 +481,15 @@ while true; do
 done
 
 crf_tier_load series "$TIER" "$CUSTOM_CRF"
+
+# Dolby Vision profile 7: the profile 8.1 conversion discards the
+# enhancement layer; asked or not depending on the tier and its type in
+# the first episode (hdr_dovi.sh dv_el_policy). Every episode is checked
+# again by its job.
+if ! dv_el_policy "$TIER" "this series"; then
+    echo "Compression cancelled."
+    exit 0
+fi
 
 # Compact: every episode's own ceiling from its exact runtime
 # (SERIES_EP_CEIL; empty for High / Base / Custom)

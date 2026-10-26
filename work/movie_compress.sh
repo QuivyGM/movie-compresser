@@ -21,7 +21,7 @@ source "$WORK_DIR/lib/policy.sh"
 # (assigned empty: "set -u" rejects ${#INPUTS[@]} of a never-assigned
 # array when every movie was skipped)
 declare -a INPUTS=() OUTPUTS=() VIDEOS=() EST_VBYTES=() RETRIES=() FILTERS=() TIERS=() OVERWRITES=()
-declare -a DV_POLICIES=() DV_MODES=() HDR10P_POLICIES=() QUALITY_SPECS=() CRF_EST_MAPS=() ACTUAL_SIGS=()
+declare -a DV_POLICIES=() DV_MODES=() DV_EL_DISCARDS=() X265_TUNES=() HDR10P_POLICIES=() QUALITY_SPECS=() CRF_EST_MAPS=() ACTUAL_SIGS=()
 
 # Compression policy: ~/compress/work/lib/compress.conf (loaded and validated
 # by work/lib/policy.sh). The policy math lives there as well
@@ -191,7 +191,7 @@ while true; do
         printf '%-16s%s GiB\n' "File size:" "$SOURCE_TOTAL_GIB"
     fi
 
-    if ! confirm_dynamic_range "$BASENAME"; then
+    if ! confirm_dynamic_range "$BASENAME" "$IN" "$VIDX"; then
         skip_movie && continue
         break
     fi
@@ -262,7 +262,8 @@ while true; do
         echo "3) Base        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of runtime (${CRF_CEILING_GIB} GiB for this movie)"
         crf_tier_load movie Compact "" "$DURATION" 2>/dev/null || true
         echo "4) Compact     CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of runtime (${CRF_CEILING_GIB} GiB for this movie)"
-        echo "5) Custom CRF  exactly the CRF you enter"
+        echo "5) Custom CRF  exactly the CRF you enter (default $(movie_custom_crf_default)), no size target or ceiling;"
+        echo "               archival use: optional x265 film-grain tuning, or keep the source video"
     else
         printf '1) %-8s %-11s %s\n' Quality "CRF search" "$QUALITY_MENU_TEXT"
         crf_tier_load movie High "" "$DURATION" 2>/dev/null || true
@@ -271,10 +272,12 @@ while true; do
         printf '3) %-8s %-11s <=%s GiB/h  (%s GiB)\n' Base "CRF ${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR" "$CRF_CEILING_GIB"
         crf_tier_load movie Compact "" "$DURATION" 2>/dev/null || true
         printf '4) %-8s %-11s <=%s GiB/h  (%s GiB)\n' Compact "CRF ${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR" "$CRF_CEILING_GIB"
-        printf '5) %-8s exact CRF (0-%s)\n' Custom "$CRF_LIMIT"
+        printf '5) %-8s exact CRF (0-%s), no size limit\n' Custom "$CRF_LIMIT"
     fi
 
     CUSTOM_CRF=""
+    CUSTOM_COPY=0
+    X265_TUNE=""
 
     # tiers from the largest to the smallest video, then Custom
     while true; do
@@ -287,11 +290,30 @@ while true; do
             4) TIER="Compact"; break ;;
             5)
                 TIER="Custom"
+                # archival use: Enter = MOVIE_CUSTOM_CRF_DEFAULT; "copy"
+                # keeps the source video (no re-encode at all). A low CRF
+                # is visually near-lossless, never mathematically lossless.
                 while true; do
-                    read -rp "Custom CRF: " CUSTOM_CRF
+                    read -rp "Custom CRF [$(movie_custom_crf_default)] (or \"copy\" = keep the source video): " CUSTOM_CRF
+                    [[ -z "$CUSTOM_CRF" ]] && CUSTOM_CRF=$(movie_custom_crf_default)
+                    if [[ "${CUSTOM_CRF,,}" == copy ]]; then
+                        if source_video_can_copy; then
+                            CUSTOM_CRF=""
+                            CUSTOM_COPY=1
+                            break
+                        fi
+                        echo "Keeping the source video needs an HEVC source, no downscaling and no dropped Dolby Vision / HDR10+."
+                        continue
+                    fi
                     crf_valid "$CUSTOM_CRF" && break
-                    echo "Enter an x265 CRF from 0 to $CRF_LIMIT, e.g. 21 (lower = higher quality)"
+                    echo "Enter an x265 CRF from 0 to $CRF_LIMIT, e.g. 14 (lower = higher quality), or \"copy\""
                 done
+                # film grain: x265's own grain tuning (no SAO, no AQ /
+                # cu-tree, strong psy-rdoq); larger files, this movie only
+                if (( CUSTOM_COPY == 0 )); then
+                    read -rp "Preserve film grain (x265 --tune grain, larger output)? [y/N]: " g
+                    [[ "$g" =~ ^[Yy]$ ]] && X265_TUNE=grain
+                fi
                 break
                 ;;
             *) echo "Invalid selection." ;;
@@ -309,6 +331,10 @@ while true; do
     QUALITY_SPEC=""
     QUALITY_KEEP_SOURCE=0
     QUALITY_PICK=""
+
+    # Custom "copy": the source video kept unchanged, like the Quality
+    # source guard's option 1 (both Dolby Vision layers stay)
+    (( CUSTOM_COPY == 1 )) && QUALITY_KEEP_SOURCE=1
 
     if [[ "$TIER" == "Quality" ]]; then
         QUALITY_STATUS="band"
@@ -351,6 +377,14 @@ while true; do
                     ;;
             esac
         fi
+    fi
+
+    # Dolby Vision profile 7: the profile 8.1 conversion discards the
+    # enhancement layer; asked or not depending on the tier and its type
+    # (hdr_dovi.sh dv_el_policy). A kept source video keeps both layers.
+    if (( QUALITY_KEEP_SOURCE == 0 )) && ! dv_el_policy "$TIER" "$BASENAME"; then
+        skip_movie && continue
+        break
     fi
 
     if (( QUALITY_KEEP_SOURCE == 1 )); then
@@ -749,6 +783,8 @@ while true; do
     OVERWRITES+=("$RESOLVED_OVERWRITE")
     DV_POLICIES+=("$DV_POLICY")
     DV_MODES+=("$DV_MODE")
+    DV_EL_DISCARDS+=("$DV_EL_DISCARD")
+    X265_TUNES+=("$X265_TUNE")
     HDR10P_POLICIES+=("$HDR10P_POLICY")
 
     # ========================================================
@@ -771,7 +807,9 @@ while true; do
             crf:*)
                 printf "  Video encode:      x265 CRF %s, single pass\n" "$CRF"
                 if [[ "$TIER" == "Custom" ]]; then
-                    printf "                     (entered CRF, used exactly)\n"
+                    printf "                     (entered CRF, used exactly; no size target or ceiling)\n"
+                    [[ -n "$X265_TUNE" ]] &&
+                        printf "                     (x265 --tune %s: film-grain preservation)\n" "$X265_TUNE"
                 elif [[ "$QUALITY_STATUS" == "band" ]]; then
                     printf "                     (Quality: CRF %s-%s, %s GiB video target, band %s-%s GiB; %s)\n" \
                         "$CRF_MIN" "$CRF_MAX" "$MOVIE_QUALITY_TARGET_VIDEO_GIB" \
@@ -849,7 +887,7 @@ while true; do
         echo "------------------------------------------------------------"
     else
         case "$VIDEO_SPEC" in
-            crf:*) VIDEO_TEXT=$(ui_bold "CRF $CRF$( (( ${BASE_MANUAL:-0} == 1 )) && echo " (manual)")") ;;
+            crf:*) VIDEO_TEXT=$(ui_bold "CRF $CRF$( (( ${BASE_MANUAL:-0} == 1 )) && echo " (manual)")${X265_TUNE:+ tune $X265_TUNE}") ;;
             copy)  VIDEO_TEXT="source video kept" ;;
         esac
 
@@ -925,6 +963,8 @@ JOB_FILE="$WORK_DIR/$SESSION.sh"
     for i in "${!INPUTS[@]}"; do
         DV_POLICY="${DV_POLICIES[$i]}"
         DV_MODE="${DV_MODES[$i]}"
+        DV_EL_DISCARD="${DV_EL_DISCARDS[$i]}"
+        X265_TUNE="${X265_TUNES[$i]}"
         HDR10P_POLICY="${HDR10P_POLICIES[$i]}"
 
         emit_encode_item \

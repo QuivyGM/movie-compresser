@@ -182,6 +182,16 @@ x265_rate_control() {
     return 0
 }
 
+# x265_sei_options FILE STREAM_INDEX  ->  the options x265 wrote into
+# the settings SEI ("rc-grain", "psy-rd=4.00", ...), one per line; nothing
+# when not x265
+x265_sei_options() {
+    ffmpeg -v error -nostdin -i "$1" -map "0:$2" -c copy -frames:v 1 -f hevc - 2>/dev/null |
+        head -c 4000000 | tr -c '[:print:]' '\n' | grep -m1 -o 'options: .*' |
+        tr ' ' '\n' | tail -n +2
+    return 0
+}
+
 get_duration() {
     ffprobe -v error \
         -show_entries format=duration \

@@ -256,6 +256,11 @@ validate_policy() {
         errs+=("AUDIO_COMPACT_LIMIT_GIB ($AUDIO_COMPACT_LIMIT_GIB) is greater than AUDIO_COMPACT_TRIGGER_GIB ($AUDIO_COMPACT_TRIGGER_GIB)")
     fi
 
+    # optional (configs without it: 14): the movie Custom CRF on Enter
+    if [[ -n "${MOVIE_CUSTOM_CRF_DEFAULT+x}" ]] && ! crf_valid "$MOVIE_CUSTOM_CRF_DEFAULT"; then
+        errs+=("MOVIE_CUSTOM_CRF_DEFAULT=\"$MOVIE_CUSTOM_CRF_DEFAULT\": not an x265 CRF (0-$CRF_LIMIT)")
+    fi
+
     if (( ${#errs[@]} )); then
         echo "Invalid compression policy in $(policy_conf_path):" >&2
         printf '  - %s\n' "${errs[@]}" >&2
@@ -493,6 +498,12 @@ movie_video_policy_lines() {
 # _gib_bytes GIB  ->  whole bytes
 _gib_bytes() {
     awk -v g="$1" 'BEGIN { printf "%.0f", g * 1073741824 }'
+}
+
+# movie_custom_crf_default  ->  the movie Custom CRF taken on Enter
+# (MOVIE_CUSTOM_CRF_DEFAULT, 14 when the config has none)
+movie_custom_crf_default() {
+    printf '%s' "${MOVIE_CUSTOM_CRF_DEFAULT:-14}"
 }
 
 # crf_valid VALUE  ->  0 when VALUE is a usable x265 CRF (0-51, decimals ok)

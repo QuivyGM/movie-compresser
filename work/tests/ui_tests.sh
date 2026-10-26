@@ -111,9 +111,10 @@ check "warning: details + tool report" \
 
 hdr_fake
 HDR_HDR10PLUS=0 HDR_DV_PROFILE=7 HDR_DV_COMPAT=6
-printf 'y\n' | confirm_dynamic_range Show > "$T/hdr4.out" 2>&1
-check "profile 7: converted + NOTE kept" \
-    "grep -q '^Dolby Vision:   PRESERVED as profile 8.1$' '$T/hdr4.out' && grep -q '^NOTE: profile 7 is dual-layer' '$T/hdr4.out' && ! grep -q 'HDR tools' '$T/hdr4.out'"
+confirm_dynamic_range Show < /dev/null > "$T/hdr4.out" 2>&1
+check "profile 7: RPU converted, EL discarded (decided with the tier)" \
+    "grep -q '^Dolby Vision:   RPU PRESERVED as profile 8.1; enhancement layer of unknown type DISCARDED$' '$T/hdr4.out' && ! grep -q 'HDR tools' '$T/hdr4.out'"
+eq "profile 7: short policy"         "$(hdr_policy_short)" "DV RPU preserved, DV EL DISCARDED"
 
 hdr_fake
 HDR_DV=0 HDR_HDR10PLUS=0
