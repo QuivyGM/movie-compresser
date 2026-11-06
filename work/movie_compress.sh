@@ -756,13 +756,19 @@ while true; do
         OUT="$OUT_DIR/${NAME} HEVC ${TIER}.mkv"
     fi
 
-    if ! resolve_output_conflict "$OUT"; then
+    # only a version made with the same settings (CRF, film grain, Dolby
+    # Vision / HDR10+ kept) is a conflict; other versions are kept and the
+    # new one gets the next free name without asking
+    OUT_SIG=$(output_plan_sig "$VIDEO_SPEC" "$X265_TUNE" "$DV_POLICY" "$HDR10P_POLICY")
+
+    if ! resolve_output_conflict "$OUT" "$OUT_SIG"; then
         skip_movie && continue
         break
     fi
 
     OUT="$RESOLVED_OUT"
     PLANNED_OUTPUTS+=("$OUT")
+    PLANNED_SIGS+=("$OUT_SIG")
 
     build_stream_map "$IN" "$VIDX"
 

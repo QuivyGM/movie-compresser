@@ -300,8 +300,15 @@ item_begin() {
         return 1
     fi
 
-    if [[ -e "$ITEM_PART" ]]; then
+    # Claim the .part name now (atomic, no-clobber), not only when the
+    # final mux writes it: Dolby Vision / HDR10+ encodes work in ITEM_TMP
+    # for hours first, and without this file another job planned in the
+    # meantime would pick the same output name and its "ffmpeg -y" mux
+    # would overwrite this item's .part. The empty file is replaced by
+    # the encode; item_failed / an interruption remove it as before.
+    if [[ -e "$ITEM_PART" ]] || ! ( set -C; : > "$ITEM_PART" ) 2>/dev/null; then
         ITEM_FAIL_REASON="$(basename "$ITEM_PART") already exists (another encode writing it?)"
+        [[ -e "$ITEM_PART" ]] || ITEM_FAIL_REASON="could not create $(basename "$ITEM_PART")"
         ITEM_PART=""
         job_write_state
         return 1

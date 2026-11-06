@@ -1178,36 +1178,66 @@ if path_taken "$OUT_SERIES" && [[ ! -d "$OUT_SERIES" ]]; then
     exit 1
 fi
 
-declare -a EP_OUT EP_OVERWRITE EP_SKIP
+declare -a EP_OUT EP_OVERWRITE EP_SKIP EP_MATCH
 EXISTING=0
+RENAMED=0
 
 for i in "${!FILES[@]}"; do
     EP_OUT[$i]=$(series_episode_output "$OUT_SERIES" "${FILES[$i]}" "$TIER" "$DOWNSCALED")
 
     EP_OVERWRITE[$i]=0
+    EP_MATCH[$i]=""
     EP_SKIP[$i]=$(( EP_GUARD_SKIP[i] == 1 || EP_CEIL_SKIP[i] == 1 ))
+    (( EP_SKIP[$i] == 1 )) && continue
 
-    # a symlink (valid or broken) at the output name counts as existing
-    if (( EP_SKIP[$i] == 0 )) &&
-       { path_taken "${EP_OUT[$i]}" || path_taken "${EP_OUT[$i]}.part"; }; then
+    # A name another encode is writing or a running job will write
+    # (output_busy) is always a conflict (its settings are not known yet).
+    if output_busy "${EP_OUT[$i]}"; then
         ((EXISTING += 1))
+        continue
+    fi
+
+    # Only a version made with the SAME settings (CRF, Dolby Vision /
+    # HDR10+ kept) is a conflict; versions with other settings are kept
+    # and this encode gets the next free " (N)" name without asking.
+    path_taken "${EP_OUT[$i]}" || continue
+    sig=$(output_plan_sig "${EP_VIDEO[$i]}" "" "${DV_POLICY:-none}" "${HDR10P_POLICY:-none}")
+    if [[ -z "$sig" ]]; then
+        EP_MATCH[$i]="${EP_OUT[$i]}"
+    else
+        while IFS= read -r f; do
+            [[ -n "$f" && "$(output_file_sig "$f")" == "$sig" ]] && { EP_MATCH[$i]="$f"; break; }
+        done < <(output_family "${EP_OUT[$i]}")
+    fi
+
+    if [[ -n "${EP_MATCH[$i]}" ]]; then
+        ((EXISTING += 1))
+    else
+        EP_OUT[$i]=$(unique_output_path "${EP_OUT[$i]}")
+        ((RENAMED += 1))
     fi
 done
 
+if (( RENAMED > 0 )); then
+    echo "$RENAMED episode(s) already have versions with other settings (kept);"
+    echo "the new encodes get the next free \" (N)\" name."
+    echo
+fi
+
 if (( EXISTING > 0 )); then
-    echo "$EXISTING of ${FILE_COUNT} outputs already exist in:"
+    echo "$EXISTING of ${FILE_COUNT} episodes already have an output with the same settings in:"
     echo "  $OUT_SERIES"
 
     for i in "${!FILES[@]}"; do
-        if [[ -L "${EP_OUT[$i]}" ]] && ! path_taken "${EP_OUT[$i]}.part"; then
+        if [[ -n "${EP_MATCH[$i]}" && -L "${EP_MATCH[$i]}" ]]; then
             echo
-            output_symlink_notice "${EP_OUT[$i]}"
+            output_symlink_notice "${EP_MATCH[$i]}"
         fi
     done
     echo
-    echo "1) Keep both (new files get a \" (2)\" suffix)"
-    echo "2) Overwrite existing files when the new encodes complete"
-    echo "3) Skip episodes that already have an output"
+    echo "1) Keep both (new files get a \" (N)\" suffix)"
+    echo "2) Overwrite those outputs when the new encodes complete"
+    echo "3) Skip those episodes"
 
     while true; do
         read -rp "Select [1-3]: " oc
@@ -1219,17 +1249,17 @@ if (( EXISTING > 0 )); then
 
     for i in "${!FILES[@]}"; do
         (( EP_SKIP[$i] == 1 )) && continue
-        if path_taken "${EP_OUT[$i]}.part"; then
-            # Possibly being written by another job: never touch it.
+        if [[ -z "${EP_MATCH[$i]}" ]] && output_busy "${EP_OUT[$i]}"; then
+            # Being written (or planned) by another job: never touch it.
             if [[ "$oc" == "3" ]]; then
                 EP_SKIP[$i]=1
             else
                 EP_OUT[$i]=$(unique_output_path "${EP_OUT[$i]}")
             fi
-        elif path_taken "${EP_OUT[$i]}"; then
+        elif [[ -n "${EP_MATCH[$i]}" ]]; then
             case "$oc" in
                 1) EP_OUT[$i]=$(unique_output_path "${EP_OUT[$i]}") ;;
-                2) EP_OVERWRITE[$i]=1 ;;
+                2) EP_OUT[$i]="${EP_MATCH[$i]}"; EP_OVERWRITE[$i]=1 ;;
                 3) EP_SKIP[$i]=1 ;;
             esac
         fi

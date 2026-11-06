@@ -672,9 +672,45 @@ output_symlink_notice() {
     fi
 }
 
+# output_reserved_by_job PATH  ->  0 when a job that is still running
+# (its tmux session is alive and its script is in WORK_DIR) will write
+# PATH. Such a job may not have created any file under that name yet
+# (pre-encode steps) or may be between files (a CRF retry writes
+# "<PATH>.retry-crf<N>.part", the accepted attempt is set aside as
+# "<PATH>.accepted-crf<N>.part"), so the name must not be planned again.
+# The running job itself (JOB_SESSION) is not counted.
+output_reserved_by_job() {
+    local work="${WORK_DIR:-}" pat script s
+
+    [[ -n "$work" && -d "$work" ]] || return 1
+    command -v tmux >/dev/null 2>&1 || return 1
+
+    # generated jobs pass every output %q-quoted to item_begin
+    pat="$(printf '%q' "$1") "
+
+    for script in "$work"/*.sh; do
+        [[ -f "$script" ]] || continue
+        s=$(basename "$script" .sh)
+        [[ "$s" =~ ^(c|a|series)[0-9]+$ ]] || continue
+        [[ "$s" == "${JOB_SESSION:-}" ]] && continue
+        grep -qF -- "$pat" "$script" 2>/dev/null || continue
+        tmux has-session -t "=$s" 2>/dev/null && return 0
+    done
+
+    return 1
+}
+
+# output_busy PATH  ->  0 when another encode is (or will be) writing
+# PATH: an in-progress ".part" file, or a running job planned it
+output_busy() {
+    path_taken "$1.part" || output_reserved_by_job "$1"
+}
+
 # unique_output_path PATH  ->  PATH, or "NAME (2).ext", "NAME (3).ext", ...
-# Also avoids names that have an in-progress ".part" file, and names
-# taken by a symlink (valid or broken).
+# Also avoids names that have an in-progress ".part" file, names a
+# running job will write (output_reserved_by_job), and names taken by a
+# symlink (valid or broken). A PATH that already carries a " (N)" suffix
+# continues from N + 1 ("M (2).mkv" -> "M (3).mkv", not "M (2) (2).mkv").
 unique_output_path() {
     local path="$1"
     local dir base ext cand
@@ -686,7 +722,14 @@ unique_output_path() {
     base="${base%.*}"
     cand="$path"
 
-    while path_taken "$cand" || path_taken "$cand.part" || output_is_planned "$cand"; do
+    # only when " (N)" is a suffix of ours: the unsuffixed name exists
+    if [[ "$base" =~ ^(.+)\ \(([0-9]+)\)$ ]] && (( 10#${BASH_REMATCH[2]} >= 2 )) &&
+       path_taken "$dir/${BASH_REMATCH[1]}.$ext"; then
+        base="${BASH_REMATCH[1]}"
+        n=$(( 10#${BASH_REMATCH[2]} + 1 ))
+    fi
+
+    while path_taken "$cand" || output_busy "$cand" || output_is_planned "$cand"; do
         cand="$dir/$base ($n).$ext"
         ((n++))
     done
@@ -695,8 +738,10 @@ unique_output_path() {
 }
 
 # Outputs already claimed by the queue being built (movie menu queues
-# several files; two entries must never write the same output).
+# several files; two entries must never write the same output), and the
+# settings signature of each (output_plan_sig; "" = not recorded).
 PLANNED_OUTPUTS=()
+PLANNED_SIGS=()
 
 output_is_planned() {
     local p
@@ -708,46 +753,208 @@ output_is_planned() {
     return 1
 }
 
-# resolve_output_conflict PATH
+# output_in_family PATH CANDIDATE  ->  0 when CANDIDATE is PATH or one of
+# its keep-both names "NAME (N).ext" (same folder)
+output_in_family() {
+    local path="$1" cand="$2" name ext base b rest
+
+    [[ "$(dirname -- "$cand")" == "$(dirname -- "$path")" ]] || return 1
+    name=$(basename -- "$path")
+    ext="${name##*.}"
+    base="${name%.*}"
+    b=$(basename -- "$cand")
+
+    [[ "$b" == "$name" ]] && return 0
+    [[ "${b:0:${#base}}" == "$base" ]] || return 1
+    rest="${b:${#base}}"
+    [[ "$rest" == *".$ext" ]] || return 1
+    rest="${rest%".$ext"}"
+    [[ "$rest" =~ ^\ \([0-9]+\)$ ]]
+}
+
+# output_family PATH  ->  every existing output of the same name family,
+# one per line: PATH itself and "NAME (N).ext" (the keep-both copies),
+# symlinks included. In-progress / kept files (".part", ".verify-failed",
+# ...) are not outputs and are not listed.
+output_family() {
+    local path="$1" f
+
+    for f in "$(dirname -- "$path")"/*; do
+        path_taken "$f" || continue
+        output_in_family "$path" "$f" && printf '%s\n' "$f"
+    done
+    return 0
+}
+
+# _sig_crf VALUE  ->  CRF normalised for comparison ("16.0" -> "16")
+_sig_crf() {
+    awk -v c="$1" 'BEGIN { printf "%g", c }'
+}
+
+# output_plan_sig VIDEO_SPEC [TUNE [DV_POLICY [HDR10P_POLICY]]]
+#   ->  settings signature of a planned encode, comparable with
+#       output_file_sig: "crf=18 tune=- dv=1 hdr10p=0" / "copy dv=1 hdr10p=0"
+# VIDEO_SPEC "crf:N" or "copy"; "" for anything else (no signature: the
+# name-only conflict prompt is used). The tier and the 1080p downscale
+# are part of the output name already.
+output_plan_sig() {
+    local spec="$1" tune="${2:-}" dv=0 h10p=0
+
+    [[ "${3:-}" == preserve ]] && dv=1
+    [[ "${4:-}" == preserve ]] && h10p=1
+    case "$spec" in
+        crf:*) printf 'crf=%s tune=%s dv=%s hdr10p=%s' "$(_sig_crf "${spec#crf:}")" "${tune:--}" "$dv" "$h10p" ;;
+        copy)  printf 'copy dv=%s hdr10p=%s' "$dv" "$h10p" ;;
+    esac
+    return 0
+}
+
+# output_file_sig FILE  ->  the same signature read from an existing
+# output: the CRF and film-grain tune x265 wrote into the stream (else
+# the COMPRESSION_CRF tag of a movie-compresser encode; neither = the
+# source video was kept), and whether Dolby Vision / HDR10+ are present.
+# "" when FILE cannot be read. Runs in a subshell (HDR_* kept).
+output_file_sig() {
+    local f="$1" vidx
+
+    [[ -e "$f" ]] || return 0
+    vidx=$(main_video_index "$f" 2>/dev/null)
+    [[ -n "$vidx" ]] || return 0
+
+    (
+        local rc crf="" tune="-"
+
+        probe_hdr "$f" "$vidx" > /dev/null 2>&1 || true
+        rc=$(x265_rate_control "$f" "$vidx")
+        case "$rc" in
+            "crf "*) crf="${rc#crf }" ;;
+            "")      crf=$(video_stream_crf "$f" "$vidx" 2>/dev/null) ;;
+            *)       printf 'x265=%s dv=%s hdr10p=%s' "${rc// /:}" "$HDR_DV" "$HDR_HDR10PLUS"; exit 0 ;;
+        esac
+        if [[ -z "$crf" ]]; then
+            printf 'copy dv=%s hdr10p=%s' "$HDR_DV" "$HDR_HDR10PLUS"
+            exit 0
+        fi
+        x265_sei_options "$f" "$vidx" | grep -qx 'rc-grain' && tune=grain
+        printf 'crf=%s tune=%s dv=%s hdr10p=%s' "$(_sig_crf "$crf")" "$tune" "$HDR_DV" "$HDR_HDR10PLUS"
+    ) || true
+}
+
+# output_sig_text SIG  ->  "CRF 18, film grain, Dolby Vision" (for prompts)
+output_sig_text() {
+    local w out=() t=""
+
+    for w in $1; do
+        case "$w" in
+            crf=*)      out+=("CRF ${w#crf=}") ;;
+            x265=*)     out+=("x265 ${w#x265=}") ;;
+            copy)       out+=("source video kept") ;;
+            tune=grain) out+=("film grain") ;;
+            dv=1)       out+=("Dolby Vision") ;;
+            hdr10p=1)   out+=("HDR10+") ;;
+        esac
+    done
+    (( ${#out[@]} )) || out=("settings not readable")
+    for w in "${out[@]}"; do
+        t+="${t:+, }$w"
+    done
+    printf '%s' "$t"
+}
+
+# resolve_output_conflict PATH [SIG]
 #
 # Interactive. Sets RESOLVED_OUT and RESOLVED_OVERWRITE (0/1).
 # Returns 1 when the user chooses to skip the file.
+#
+# SIG (output_plan_sig) given: only an output of the same name family
+# (PATH, "NAME (N).ext") made with the SAME settings is a conflict. When
+# every existing version was made with other settings (another CRF, film
+# grain, Dolby Vision kept / dropped, ...) the new encode is saved under
+# the next free name and nothing is asked. A same-settings version gets
+# the prompt; "Overwrite" replaces that version (whatever its number).
+# Without SIG any existing PATH is a conflict (name only).
 resolve_output_conflict() {
-    local path="$1"
-    local alt c
+    local path="$1" sig="${2:-}"
+    local alt c target="$1" f fs i others=()
 
     RESOLVED_OUT="$path"
     RESOLVED_OVERWRITE=0
 
-    if ! path_taken "$path" && ! path_taken "$path.part" && ! output_is_planned "$path"; then
+    if [[ -n "$sig" ]]; then
+        target=""
+        # same settings already in this queue
+        for i in "${!PLANNED_OUTPUTS[@]}"; do
+            [[ "${PLANNED_SIGS[$i]:-}" == "$sig" ]] || continue
+            if output_in_family "$path" "${PLANNED_OUTPUTS[$i]}"; then
+                target="${PLANNED_OUTPUTS[$i]}"
+                break
+            fi
+        done
+        # same settings on disk
+        if [[ -z "$target" ]]; then
+            while IFS= read -r f; do
+                [[ -n "$f" ]] || continue
+                fs=$(output_file_sig "$f")
+                if [[ -n "$fs" && "$fs" == "$sig" ]]; then
+                    target="$f"
+                    break
+                fi
+                others+=("$(basename -- "$f")  ($(output_sig_text "$fs"))")
+            done < <(output_family "$path")
+        fi
+
+        if [[ -z "$target" ]]; then
+            if ! path_taken "$path" && ! output_busy "$path" && ! output_is_planned "$path"; then
+                return 0
+            fi
+            RESOLVED_OUT=$(unique_output_path "$path")
+            echo
+            echo "Other versions of this output exist (different settings, all kept):"
+            for f in "${others[@]+"${others[@]}"}"; do
+                echo "  $f"
+            done
+            output_busy "$path" && echo "  $(basename -- "$path")  (another encode is writing it)"
+            output_is_planned "$path" && echo "  $(basename -- "$path")  (in this queue)"
+            echo "New file: $(basename -- "$RESOLVED_OUT")  ($(output_sig_text "$sig"))"
+            return 0
+        fi
+    elif ! path_taken "$path" && ! output_busy "$path" && ! output_is_planned "$path"; then
         return 0
     fi
 
     alt=$(unique_output_path "$path")
 
     echo
-    echo "Output already exists:"
-    echo "  $(basename "$path")"
+    if [[ -n "$sig" ]]; then
+        echo "An output with the same settings ($(output_sig_text "$sig")) already exists:"
+    else
+        echo "Output already exists:"
+    fi
+    echo "  $(basename "$target")"
 
-    if path_taken "$path.part"; then
+    if path_taken "$target.part"; then
         echo "  (a .part file exists: another encode may be writing it)"
+    elif output_reserved_by_job "$target"; then
+        echo "  (a running job will write this file)"
+    elif output_is_planned "$target"; then
+        echo "  (already in this queue)"
     fi
 
-    if [[ -L "$path" ]]; then
+    if [[ -L "$target" ]]; then
         echo
-        output_symlink_notice "$path"
+        output_symlink_notice "$target"
         echo
     fi
 
     echo "1) Keep both  [new file: $(basename "$alt")]"
 
-    if path_taken "$path" && ! path_taken "$path.part" && ! output_is_planned "$path"; then
-        if [[ -L "$path" && -e "$path" ]]; then
+    if path_taken "$target" && ! output_busy "$target" && ! output_is_planned "$target"; then
+        if [[ -L "$target" && -e "$target" ]]; then
             echo "2) Overwrite: replace the symlink itself when the new encode completes"
-        elif [[ -L "$path" ]]; then
+        elif [[ -L "$target" ]]; then
             echo "2) Overwrite: replace the broken symlink when the new encode completes"
         else
-            echo "2) Overwrite the existing file when the new encode completes"
+            echo "2) Overwrite $(basename "$target") when the new encode completes"
         fi
     fi
 
@@ -762,7 +969,8 @@ resolve_output_conflict() {
                 return 0
                 ;;
             2)
-                if path_taken "$path" && ! path_taken "$path.part" && ! output_is_planned "$path"; then
+                if path_taken "$target" && ! output_busy "$target" && ! output_is_planned "$target"; then
+                    RESOLVED_OUT="$target"
                     RESOLVED_OVERWRITE=1
                     return 0
                 fi

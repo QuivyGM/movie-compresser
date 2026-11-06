@@ -770,8 +770,9 @@ OUT="$OUT_DIR/${NAME} AudioCompressed.mkv"
 
 counter=2
 
-# a symlink (valid or broken) at a name counts as taken
-while path_taken "$OUT" || path_taken "$OUT.part"; do
+# a symlink (valid or broken) at a name counts as taken, and so does a
+# name another encode is writing or a running job will write
+while path_taken "$OUT" || output_busy "$OUT"; do
     OUT="$OUT_DIR/${NAME} AudioCompressed ${counter}.mkv"
     ((counter++))
 done
