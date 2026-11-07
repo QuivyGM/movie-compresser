@@ -15,8 +15,15 @@
 #   4. mkvmerge wraps the HEVC with the source frame timestamps and
 #      writes the DV configuration record; ffmpeg then muxes it with all
 #      other streams like the normal path
-#   5. the output is verified (configuration record, RPU in every frame,
-#      HDR10 fallback signalling) before it gets its final name
+#   5. the output is verified before it gets its final name: configuration
+#      record (profile, compatibility id, RPU + BL present, no EL), one
+#      RPU per source frame and per output frame, RPU content identical to
+#      the injected one, the stream decodes, base-layer fallback
+#      (HDR10 / HLG / SDR) signalling and HDR10 static metadata
+#
+# The menu shows what was detected (dv_detect_report) and asks
+# Preserve Dolby Vision (default) / base layer only (dv_output_menu).
+# Limitations and playback notes: DOLBY_VISION.md in the project root.
 #
 # HDR10+: metadata extracted with hdr10plus_tool and handed to x265
 # (dhdr10-info). ffmpeg does not pass HDR10+ through on its own.
@@ -77,6 +84,12 @@ hdr_tools_detect() {
 
     HDR10PLUS_TOOL=$(hdr_find_tool hdr10plus_tool)
     MKVMERGE=$(hdr_find_tool mkvmerge)
+    # report only (optional global): an mkvmerge too old to write the DV
+    # configuration record fails the item at its check in item_dv_wrap
+    MKVMERGE_VERSION=""
+    if [[ -n "$MKVMERGE" ]]; then
+        MKVMERGE_VERSION=$("$MKVMERGE" --version 2>/dev/null | tr -d '\r' | awk '{ print $2; exit }')
+    fi
 
     FFMPEG_DOVI_BSF=0
     if ffmpeg -hide_banner -bsfs 2>/dev/null | grep -qx 'dovi_rpu'; then
@@ -140,7 +153,9 @@ hdr_tools_report() {
         if [[ -z "$DOVI_TOOL" ]]; then echo "not found (looked in ${WORK_DIR:-~/compress/work}/bin and PATH)"
         elif (( DOVI_TOOL_OK == 0 )); then echo "$DOVI_TOOL_VERSION at $DOVI_TOOL - too old (need >= 2.1: export level5)"
         else echo "$DOVI_TOOL_VERSION ($DOVI_TOOL)"; fi)"
-    printf '  mkvmerge:        %s\n' "${MKVMERGE:-not found (mkvtoolnix)}"
+    printf '  mkvmerge:        %s\n' "$(
+        if [[ -z "$MKVMERGE" ]]; then echo "not found (mkvtoolnix)"
+        else echo "${MKVMERGE_VERSION:+$MKVMERGE_VERSION }($MKVMERGE)"; fi)"
     printf '  hdr10plus_tool:  %s\n' "${HDR10PLUS_TOOL:-not found}"
     printf '  ffmpeg:          libx265 -dolbyvision %s, dovi_rpu bsf %s\n' \
         "$( (( FFMPEG_X265_DV == 1 )) && echo yes || echo no)" \
@@ -337,6 +352,103 @@ dv_el_policy() {
     return 0
 }
 
+# dv_compat_name ID  ->  what a base-layer signal compatibility id means
+dv_compat_name() {
+    case "$1" in
+        0) printf 'no backward-compatible base layer' ;;
+        1) printf 'HDR10 base layer' ;;
+        2) printf 'SDR (BT.709) base layer' ;;
+        4) printf 'HLG base layer' ;;
+        6) printf 'HDR10 base layer, Blu-ray dual layer' ;;
+        "") printf 'compatibility id unknown' ;;
+        *) printf 'unknown base layer' ;;
+    esac
+}
+
+# dv_detect_report [EL_TYPE]  (after probe_hdr / dv_plan_source)
+#
+# What was detected, before any decision: profile, base-layer
+# compatibility id, the layers the configuration record declares and
+# (profile 7, from dv_el_probe) the enhancement-layer type. Printed in
+# every output mode.
+dv_detect_report() {
+    local el="${1:-}" layers=()
+
+    [[ "${HDR_DV_BL:-}" == 1 ]] && layers+=(BL)
+    [[ "${HDR_DV_EL:-}" == 1 ]] && layers+=(EL)
+    [[ "${HDR_DV_RPU:-}" == 1 ]] && layers+=(RPU)
+
+    printf 'DV detected:    profile %s, compatibility id %s (%s)%s\n' \
+        "${HDR_DV_PROFILE:-?}" "${HDR_DV_COMPAT:-?}" "$(dv_compat_name "${HDR_DV_COMPAT:-}")" \
+        "$( (( ${#layers[@]} )) && printf ', %s' "$(IFS=+; echo "${layers[*]}")")${HDR_DV_LEVEL:+, level $HDR_DV_LEVEL}"
+
+    if [[ "${HDR_DV_PROFILE:-}" == 7 ]]; then
+        case "$el" in
+            MEL) echo "                enhancement layer: MEL (minimal; first $DV_EL_PROBE_FRAMES frames read, the job checks every frame)" ;;
+            FEL) echo "                enhancement layer: $(ui_warn FEL) (full: carries additional picture data)" ;;
+            "")  echo "                enhancement layer: not classified (needs dovi_tool + mkvmerge)" ;;
+            *)   echo "                enhancement layer: $(ui_warn "type unknown") (MEL or FEL could not be determined)" ;;
+        esac
+    elif [[ "${HDR_DV_PROFILE:-}" == 8 ]]; then
+        echo "                single layer (no enhancement layer)"
+    fi
+}
+
+# dv_output_menu [EL_TYPE]  (DV_SUPPORTED == 1, tools present)
+#
+#   1) Preserve Dolby Vision (Profile 8.1 + HDR10)   default (Enter / EOF)
+#   2) HDR10 only
+#
+# (labels follow the actual output profile and base layer, e.g. 8.4 +
+# HLG). Explains what the output keeps and loses. Returns 0 for preserve,
+# 1 for the base layer only.
+dv_output_menu() {
+    local el="${1:-}" ans out="Profile ${DV_OUT:-8.1}"
+
+    echo "Dolby Vision output:"
+    echo "1) Preserve Dolby Vision ($out + $HDR_KIND)  [default]"
+    echo "2) $HDR_KIND only"
+    echo "   1: single-layer $out: the RPU (dynamic metadata) is re-injected and"
+    echo "      verified; players without Dolby Vision show the $HDR_KIND base layer."
+    echo "      $out plays on most Dolby Vision TVs, streaming boxes and media"
+    echo "      players; it is not a disc format (no Blu-ray authoring / playback)."
+    if [[ "$DV_MODE" == 2 ]]; then
+        case "$el" in
+            MEL)
+                echo "      MEL: carries no picture data beyond the base layer; the RPU holds"
+                echo "      its Dolby Vision information, nothing visible is lost."
+                ;;
+            FEL)
+                echo "      $(ui_warn "FEL: LOSSY CONVERSION"). Profile 8.1 keeps only the RPU; the FEL's"
+                echo "      additional picture data (enhancement for the 12-bit"
+                echo "      reconstruction) is NOT in the output and cannot be restored."
+                ;;
+            *)
+                echo "      Enhancement layer of unknown type: it may be a FEL whose additional"
+                echo "      picture data would NOT be in the output (confirmed later)."
+                ;;
+        esac
+    fi
+    local keep="$HDR_KIND signalling"
+    [[ -n "${HDR_MASTER:-}" ]] && keep+=", mastering display"
+    [[ -n "${HDR_CLL:-}" ]] && keep+=", MaxCLL/MaxFALL"
+    echo "   2: Dolby Vision metadata removed (not recoverable from the output);"
+    echo "      kept: $keep."
+
+    while true; do
+        ans=""
+        # EOF (no terminal): the default
+        if ! read -rp "Select [1-2, Enter = 1]: " ans; then
+            echo
+        fi
+        case "$ans" in
+            ""|1) return 0 ;;
+            2)    return 1 ;;
+            *)    echo "Invalid selection." ;;
+        esac
+    done
+}
+
 # confirm_dynamic_range LABEL [FILE VIDX]  (after probe_hdr)
 #
 # Prints the dynamic range summary, decides what happens to Dolby
@@ -434,6 +546,15 @@ confirm_dynamic_range() {
     dv_plan_source
     (( verbose == 1 )) && echo
 
+    # profile 7: enhancement-layer type (MEL / FEL) before anything is
+    # decided, so the detection lines and the menu can name it
+    local el_seen=""
+    if (( DV_SUPPORTED == 1 )) && [[ "$DV_MODE" == 2 ]] &&
+       (( DOVI_TOOL_OK == 1 )) && [[ -n "$MKVMERGE" ]]; then
+        el_seen=$(dv_el_probe "$file" "$vidx")
+    fi
+    dv_detect_report "$el_seen"
+
     if (( DV_BASE_OK == 0 )); then
         _hdr_tools_once
         echo "$(ui_err ERROR): $label contains Dolby Vision profile ${HDR_DV_PROFILE:-?}${HDR_DV_COMPAT:+ (compatibility id $HDR_DV_COMPAT)}."
@@ -445,12 +566,19 @@ confirm_dynamic_range() {
     fi
 
     if (( DV_SUPPORTED == 1 )) && (( DOVI_TOOL_OK == 1 )) && [[ -n "$MKVMERGE" ]]; then
+        # explicit choice, preservation the default (dv_output_menu)
+        if ! dv_output_menu "$el_seen"; then
+            DV_POLICY="drop"
+            DV_MODE=""
+            echo "Dolby Vision:   $(ui_warn DROPPED) by choice: $HDR_KIND only (base layer; Dolby Vision metadata removed)"
+            return 0
+        fi
         DV_POLICY="preserve"
 
         if [[ "$DV_MODE" == 2 ]]; then
             # profile 7 (dual-layer): the RPU is kept, the enhancement
             # layer cannot be; dv_el_policy decides with the tier
-            DV_EL_TYPE=$(dv_el_probe "$file" "$vidx")
+            DV_EL_TYPE="${el_seen:-unknown}"
 
             if (( verbose == 1 )); then
                 echo "Dolby Vision:   RPU PRESERVED as profile $DV_OUT (converted from profile 7 with"
@@ -768,6 +896,8 @@ item_dv_wrap() {
     local rc
 
     hdr_tools_detect
+    [[ -n "$MKVMERGE" ]] ||
+        { _dv_fail "mkvmerge not found (needed to write the DV configuration record)"; return 1; }
     echo "Wrapping HEVC with mkvmerge (DV configuration record, source timestamps)..."
 
     "$MKVMERGE" -o "$ITEM_TMP/video_dv.mkv" \
@@ -784,7 +914,7 @@ item_dv_wrap() {
 
     if ! ffprobe -v error -show_streams "$ITEM_TMP/video_dv.mkv" 2>/dev/null |
             grep -q '^dv_profile='; then
-        _dv_fail "mkvmerge did not write a Dolby Vision configuration record"
+        _dv_fail "mkvmerge ${MKVMERGE_VERSION:-} did not write a Dolby Vision configuration record (too old?)"
         return 1
     fi
 
@@ -1028,14 +1158,38 @@ item_verify_output() {
                         "$(cat "$ITEM_TMP/rpu_frames" 2>/dev/null)")
                     if [[ "$v" == VERIFIED* ]]; then
                         _rep "Dolby Vision RPU" "$v" >&3
-                        if [[ "$O_DV_COMPAT" == "1" ]]; then
-                            if [[ "$O_KIND" == "HDR10" && "$O_PRIMARIES" == "bt2020" && "$O_MASTER" == "$S_MASTER" ]]; then
-                                _rep "HDR10 fallback" "VERIFIED (PQ/BT.2020 base layer${O_MASTER:+ + mastering display}${O_CLL:+ + MaxCLL/MaxFALL})" >&3
-                            else
-                                _rep "HDR10 fallback" "FAILED (base layer is $O_KIND/${O_PRIMARIES:-?})" >&3
-                                fails+=("HDR10 fallback not valid")
-                            fi
-                        fi
+                        # the base layer must be what the compatibility
+                        # id promises to players without Dolby Vision
+                        case "$O_DV_COMPAT" in
+                            1)
+                                if [[ "$O_KIND" == "HDR10" && "$O_PRIMARIES" == "bt2020" && "$O_MASTER" == "$S_MASTER" ]]; then
+                                    _rep "HDR10 fallback" "VERIFIED (PQ/BT.2020 base layer${O_MASTER:+ + mastering display}${O_CLL:+ + MaxCLL/MaxFALL})" >&3
+                                else
+                                    _rep "HDR10 fallback" "FAILED (base layer is $O_KIND/${O_PRIMARIES:-?})" >&3
+                                    fails+=("HDR10 fallback not valid")
+                                fi
+                                ;;
+                            4)
+                                if [[ "$O_KIND" == "HLG" && "$O_PRIMARIES" == "bt2020" ]]; then
+                                    _rep "HLG fallback" "VERIFIED (HLG/BT.2020 base layer)" >&3
+                                else
+                                    _rep "HLG fallback" "FAILED (base layer is $O_KIND/${O_PRIMARIES:-?})" >&3
+                                    fails+=("HLG fallback not valid")
+                                fi
+                                ;;
+                            2)
+                                if [[ "$O_KIND" == "SDR" && "$O_KIND" == "$S_KIND" ]]; then
+                                    _rep "SDR fallback" "VERIFIED (SDR base layer${O_PRIMARIES:+, $O_PRIMARIES})" >&3
+                                else
+                                    _rep "SDR fallback" "FAILED (base layer is $O_KIND)" >&3
+                                    fails+=("SDR fallback not valid")
+                                fi
+                                ;;
+                            *)
+                                _rep "Base-layer fallback" "FAILED (compatibility id ${O_DV_COMPAT:-?} has no valid fallback)" >&3
+                                fails+=("Dolby Vision output has no backward-compatible base layer")
+                                ;;
+                        esac
                     else
                         _rep "Dolby Vision RPU" "FAILED: $v" >&3
                         fails+=("Dolby Vision not verified: $v")
@@ -1725,6 +1879,7 @@ dv_verify_rpu() {
         { echo "compatibility id $O_DV_COMPAT, expected $compat"; return; }
     [[ "$O_DV_RPU" != "0" ]] || { echo "configuration record says no RPU"; return; }
     [[ "$O_DV_EL" != "1" ]] || { echo "configuration record claims an enhancement layer"; return; }
+    [[ "$O_DV_BL" != "0" ]] || { echo "configuration record says no base layer"; return; }
     [[ -n "$DOVI_TOOL" ]] || { echo "dovi_tool not available to check the RPU"; return; }
 
     tmp="$ITEM_TMP/output.rpu"
@@ -1748,6 +1903,45 @@ dv_verify_rpu() {
         return
     fi
 
+    # every output frame carries exactly one RPU: the frame count of the
+    # muxed stream itself (not only the RPU count) must match
+    local pk
+    pk=$(ffprobe -v error -select_streams "$vidx" -count_packets \
+        -show_entries stream=nb_read_packets -of csv=p=0 "$file" 2>/dev/null | tr -d '\r,' | head -n 1)
+    if [[ ! "$pk" =~ ^[0-9]+$ ]]; then
+        echo "output video frame count could not be read"
+        return
+    elif [[ "$pk" != "$n" ]]; then
+        echo "output has $pk video frames but $n RPUs (frames and RPUs not aligned)"
+        return
+    fi
+
+    # content + order: the RPUs read back must be the ones injected
+    # (byte-identical, else the same dovi_tool summary)
+    local ref="$ITEM_TMP/inject.rpu" content=""
+    if [[ -s "$ref" ]]; then
+        if cmp -s -- "$ref" "$tmp"; then
+            content=", identical to the injected RPU"
+        else
+            "$DOVI_TOOL" info -s -i "$ref" 2>/dev/null | tr -d '\r' > "$ITEM_TMP/inject_rpu_summary.txt"
+            if [[ -s "$ITEM_TMP/inject_rpu_summary.txt" ]] &&
+               [[ "$(cat "$ITEM_TMP/inject_rpu_summary.txt")" == "$(tr -d '\r' <<< "$summary")" ]]; then
+                content=", same metadata as the injected RPU"
+            else
+                echo "output RPU metadata differs from the injected RPU (inject_rpu_summary.txt / output_rpu_summary.txt)"
+                return
+            fi
+        fi
+    fi
+
+    # playable: the start of the stream decodes without errors
+    if ! ffmpeg -v error -nostdin -xerror -i "$file" -map "0:$vidx" \
+            -frames:v 48 -f null - > "$ITEM_TMP/decode_check.log" 2>&1; then
+        echo "output video does not decode (decode_check.log)"
+        return
+    fi
+    rm -f -- "$ITEM_TMP/decode_check.log"
+
     rm -f -- "$tmp"
-    echo "VERIFIED (profile $prof${compat:+.$compat}, RPU in all ${n} frames)"
+    echo "VERIFIED (profile $prof${compat:+.$compat}, RPU in all ${n} frames$content)"
 }

@@ -38,7 +38,10 @@
 #     warning; source-quality guard (keep source video / encode / skip);
 #     estimate vs actual reported; progress-check shows one encode step
 # 12. HDR10 / HDR10+ (needs hdr10plus_tool) / Dolby Vision on the CRF path
-# 13. HDR tool initialization in the menus under set -u (hdr_init_tests.sh)
+# 13. HDR tool initialization in the menus under set -u (hdr_init_tests.sh);
+#     Dolby Vision profile 7 EL policy (dv_el_policy_tests.sh); Dolby
+#     Vision output menu, detection, RPU / frame / content verification,
+#     injection and wrap failures (dv_output_tests.sh)
 # 14. a complete encode that fails only the output verification is kept
 #     as <output>.verify-failed; semantic chapter comparison; the
 #     accepted CRF retry attempt is verified with its full chapter
@@ -2318,6 +2321,22 @@ bash "$SRC_WORK/tests/hdr_init_tests.sh" > "$T/hdr_init.out" 2>&1
 grep -E '^  (ok|FAIL|skipped:) ' "$T/hdr_init.out"
 PASS=$((PASS + $(grep -c '^  ok ' "$T/hdr_init.out")))
 FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/hdr_init.out")))
+
+echo
+echo "== Dolby Vision profile 7 enhancement layer policy (dv_el_policy_tests.sh)"
+bash "$SRC_WORK/tests/dv_el_policy_tests.sh" > "$T/dv_el_policy.out" 2>&1
+grep -E '^  (ok|FAIL) ' "$T/dv_el_policy.out"
+PASS=$((PASS + $(grep -c '^  ok ' "$T/dv_el_policy.out")))
+FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/dv_el_policy.out")))
+
+echo
+echo "== Dolby Vision output choice, verification, injection failures (dv_output_tests.sh)"
+bash "$SRC_WORK/tests/dv_output_tests.sh" > "$T/dv_output.out" 2>&1
+grep -E '^  (ok|FAIL) ' "$T/dv_output.out"
+PASS=$((PASS + $(grep -c '^  ok ' "$T/dv_output.out")))
+FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/dv_output.out")))
+grep -qE '^  \((ffmpeg / ffprobe not found|could not make a test clip): skipped\)' "$T/dv_output.out" &&
+    SKIPPED+=("dv_output_tests.sh job generation (needs ffmpeg with libx265)")
 
 echo
 echo "== audio pipeline: layout planning, mapping, audio menu jobs, verification (audio_pipeline_tests.sh)"
