@@ -94,15 +94,28 @@ COMPRESSION_TOOL_NAME="movie-compresser"
 # or describe fails. Never fails. A job calls it once, when it is
 # generated (emit_job_header), and records that value in every output.
 compresser_version() {
-    local lib root top v
+    local lib root top v="" r
 
-    lib=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) &&
-    root=$(cd -P -- "$lib/../.." 2>/dev/null && pwd -P) &&
-    command -v git >/dev/null 2>&1 &&
-    top=$(GIT_OPTIONAL_LOCKS=0 git -C "$root" rev-parse --show-toplevel 2>/dev/null) &&
-    [[ -n "$top" && "$(cd -P -- "$top" 2>/dev/null && pwd -P)" == "$root" ]] &&
-    v=$(GIT_OPTIONAL_LOCKS=0 git -C "$root" describe --tags --always --dirty 2>/dev/null) &&
-    [[ "$v" =~ ^[[:graph:]]{1,128}$ ]] || v=unknown
+    # the checkout two levels above lib/: through the physical path first
+    # (work/ resolved), then through the path the library was sourced by
+    # (~/compress/work may be a symlink to another disk while ~/compress
+    # is the checkout)
+    for r in physical logical; do
+        if [[ "$r" == physical ]]; then
+            lib=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) &&
+            root=$(cd -P -- "$lib/../.." 2>/dev/null && pwd -P) || continue
+        else
+            lib=$(cd -L -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -L) &&
+            root=$(cd -L -- "$lib/../.." 2>/dev/null && pwd -P) || continue
+        fi
+        command -v git >/dev/null 2>&1 &&
+        top=$(GIT_OPTIONAL_LOCKS=0 git -C "$root" rev-parse --show-toplevel 2>/dev/null) &&
+        [[ -n "$top" && "$(cd -P -- "$top" 2>/dev/null && pwd -P)" == "$root" ]] &&
+        v=$(GIT_OPTIONAL_LOCKS=0 git -C "$root" describe --tags --always --dirty 2>/dev/null) &&
+        [[ "$v" =~ ^[[:graph:]]{1,128}$ ]] && break
+        v=""
+    done
+    [[ -n "$v" ]] || v=unknown
 
     printf '%s\n' "$v"
 }

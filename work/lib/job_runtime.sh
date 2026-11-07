@@ -199,9 +199,7 @@ job_on_exit() {
     done
 
     # Large intermediates are not useful after an interruption.
-    if [[ -n "${ITEM_TMP:-}" && -d "$ITEM_TMP" ]]; then
-        rm -f -- "$ITEM_TMP"/*.hevc "$ITEM_TMP"/video_dv.mkv
-    fi
+    item_tmp_drop_intermediates
 
     JOB_STATUS="interrupted"
     job_write_state
@@ -705,6 +703,12 @@ item_finalize_titles() {
 item_part_complete() {
     local out_dur short
 
+    # the encode function has finished (mux, covers, chapters): its video
+    # intermediates are no longer read. Deleted now, not only when the
+    # item is finalised: a season batch keeps every episode open until
+    # the season CRF is decided.
+    item_tmp_drop_intermediates
+
     if [[ ! -s "$ITEM_PART" ]]; then
         ITEM_FAIL_REASON="ffmpeg reported success but no output was written"
         return 1
@@ -881,8 +885,11 @@ item_failed() {
 
     echo "FAILED: $reason" >> "$ITEM_LOG"
 
-    # Keep DV / HDR10+ intermediates (RPU, raw HEVC, tool logs) for
-    # diagnosis; drop the directory if nothing was written.
+    # Keep the small DV / HDR10+ files (RPU, timestamps, tool logs) for
+    # diagnosis. The raw / wrapped video intermediates (as large as the
+    # encode itself) are deleted: a failure on a full disk must not keep
+    # the disk full. Drop the directory if nothing is left.
+    item_tmp_drop_intermediates
     if [[ -n "${ITEM_TMP:-}" ]]; then
         rmdir -- "$ITEM_TMP" 2>/dev/null || true
     fi
@@ -1296,6 +1303,30 @@ item_attempt_part() {
         return 1
     fi
     ITEM_PART="$p"
+    # the previous attempt's video intermediates are already muxed into
+    # its .part: without this, a Dolby Vision retry would hold three
+    # copies of the video in work/ at once
+    item_tmp_drop_intermediates
+}
+
+# item_tmp_drop_intermediates  ->  deletes the large video intermediates
+# of the Dolby Vision path (video.hevc, video_dv.hevc, video_dv.mkv) from
+# this item's own $ITEM_TMP. Only these names, only directly inside
+# ITEM_TMP, only when ITEM_TMP is a real directory below the job's log
+# directory (never through a symlink); a symlink at one of the names is
+# removed itself, its target is never touched.
+item_tmp_drop_intermediates() {
+    local f
+
+    [[ -n "${ITEM_TMP:-}" && -n "${JOB_LOG_DIR:-}" && "$ITEM_TMP" == "$JOB_LOG_DIR"/item-*.tmp ]] || return 0
+    [[ -d "$ITEM_TMP" && ! -L "$ITEM_TMP" ]] || return 0
+
+    for f in video.hevc video_dv.hevc video_dv.mkv; do
+        if [[ -e "$ITEM_TMP/$f" || -L "$ITEM_TMP/$f" ]]; then
+            rm -f -- "$ITEM_TMP/$f"
+        fi
+    done
+    return 0
 }
 
 # _keep_accepted FILE OUTPUT CRF  ->  KEPT_PART = the accepted encode,

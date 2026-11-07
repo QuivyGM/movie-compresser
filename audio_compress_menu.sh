@@ -4,7 +4,10 @@ set -euo pipefail
 OUT_DIR="$HOME/compress/out"
 WORK_DIR="$HOME/compress/work"
 
-mkdir -p "$OUT_DIR" "$WORK_DIR"
+# out / work: real directories or symlinks to directories, used as they
+# are (never replaced); missing ones are created (work/lib/fs_guard.sh)
+source "$WORK_DIR/lib/fs_guard.sh"
+compress_dirs_init "$HOME/compress" out:rw work:rw || exit 1
 
 source "$WORK_DIR/lib/media_probe.sh"
 source "$WORK_DIR/lib/media_stats.sh"
@@ -776,6 +779,14 @@ while path_taken "$OUT" || output_busy "$OUT"; do
     OUT="$OUT_DIR/${NAME} AudioCompressed ${counter}.mkv"
     ((counter++))
 done
+
+# ============================================================
+# DISK SPACE (the output is at most the size of the source)
+# ============================================================
+
+echo
+SPACE_SRC=$(file_bytes "$IN")
+compress_space_confirm "$OUT_DIR" "$SPACE_SRC" "$SPACE_SRC" "$WORK_DIR" 0 || exit 1
 
 # ============================================================
 # TMUX SESSION
