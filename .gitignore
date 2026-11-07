@@ -24,3 +24,6 @@ work/*.log
 
 # optional static tools (dovi_tool, hdr10plus_tool) dropped in by the user
 work/bin/
+
+# optional per-machine directory pins (work/lib/fs_guard.sh)
+/paths.conf

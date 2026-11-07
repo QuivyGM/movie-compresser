@@ -5,7 +5,10 @@ IN_DIR="$HOME/compress/in"
 OUT_DIR="$HOME/compress/out"
 WORK_DIR="$HOME/compress/work"
 
-mkdir -p "$IN_DIR" "$OUT_DIR" "$WORK_DIR"
+# in / out / work: real directories or symlinks to directories, used as
+# they are (never replaced); missing ones are created (lib/fs_guard.sh)
+source "$WORK_DIR/lib/fs_guard.sh"
+compress_dirs_init "$HOME/compress" in out:rw work:rw || exit 1
 
 source "$WORK_DIR/lib/ui.sh"
 source "$WORK_DIR/lib/media_probe.sh"
@@ -22,6 +25,9 @@ source "$WORK_DIR/lib/policy.sh"
 # array when every movie was skipped)
 declare -a INPUTS=() OUTPUTS=() VIDEOS=() EST_VBYTES=() RETRIES=() FILTERS=() TIERS=() OVERWRITES=()
 declare -a DV_POLICIES=() DV_MODES=() DV_EL_DISCARDS=() X265_TUNES=() HDR10P_POLICIES=() QUALITY_SPECS=() CRF_EST_MAPS=() ACTUAL_SIGS=()
+# disk-space preflight (lib/fs_guard.sh): expected output bytes, peak
+# work/ scratch bytes (Dolby Vision intermediates) per queued movie
+declare -a SPACE_OUT=() SPACE_WORK=() SPACE_RETRY=()
 
 # Compression policy: ~/compress/work/lib/compress.conf (loaded and validated
 # by work/lib/policy.sh). The policy math lives there as well
@@ -792,6 +798,13 @@ while true; do
     DV_EL_DISCARDS+=("$DV_EL_DISCARD")
     X265_TUNES+=("$X265_TUNE")
     HDR10P_POLICIES+=("$HDR10P_POLICY")
+    SPACE_OUT+=("$(item_output_estimate "$SOURCE_TOTAL_BYTES" "$SOURCE_VIDEO_BYTES" \
+        "$( [[ "$VIDEO_SPEC" == crf:* ]] && echo "$EST_VIDEO_BYTES")")")
+    SPACE_WORK+=("$(item_work_estimate \
+        "$( [[ "$VIDEO_SPEC" == crf:* && "$DV_POLICY" == preserve ]] && echo 1 || echo 0)" \
+        "${EST_VIDEO_BYTES:-$SOURCE_VIDEO_BYTES}")")
+    # a CRF retry keeps the completed attempt next to the new one
+    SPACE_RETRY+=("$( [[ -n "$RETRY_SPEC" ]] && echo "${SPACE_OUT[-1]}" || echo 0)")
 
     # ========================================================
     # SUMMARY
@@ -951,6 +964,17 @@ if (( ${#INPUTS[@]} == 0 )); then
     echo "Nothing queued."
     exit 0
 fi
+
+# ============================================================
+# DISK SPACE (before hours of encoding: outputs in out/, Dolby Vision
+# intermediates in work/logs/)
+# ============================================================
+
+echo
+compress_space_confirm \
+    "$OUT_DIR" "$(bytes_sum "${SPACE_OUT[@]}")" \
+    "$(( $(bytes_sum "${SPACE_OUT[@]}") + $(bytes_max "${SPACE_RETRY[@]}") ))" \
+    "$WORK_DIR" "$(bytes_max "${SPACE_WORK[@]}")" || exit 1
 
 # ============================================================
 # TMUX

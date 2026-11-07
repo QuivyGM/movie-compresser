@@ -856,7 +856,8 @@ while IFS= read -r -d '' state_file; do
         printf '    Logs: %s\n' "${ST[log_dir]}"
     fi
 done < <(
-    find "$WORK" -maxdepth 1 -type f -name '*.state' \
+    # -H: work/ itself may be a symlink to another disk
+    find -H "$WORK" -maxdepth 1 -type f -name '*.state' \
         -mmin "-$((RECENT_HOURS * 60))" -print0 2>/dev/null |
     sort -zV
 )

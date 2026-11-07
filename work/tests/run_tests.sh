@@ -2352,6 +2352,14 @@ FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/compresser_version.out")))
 while IFS= read -r s; do SKIPPED+=("${s#skipped: }"); done < <(grep '^skipped: ' "$T/compresser_version.out")
 
 echo
+echo "== in / out / work as directories or symlinks, disk-space preflight (dir_layout_tests.sh)"
+bash "$SRC_WORK/tests/dir_layout_tests.sh" > "$T/dir_layout.out" 2>&1
+grep -E '^  (ok|FAIL) ' "$T/dir_layout.out"
+PASS=$((PASS + $(grep -c '^  ok ' "$T/dir_layout.out")))
+FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/dir_layout.out")))
+grep -q '^SKIP: ' "$T/dir_layout.out" && SKIPPED+=("dir_layout_tests.sh (no real symlinks)")
+
+echo
 echo "============================================================"
 echo "passed: $PASS   failed: $FAIL"
 for s in "${SKIPPED[@]+"${SKIPPED[@]}"}"; do echo "skipped: $s"; done

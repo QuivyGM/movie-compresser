@@ -6,6 +6,11 @@ IN_DIR="$BASE/in"
 OUT_DIR="$BASE/out"
 WORK_DIR="$BASE/work"
 
+# in / out / work: real directories or symlinks to directories, used as
+# they are (never replaced); missing ones are created (lib/fs_guard.sh)
+source "$WORK_DIR/lib/fs_guard.sh"
+compress_dirs_init "$BASE" in out:rw work:rw || exit 1
+
 source "$WORK_DIR/lib/ui.sh"
 source "$WORK_DIR/lib/media_probe.sh"
 source "$WORK_DIR/lib/media_stats.sh"
@@ -1310,8 +1315,6 @@ else
 fi
 [[ "$confirm" =~ ^[Yy]$ ]] || exit 0
 
-mkdir -p "$OUT_SERIES"
-
 # ============================================================
 # TMUX SESSION
 # ============================================================
@@ -1348,6 +1351,32 @@ for i in "${!FILES[@]}"; do
         exit 1
     fi
 done
+
+# ============================================================
+# DISK SPACE (before hours of encoding: outputs in out/, Dolby Vision
+# intermediates in work/logs/). A season CRF retry re-encodes every
+# episode while the completed season attempt is kept: up to twice the
+# season in out/.
+# ============================================================
+
+SPACE_OUT=() SPACE_WORK=() SPACE_RETRY=0
+for i in "${!FILES[@]}"; do
+    (( EP_SKIP[$i] == 1 )) && continue
+    SPACE_OUT+=("$(item_output_estimate "$(file_bytes "${FILES[$i]}")" "${EP_VBYTES[$i]:-}" \
+        "$( [[ "${EP_VIDEO[$i]}" == crf:* ]] && echo "${EP_EST[$i]:-}")")")
+    SPACE_WORK+=("$(item_work_estimate \
+        "$( [[ "${EP_VIDEO[$i]}" == crf:* && "${DV_POLICY:-none}" == preserve ]] && echo 1 || echo 0)" \
+        "${EP_EST[$i]:-${EP_VBYTES[$i]:-0}}")")
+    [[ -n "$(ep_retry_spec "$i")" ]] && SPACE_RETRY=1
+done
+echo
+compress_space_confirm \
+    "$( [[ -d "$OUT_SERIES" ]] && echo "$OUT_SERIES" || echo "$OUT_DIR")" \
+    "$(bytes_sum "${SPACE_OUT[@]}")" \
+    "$(( $(bytes_sum "${SPACE_OUT[@]}") * (1 + SPACE_RETRY) ))" \
+    "$WORK_DIR" "$(bytes_max "${SPACE_WORK[@]}")" || exit 1
+
+mkdir -p "$OUT_SERIES"
 
 {
     emit_job_header "$SESSION" series "$QUEUED"
