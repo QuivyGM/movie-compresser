@@ -222,12 +222,15 @@ if (( HAVE_DV == 1 && HAVE_H10P == 1 )); then
     check "source is DV 8.1 + HDR10 + HDR10+"    "[[ \"\$probe_out\" == 'HDR10 1 1 8.1' ]]"
 
     L="$T/movie_dv.log"
-    menu "$H/compress/work/movie_compress.sh" "1\n5\n24\nn\n" "$L"
+    # (Enter after the source: the Dolby Vision output menu's default)
+    menu "$H/compress/work/movie_compress.sh" "1\n\n5\n24\nn\n" "$L"
     sed -n '/^Dynamic range/,/^Compression tier/p' "$L" | sed 's/^/  | /'
     check "movie: no unbound variable"           "! grep -q 'unbound variable' '$L' && grep -q '^exit=0\$' '$L'"
     check "movie: header DV 8.1 + HDR10 + HDR10+" "grep -qE '^Dynamic range: +Dolby Vision 8.1 \\+ HDR10 \\+ HDR10\\+\$' '$L'"
     check "movie: HDR10+ and Dolby Vision PRESERVED" \
         "grep -q '^HDR10+:         PRESERVED\$' '$L' && grep -q '^Dolby Vision:   PRESERVED\$' '$L'"
+    check "movie: DV detected + output menu, default taken" \
+        "grep -q '^DV detected:    profile 8, compatibility id 1' '$L' && grep -q '^1) Preserve Dolby Vision (Profile 8.1 + HDR10)  \[default\]\$' '$L'"
     J=$(ls "$H/compress/work"/c[0-9]*.sh 2>/dev/null | head -n 1)
     check "movie job: RPU and HDR10+ steps, HDR10 signalling" \
         "[[ -n '$J' ]] && grep -q 'item_step rpu item_dv_extract' '$J' && grep -q 'item_dv_inject' '$J' && grep -q 'item_step hdr10+ item_hdr10plus_extract' '$J' && grep -q 'dhdr10-info' '$J' && grep -q 'transfer=smpte2084' '$J' && bash -n '$J'"

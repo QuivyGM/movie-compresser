@@ -130,7 +130,7 @@ hdr_fake; HDR_DV_PROFILE=8 HDR_DV_COMPAT=1 HDR_DV_EL=""
 confirm_dynamic_range Film "$T/src.mkv" 0 < /dev/null > "$T/c5.out" 2>&1
 eq    "P8.1: preserved, no conversion"  "$?:$DV_POLICY:$DV_MODE:$DV_EL_TYPE" "0:preserve::"
 check "P8.1: no dovi_tool probe"        "! grep -q extract-rpu '$FAKE_CALLS'"
-eq    "P8.1: compact line unchanged"    "$(cat "$T/c5.out")" $'\nDolby Vision:   PRESERVED'
+check "P8.1: detection, menu, result"  "grep -q '^DV detected:    profile 8, compatibility id 1 (HDR10 base layer)' '$T/c5.out' && grep -q '^1) Preserve Dolby Vision (Profile 8.1 + HDR10)  \[default\]\$' '$T/c5.out' && [[ \"\$(tail -n 1 '$T/c5.out')\" == 'Dolby Vision:   PRESERVED' ]]"
 eq    "P8.1: short policy unchanged"    "$(hdr_policy_short)" "DV preserved"
 dv_el_policy Quality Film < /dev/null > /dev/null
 eq    "P8.1: EL policy not involved"    "$?:$DV_EL_DISCARD" "0:"

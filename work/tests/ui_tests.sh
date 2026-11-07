@@ -94,7 +94,9 @@ hdr_fake() {
 hdr_fake
 eq "label: DV 8.1 + HDR10 + HDR10+"  "$(hdr_compact_label)" "Dolby Vision 8.1 + HDR10 + HDR10+"
 confirm_dynamic_range Show < /dev/null > "$T/hdr1.out"
-eq "compact: only PRESERVED lines"   "$(cat "$T/hdr1.out")" $'\nHDR10+:         PRESERVED\nDolby Vision:   PRESERVED'
+eq "compact: HDR10+ line, DV result" "$(grep -E '^(HDR10\+|Dolby Vision): ' "$T/hdr1.out")" $'HDR10+:         PRESERVED\nDolby Vision:   PRESERVED'
+check "compact: DV detection + menu, no tool report" \
+    "grep -q '^DV detected:    profile 8, compatibility id 1' '$T/hdr1.out' && grep -q '^2) HDR10 only\$' '$T/hdr1.out' && ! grep -q '^HDR tools:' '$T/hdr1.out'"
 eq "short policy"                    "$(hdr_policy_short)" "DV/HDR10+ preserved"
 
 hdr_fake
