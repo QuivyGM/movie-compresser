@@ -62,6 +62,10 @@
 # 17. standard video / audio track titles (final CRF, actual audio rates)
 #     for movie / copy / audio-menu / combined jobs, names-only writes,
 #     verify.sh Verify / Validate + update (track_title_tests.sh)
+# 18. compression provenance: Git commit / tools / settings / verified
+#     track operations per output, PROVENANCE_* tags, the manifest
+#     (repeats, recovery, concurrency), scan / tag / relink / compare
+#     (provenance_tests.sh; needs python3)
 #
 # Runs in a temporary copy of work/ so real logs/jobs are untouched.
 # Everything here is synthetic: it proves the mechanics, not behaviour
@@ -2369,6 +2373,14 @@ grep -E '^  (ok|FAIL) ' "$T/compresser_version.out"
 PASS=$((PASS + $(grep -c '^  ok ' "$T/compresser_version.out")))
 FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/compresser_version.out")))
 while IFS= read -r s; do SKIPPED+=("${s#skipped: }"); done < <(grep '^skipped: ' "$T/compresser_version.out")
+
+echo
+echo "== compression provenance: manifest, tags, scan / tag / relink / compare (provenance_tests.sh)"
+bash "$SRC_WORK/tests/provenance_tests.sh" > "$T/provenance.out" 2>&1
+grep -E '^  (ok|FAIL) ' "$T/provenance.out"
+PASS=$((PASS + $(grep -c '^  ok ' "$T/provenance.out")))
+FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/provenance.out")))
+while IFS= read -r s; do SKIPPED+=("${s#skipped: }"); done < <(grep '^skipped: ' "$T/provenance.out")
 
 echo
 echo "== in / out / work as directories or symlinks, disk-space preflight (dir_layout_tests.sh)"

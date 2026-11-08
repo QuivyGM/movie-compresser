@@ -867,6 +867,8 @@ TITLE_ARGS=$(audio_std_title_args "$IN" "$(title_overrides)")
     [[ -n "$MAP_META_ARGS" ]] && printf '      %s\\\n' "$MAP_META_ARGS"
     [[ -n "$TITLE_ARGS" ]] && printf '      %s\\\n' "$TITLE_ARGS"
     [[ -n "$STALE_ARGS" ]] && printf '      %s\\\n' "$STALE_ARGS"
+    # the output gets its own provenance (the source's ID becomes its parent)
+    printf '      %s\\\n' "$(provenance_strip_args)"
     printf '      -map_metadata 0 -map_chapters 0 \\\n'
     printf '      -max_muxing_queue_size 4096 %s\\\n' "$(matroska_mux_args)"
     emit_part_and_covers "$IN"

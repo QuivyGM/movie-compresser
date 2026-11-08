@@ -94,12 +94,28 @@ COMPRESSION_TOOL_NAME="movie-compresser"
 # or describe fails. Never fails. A job calls it once, when it is
 # generated (emit_job_header), and records that value in every output.
 compresser_version() {
-    local lib root top v="" r
+    local root v=""
 
-    # the checkout two levels above lib/: through the physical path first
-    # (work/ resolved), then through the path the library was sourced by
-    # (~/compress/work may be a symlink to another disk while ~/compress
-    # is the checkout)
+    while IFS= read -r root; do
+        v=$(GIT_OPTIONAL_LOCKS=0 git -C "$root" describe --tags --always --dirty 2>/dev/null) &&
+        [[ "$v" =~ ^[[:graph:]]{1,128}$ ]] && break
+        v=""
+    done < <(_compresser_git_roots)
+    [[ -n "$v" ]] || v=unknown
+
+    printf '%s\n' "$v"
+}
+
+# _compresser_git_roots  ->  the movie-compresser checkout this library
+# belongs to (work/lib/../..), once per way of reaching it, when that
+# directory is the top of a Git work tree: through the physical path
+# first (work/ resolved), then through the path the library was sourced
+# by (~/compress/work may be a symlink to another disk while ~/compress
+# is the checkout). Nothing when Git is missing or neither is a checkout.
+_compresser_git_roots() {
+    local lib root top r prev=""
+
+    command -v git >/dev/null 2>&1 || return 0
     for r in physical logical; do
         if [[ "$r" == physical ]]; then
             lib=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) &&
@@ -108,16 +124,38 @@ compresser_version() {
             lib=$(cd -L -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -L) &&
             root=$(cd -L -- "$lib/../.." 2>/dev/null && pwd -P) || continue
         fi
-        command -v git >/dev/null 2>&1 &&
         top=$(GIT_OPTIONAL_LOCKS=0 git -C "$root" rev-parse --show-toplevel 2>/dev/null) &&
-        [[ -n "$top" && "$(cd -P -- "$top" 2>/dev/null && pwd -P)" == "$root" ]] &&
-        v=$(GIT_OPTIONAL_LOCKS=0 git -C "$root" describe --tags --always --dirty 2>/dev/null) &&
-        [[ "$v" =~ ^[[:graph:]]{1,128}$ ]] && break
-        v=""
+        [[ -n "$top" && "$(cd -P -- "$top" 2>/dev/null && pwd -P)" == "$root" ]] || continue
+        [[ "$root" == "$prev" ]] && continue
+        printf '%s\n' "$root"
+        prev="$root"
     done
-    [[ -n "$v" ]] || v=unknown
+    return 0
+}
 
-    printf '%s\n' "$v"
+# compresser_git_info  ->  "COMMIT<TAB>BRANCH<TAB>TREE" of the same
+# checkout as compresser_version: the full commit SHA of HEAD, the branch
+# name ("HEAD" when detached) and the working tree state "clean" / "dirty"
+# (a change to a tracked file; untracked files do not count, as for
+# describe --dirty). "unknown" for every value Git cannot give. Never
+# fails, never writes to the repository (no index refresh lock).
+compresser_git_info() {
+    local root c="" b="" t=""
+
+    while IFS= read -r root; do
+        c=$(GIT_OPTIONAL_LOCKS=0 git -C "$root" rev-parse --verify -q 'HEAD^{commit}' 2>/dev/null) &&
+        [[ "$c" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || { c=""; continue; }
+        b=$(GIT_OPTIONAL_LOCKS=0 git -C "$root" symbolic-ref --short -q HEAD 2>/dev/null) || b=HEAD
+        [[ "$b" =~ ^[[:graph:]]{1,200}$ ]] || b=unknown
+        if t=$(GIT_OPTIONAL_LOCKS=0 git -C "$root" status --porcelain --untracked-files=no 2>/dev/null); then
+            [[ -n "$t" ]] && t=dirty || t=clean
+        else
+            t=unknown
+        fi
+        break
+    done < <(_compresser_git_roots)
+
+    printf '%s\t%s\t%s\n' "${c:-unknown}" "${b:-unknown}" "${t:-unknown}"
 }
 
 # compression_date_now  ->  today's date, ISO 8601 (YYYY-MM-DD), in UTC
@@ -490,26 +528,12 @@ mkv_track_map() {
 # were not written (FILE unchanged); WORKDIR keeps the XML and tool logs.
 mkv_set_compression_tags() {
     local file="$1" crf="$2" tier="$3" dir="$4" version="${5:-}" date="${6:-}"
-    local orig="$dir/tags_source.xml" new="$dir/tags_compression.xml"
-    local back="$dir/tags_written.xml" log="$dir/mkvpropedit_tags.log"
-    local rc restore names="$COMPRESSION_CRF_TAG_NAMES" n v
+    local names="$COMPRESSION_CRF_TAG_NAMES"
 
     [[ "$crf" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 2
     if [[ -n "$version" ]]; then
         [[ "$version" =~ ^[[:graph:]]{1,128}$ && "$date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 2
         names="$COMPRESSION_ALL_TAG_NAMES"
-    fi
-    command -v mkvextract >/dev/null 2>&1 && command -v mkvpropedit >/dev/null 2>&1 || return 3
-    mkdir -p "$dir" || return 4
-
-    rm -f -- "$orig" "$new" "$back"
-    mkvextract "$file" tags "$orig" > "$log" 2>&1 || return 5
-    # no tags at all: mkvextract writes no (or an empty) file
-    if grep -q '<Tags>' "$orig" 2>/dev/null; then
-        restore="all:$orig"
-    else
-        printf '<?xml version="1.0"?>\n<Tags>\n</Tags>\n' > "$orig"
-        restore="all:"
     fi
 
     # NAME=VALUE pairs of the new global tag, in writing order
@@ -518,6 +542,71 @@ mkv_set_compression_tags() {
         want+=("COMPRESSION_TOOL=$COMPRESSION_TOOL_NAME" "MOVIE_COMPRESSER_VERSION=$version" "COMPRESSION_DATE=$date")
     want+=("COMPRESSION_CRF=$crf")
     [[ -n "$tier" ]] && want+=("COMPRESSION_TIER=$tier")
+
+    _mkv_write_global_tags "$file" "$dir" tags_source.xml tags_compression.xml tags_written.xml \
+        mkvpropedit_tags.log "$names" "${want[@]}"
+}
+
+# mkv_set_global_tags FILE WORKDIR NAMES NAME=VALUE...
+#
+# The general form of mkv_set_compression_tags: writes the NAME=VALUE
+# pairs as ONE new global Matroska tag (TargetTypeValue 50) into FILE
+# with mkvpropedit, after removing every earlier global value of the
+# names matching the extended regular expression NAMES (upper-case
+# names). Every other tag (global, track, edition, chapter, attachment)
+# is kept, read back and compared; on any difference the original tag
+# set is restored. Only tags change (no remux, chapters / attachments /
+# streams untouched). WORKDIR keeps tags_global_*.xml and
+# mkvpropedit_global_tags.log. Same return codes as
+# mkv_set_compression_tags.
+mkv_set_global_tags() {
+    local file="$1" dir="$2" names="$3" kv
+    shift 3
+
+    (( $# > 0 )) || return 2
+    for kv in "$@"; do
+        [[ "${kv%%=*}" =~ ^[A-Z][A-Z0-9_]*$ && "$kv" == *=* ]] || return 2
+        [[ "${kv%%=*}" =~ ^($names)$ ]] || return 2
+    done
+    _mkv_write_global_tags "$file" "$dir" tags_global_source.xml tags_global_new.xml \
+        tags_global_written.xml mkvpropedit_global_tags.log "$names" "$@"
+}
+
+# _mkv_tags_arg PATH  ->  "all:PATH" for mkvpropedit --tags; under MSYS /
+# Cygwin (Git Bash) PATH is given in the Windows form, which the native
+# mkvpropedit can open (MSYS does not convert a path behind a prefix)
+_mkv_tags_arg() {
+    local p="$1"
+
+    if [[ -n "$p" && "$p" == /* ]] && command -v cygpath >/dev/null 2>&1; then
+        p=$(cygpath -m -- "$p" 2>/dev/null) || p="$1"
+    fi
+    printf 'all:%s' "$p"
+}
+
+# _mkv_write_global_tags FILE DIR ORIG NEW BACK LOG NAMES NAME=VALUE...
+# (mkv_set_compression_tags / mkv_set_global_tags): extract, strip the
+# global NAMES, append the new global tag, write, read back, restore on
+# any difference
+_mkv_write_global_tags() {
+    local file="$1" dir="$2"
+    local orig="$dir/$3" new="$dir/$4" back="$dir/$5" log="$dir/$6" names="$7"
+    local rc restore n v
+    shift 7
+    local -a want=("$@")
+
+    command -v mkvextract >/dev/null 2>&1 && command -v mkvpropedit >/dev/null 2>&1 || return 3
+    mkdir -p "$dir" || return 4
+
+    rm -f -- "$orig" "$new" "$back"
+    mkvextract "$file" tags "$orig" > "$log" 2>&1 || return 5
+    # no tags at all: mkvextract writes no (or an empty) file
+    if grep -q '<Tags>' "$orig" 2>/dev/null; then
+        restore=$(_mkv_tags_arg "$orig")
+    else
+        printf '<?xml version="1.0"?>\n<Tags>\n</Tags>\n' > "$orig"
+        restore="all:"
+    fi
 
     {
         _compression_tags_strip "$names" < "$orig" | sed '/<\/Tags>/,$d'
@@ -533,7 +622,7 @@ mkv_set_compression_tags() {
         echo '</Tags>'
     } > "$new"
 
-    mkvpropedit "$file" --tags "all:$new" >> "$log" 2>&1
+    mkvpropedit "$file" --tags "$(_mkv_tags_arg "$new")" >> "$log" 2>&1
     rc=$?
     (( rc <= 1 )) || return 6
 
@@ -3635,6 +3724,10 @@ emit_job_header() {
     echo 'set -uo pipefail'
     echo
     printf 'JOB_COMPRESSER_VERSION=%q\n' "$(compresser_version)"
+    # provenance (provenance.sh): full commit, branch, working tree state
+    local gc gb gt
+    IFS=$'\t' read -r gc gb gt <<< "$(compresser_git_info)"
+    printf 'JOB_GIT_COMMIT=%q\nJOB_GIT_BRANCH=%q\nJOB_GIT_TREE=%q\n' "${gc:-unknown}" "${gb:-unknown}" "${gt:-unknown}"
     printf 'WORK_DIR=%q\n' "$WORK_DIR"
     echo 'source "$WORK_DIR/lib/media_probe.sh"'
     echo 'source "$WORK_DIR/lib/media_stats.sh"'
@@ -4078,9 +4171,28 @@ _emit_final_encode() {
     # a source compressed earlier must not lend its provenance to this
     # encode (item_tag_compression writes the job's own)
     printf '      -metadata COMPRESSION_TOOL= -metadata MOVIE_COMPRESSER_VERSION= -metadata COMPRESSION_DATE= \\\n'
+    printf '      %s\\\n' "$(provenance_strip_args)"
     printf '      -map_metadata 0 -map_chapters 0 -max_muxing_queue_size 4096 %s\\\n' "$(matroska_mux_args)"
     emit_part_and_covers "$in"
 }
+
+# provenance_strip_args  ->  ffmpeg options that drop the PROVENANCE_*
+# global tags a source compressed earlier carries (-map_metadata 0
+# would copy them): the output is a new file with its own provenance
+# (provenance.sh item_provenance_tag); the source's ID is recorded as
+# the output's parent instead
+provenance_strip_args() {
+    local n out=""
+
+    for n in ${PROVENANCE_TAG_NAMES//|/ }; do
+        out+="-metadata $n= "
+    done
+    printf '%s' "$out"
+}
+
+# PROVENANCE_* global tags (provenance.sh item_provenance_tag): the
+# operation that produced the file; details in the provenance manifest
+PROVENANCE_TAG_NAMES="PROVENANCE_TOOL|PROVENANCE_ID|PROVENANCE_STATUS|PROVENANCE_COMMIT|PROVENANCE_TREE|PROVENANCE_TIME|PROVENANCE_PRESET|PROVENANCE_OPS|PROVENANCE_PARENT"
 
 # _emit_x265_lines RATE DV X265_PARAMS_QUOTED COLOR  ->  the libx265
 # option lines of a generated ffmpeg command
@@ -4118,6 +4230,7 @@ emit_copy_item() {
     [[ -n "$vfix" ]] && printf '      %s\\\n' "$(_video_title_arg "$vfix")"
     [[ -n "$MAP_META_ARGS" ]] && printf '      %s\\\n' "$MAP_META_ARGS"
     [[ -n "${MAP_ATITLE_ARGS:-}" ]] && printf '      %s\\\n' "$MAP_ATITLE_ARGS"
+    printf '      %s\\\n' "$(provenance_strip_args)"
     printf '      -map_metadata 0 -map_chapters 0 -max_muxing_queue_size 4096 %s\\\n' "$(matroska_mux_args)"
     emit_part_and_covers "$in"
     printf 'then\n'
