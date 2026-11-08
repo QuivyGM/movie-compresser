@@ -69,6 +69,17 @@
 # for Dolby Vision / HDR10+ intermediates and the metadata report. It is
 # removed when the item succeeds and kept (RPU, raw HEVC, tool logs) when
 # it fails.
+#
+# Provenance (provenance.sh, PROVENANCE.md): every verified output gets
+# a stable ID and the PROVENANCE_* global tags (item_provenance_tag,
+# before the rename) and one record in the provenance manifest under
+# work/logs/provenance (item_provenance_record, after the rename). Failed
+# and interrupted items record nothing. Neither step changes the encode
+# or can fail an item.
+
+# shellcheck source=provenance.sh
+[[ -n "${PROVENANCE_LOADED:-}" ]] ||
+    source "$(dirname "${BASH_SOURCE[0]}")/provenance.sh" 2>/dev/null || true
 
 job_init() {
     JOB_SESSION="$1"
@@ -200,6 +211,9 @@ job_on_exit() {
 
     # Large intermediates are not useful after an interruption.
     item_tmp_drop_intermediates
+    # an interrupted item records no provenance
+    [[ -n "${ITEM_TMP:-}" && "$ITEM_TMP" == "${JOB_LOG_DIR:-/nonexistent}"/item-*.tmp ]] &&
+        rm -rf -- "$ITEM_TMP/prov" 2>/dev/null
 
     JOB_STATUS="interrupted"
     job_write_state
@@ -247,6 +261,7 @@ item_begin() {
     ITEM_OVER_CEILING=0
     ITEM_BELOW_FLOOR=0
     ITEM_ATTEMPT_ROWS=()
+    ITEM_PROV_ID=""
     JOB_STATUS="running"
 
     if [[ "${ITEM_BEGIN_MODE:-}" == resume ]]; then
@@ -418,6 +433,12 @@ item_run() {
         printf '%q ' "$cmd" "$@"
         echo
     } >> "$ITEM_LOG"
+
+    # the options actually executed, for the provenance record (one
+    # NUL-separated argv per pass label; a later attempt replaces it)
+    if [[ -n "${ITEM_TMP:-}" ]] && mkdir -p "$ITEM_TMP/prov" 2>/dev/null; then
+        printf '%s\0' "$cmd" "$@" > "$ITEM_TMP/prov/cmd_${label//\//-}" 2>/dev/null || true
+    fi
 
     # Run as a waited child (stdin kept, so 'q' still works when
     # attached): bash only runs signal traps between commands, so a
@@ -757,6 +778,10 @@ item_succeeded() {
         return 1
     fi
 
+    # provenance ID + PROVENANCE_* tags of the verified output (tags
+    # only; never a failure)
+    declare -F item_provenance_tag > /dev/null && item_provenance_tag
+
     final="$ITEM_OUTPUT"
 
     # A symlink (valid or broken) at the output name is "taken" too.
@@ -806,6 +831,9 @@ item_succeeded() {
         compression_ledger_add "$JOB_WORK/logs" "$final" "${ITEM_EXP[crf]:-}" \
             "$(compression_tier_name "$ITEM_TIER")" "$ITEM_FINAL_VBYTES" "$JOB_SESSION" "$ITEM_INPUT"
     fi
+
+    # provenance manifest record of the final output (never a failure)
+    declare -F item_provenance_record > /dev/null && item_provenance_record "$final"
 
     if [[ -s "$ITEM_TMP/report.txt" ]]; then
         echo
@@ -891,6 +919,8 @@ item_failed() {
     # the disk full. Drop the directory if nothing is left.
     item_tmp_drop_intermediates
     if [[ -n "${ITEM_TMP:-}" ]]; then
+        # provenance scratch (executed options): a failed item records nothing
+        rm -rf -- "$ITEM_TMP/prov" "$ITEM_TMP/ops.tsv" 2>/dev/null
         rmdir -- "$ITEM_TMP" 2>/dev/null || true
     fi
     printf '%s\t%s\n' "$ITEM_NAME" "$reason${ITEM_KEPT:+ (encode kept: $ITEM_KEPT)}" >> "$JOB_LOG_DIR/failed.tsv"

@@ -132,12 +132,17 @@ tagval() {
             hit = 0
         }'
 }
-# taglist FILE  ->  "NAME=VALUE" of every simple tag, in file order
+# taglist FILE  ->  "NAME=VALUE" of every simple tag, in file order; the
+# PROVENANCE_* tags every verified output also gets (its own tag, written
+# after the verification) are left out: provenance_tests.sh covers them
 taglist() {
     sed '1,/^#TAGS$/d' "$1" 2>/dev/null | awk '
         /<Name>/   { n = $0; sub(/.*<Name>/, "", n); sub(/<\/Name>.*/, "", n) }
-        /<String>/ { v = $0; sub(/.*<String>/, "", v); sub(/<\/String>.*/, "", v); printf "%s=%s ", n, v }'
+        /<String>/ { v = $0; sub(/.*<String>/, "", v); sub(/<\/String>.*/, "", v); if (n !~ /^PROVENANCE_/) printf "%s=%s ", n, v }'
 }
+# compression tag writes (mkv_set_compression_tags) in the stand-in log;
+# the provenance write (tags_global_*.xml) is a separate tag
+ctwrites() { grep -- '--tags' "$1" 2>/dev/null | grep -c 'tags_compression'; }
 
 # source tags an encode copies (ffmpeg -map_metadata 0): global title +
 # a custom global tag, an ENCODER tag, a track tag; source 2 also carries
@@ -289,7 +294,7 @@ eq    "High: final output CRF 21"                "$(first "$T/out/High.mkv")" 21
 eq    "High: COMPRESSION_CRF=21 (not planned 20)" "$(tagval "$T/out/High.mkv" COMPRESSION_CRF)" 21
 eq    "High: COMPRESSION_TIER=High"              "$(tagval "$T/out/High.mkv" COMPRESSION_TIER)" High
 eq    "High: tagged before verification"         "$(verified mh)" "1:21:21 "
-check "High: one tag write (accepted attempt only)" "[[ \$(grep -c -- '--tags' '$STUB_LOG') == 1 ]]"
+check "High: one tag write (accepted attempt only)" "[[ \$(ctwrites '$STUB_LOG') == 1 ]]"
 eq    "High: source tags intact + compression tags" "$(taglist "$T/out/High.mkv")" "${SRC_LIST}${PROV}COMPRESSION_CRF=21 COMPRESSION_TIER=High "
 eq    "High: track-level COMPRESSION_CRF untouched" "$(tagval "$T/out/High.mkv" COMPRESSION_CRF track)" "track-level stays"
 check "High: pane shows the tags"                "logged mh 'Recording compression tags: COMPRESSION_CRF=21 COMPRESSION_TIER=High'"
@@ -408,7 +413,7 @@ eq    "copy: no COMPRESSION_CRF"                 "$(tagval "$T/out/Copy.mkv" COM
 eq    "copy: source tags unchanged"              "$(taglist "$T/out/Copy.mkv")" "$SRC_LIST"
 eq    "two-pass: no COMPRESSION_CRF"             "$(tagval "$T/out/Abr.mkv" COMPRESSION_CRF)" ""
 eq    "two-pass: source tags unchanged"          "$(taglist "$T/out/Abr.mkv")" "$SRC_LIST"
-check "copy / two-pass: mkvpropedit not run on them" "! grep -qE '^(Copy|Abr)\\.mkv' '$STUB_LOG'"
+check "copy / two-pass: no compression tag write on them" "! grep -E '^(Copy|Abr)\\.mkv' '$STUB_LOG' | grep -q 'tags_compression'"
 eq    "copy / two-pass: no ledger row"           "$(ledger '(Copy|Abr)[.]mkv$')" ""
 eq    "copy / two-pass: no provenance written"   "$(tagval "$T/out/Copy.mkv" MOVIE_COMPRESSER_VERSION)$(tagval "$T/out/Abr.mkv" MOVIE_COMPRESSER_VERSION)" ""
 eq    "untagged source: only the compression tags" "$(taglist "$T/out/New.mkv")" "${PROV}COMPRESSION_CRF=19 COMPRESSION_TIER=High "

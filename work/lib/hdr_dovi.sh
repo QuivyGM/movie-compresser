@@ -1101,6 +1101,21 @@ _rep() {
     printf '  %-19s %s\n' "$1:" "$2"
 }
 
+# _vop SCOPE SUBJECT ACTION DETAIL  ->  one verified operation row in
+# $ITEM_TMP/ops.tsv (provenance.sh / provenance.py): SCOPE video | hdr |
+# hdr10 | dv | hdr10plus | audio | commentary | subtitle | stream |
+# attachments | chapters | metadata; ACTION preserved | removed |
+# converted | reencoded | added | modified. Written by
+# item_verify_output only for what it compared between the source and
+# the output (never inferred from the output alone).
+_vop() {
+    [[ -n "${ITEM_TMP:-}" && -d "$ITEM_TMP" ]] || return 0
+    local d="$4"
+    d="${d//$'\t'/ }"
+    d="${d//$'\n'/ }"
+    printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$d" >> "$ITEM_TMP/ops.tsv"
+}
+
 # item_verify_output  (item step)
 #
 # Compares the source with "$ITEM_PART" and writes the preservation
@@ -1122,6 +1137,7 @@ item_verify_output() {
     local O_A=() O_S=() O_ORDER=() O_DROPPED=() O_ATT=()
 
     exec 3> "$ITEM_TMP/report.txt"
+    : > "$ITEM_TMP/ops.tsv"
 
     echo "Verifying output metadata..."
     echo "Metadata preservation:" >&3
@@ -1141,8 +1157,10 @@ item_verify_output() {
 
         if [[ "$s" == "$o" ]]; then
             _rep "HDR type" "$o" >&3
+            _vop hdr "dynamic range" preserved "$o"
         else
             line="$s -> $o"
+            _vop hdr "dynamic range" modified "$line"
             [[ "$dv" == "drop" ]] && line+="  (Dolby Vision dropped by choice)"
             [[ "$h10p" == "drop" ]] && line+="  (HDR10+ dropped by choice)"
             [[ "$dv" == "preserve" && "$S_DV_PROFILE" == "7" ]] && line+="  (profile 7 RPU converted to 8.1; enhancement layer discarded)"
@@ -1158,6 +1176,11 @@ item_verify_output() {
                         "$(cat "$ITEM_TMP/rpu_frames" 2>/dev/null)")
                     if [[ "$v" == VERIFIED* ]]; then
                         _rep "Dolby Vision RPU" "$v" >&3
+                        if [[ "$S_DV_PROFILE${S_DV_COMPAT:+.$S_DV_COMPAT}" == "$O_DV_PROFILE${O_DV_COMPAT:+.$O_DV_COMPAT}" ]]; then
+                            _vop dv rpu preserved "profile $O_DV_PROFILE${O_DV_COMPAT:+.$O_DV_COMPAT} (RPU re-injected after the re-encode, verified)"
+                        else
+                            _vop dv rpu converted "profile $S_DV_PROFILE${S_DV_COMPAT:+.$S_DV_COMPAT} -> $O_DV_PROFILE${O_DV_COMPAT:+.$O_DV_COMPAT} (RPU kept, verified)"
+                        fi
                         # the base layer must be what the compatibility
                         # id promises to players without Dolby Vision
                         case "$O_DV_COMPAT" in
@@ -1200,6 +1223,7 @@ item_verify_output() {
                         local el
                         el=$(cat "$ITEM_TMP/dv_el" 2>/dev/null)
                         _rep "DV enhancement" "$(_dv_el_name "$el") DISCARDED (only the RPU is kept; a single-layer encode cannot carry the enhancement layer)" >&3
+                        _vop dv "enhancement layer" removed "$(_dv_el_name "$el") discarded (single-layer output)"
                         [[ "$el" == MEL ]] ||
                             warns+=("Dolby Vision $(_dv_el_name "$el") discarded (RPU kept as profile 8.1)")
                     fi
@@ -1210,11 +1234,15 @@ item_verify_output() {
                         fails+=("output has a Dolby Vision record although DV was dropped")
                     else
                         _rep "Dolby Vision RPU" "DROPPED (base layer only, chosen before encoding)" >&3
+                        _vop dv rpu removed "profile $S_DV_PROFILE${S_DV_COMPAT:+.$S_DV_COMPAT} dropped (base layer only, chosen before encoding)"
                     fi
                     ;;
                 *)
                     if [[ "$video" == "copy" ]] && (( O_DV == 1 )) && [[ "$O_DV_PROFILE" == "$S_DV_PROFILE" ]]; then
                         _rep "Dolby Vision" "COPIED (video stream copy, profile $O_DV_PROFILE)" >&3
+                        _vop dv rpu preserved "profile $O_DV_PROFILE${O_DV_COMPAT:+.$O_DV_COMPAT} (video stream copy)"
+                        [[ "$S_DV_EL" == 1 && "$O_DV_EL" == 1 ]] &&
+                            _vop dv "enhancement layer" preserved "kept in the copied stream"
                     else
                         _rep "Dolby Vision" "MISSING" >&3
                         fails+=("Dolby Vision lost without a policy")
@@ -1227,8 +1255,10 @@ item_verify_output() {
         if (( S_HDR10PLUS == 1 )); then
             if [[ "$h10p" == "drop" ]]; then
                 _rep "HDR10+" "DROPPED (chosen before encoding)" >&3
+                _vop hdr10plus "dynamic metadata" removed "dropped (chosen before encoding)"
             elif (( O_HDR10PLUS == 1 )); then
                 _rep "HDR10+" "VERIFIED" >&3
+                _vop hdr10plus "dynamic metadata" preserved "$( [[ "$video" == copy ]] && echo "video stream copy" || echo "re-inserted into the re-encode, verified")"
             else
                 _rep "HDR10+" "MISSING" >&3
                 fails+=("HDR10+ metadata missing in the output")
@@ -1249,8 +1279,10 @@ item_verify_output() {
             _rep "Colour signalling" "n/a (source untagged)" >&3
         elif [[ -z "$line" ]]; then
             _rep "Colour signalling" "MATCH (${S_PRIMARIES:-?}/${S_TRANSFER:-?}/${S_MATRIX:-?}/${S_RANGE:-?})" >&3
+            _vop video "colour signalling" preserved "${S_PRIMARIES:-?}/${S_TRANSFER:-?}/${S_MATRIX:-?}/${S_RANGE:-?}"
         else
             _rep "Colour signalling" "CHANGED: $line" >&3
+            _vop video "colour signalling" modified "$line"
             fails+=("colour signalling changed: $line")
         fi
 
@@ -1274,13 +1306,17 @@ item_verify_output() {
 
                 if [[ -z "$sv" ]]; then
                     _rep "$lbl" "n/a (source has none)" >&3
+                    [[ -n "$ov" ]] && _vop hdr10 "${lbl#HDR10 }" added "$ov"
                 elif [[ "$sv" == "$ov" ]]; then
                     _rep "$lbl" "VERIFIED" >&3
+                    _vop hdr10 "${lbl#HDR10 }" preserved "$sv"
                 elif [[ -z "$ov" ]]; then
                     _rep "$lbl" "MISSING" >&3
+                    _vop hdr10 "${lbl#HDR10 }" removed "$sv"
                     fails+=("$lbl missing in the output")
                 else
                     _rep "$lbl" "CHANGED ($sv -> $ov)" >&3
+                    _vop hdr10 "${lbl#HDR10 }" modified "$sv -> $ov"
                     fails+=("$lbl changed")
                 fi
                 unset -n sv ov
@@ -1322,6 +1358,8 @@ item_verify_output() {
         if [[ "$video" == "copy" ]]; then
             if [[ "$ov_codec $ov_w $ov_h $ov_pix" == "$sv_codec $sv_w $sv_h $sv_pix" ]]; then
                 _rep "Video stream" "COPIED ($line, as the source)" >&3
+                _vop video stream preserved "stream copy ($line)"
+                _vop video resolution preserved "${ov_w}x${ov_h}"
             else
                 _rep "Video stream" "CHANGED although it was to be copied: ${sv_codec}/${sv_w}x${sv_h}/${sv_pix} -> ${line// //}" >&3
                 fails+=("video stream not copied unchanged")
@@ -1348,6 +1386,13 @@ item_verify_output() {
             esac
             [[ -n "${ITEM_EXP[tune]:-}" ]] && line+=", tune ${ITEM_EXP[tune]}"
             _rep "Video stream" "AS PLANNED ($line)" >&3
+            _vop video stream reencoded "${sv_codec:-?} ${sv_pix:-?} -> $line"
+            if [[ "$ov_w" == "$sv_w" && "$ov_h" == "$sv_h" ]]; then
+                _vop video resolution preserved "${ov_w}x${ov_h}"
+            else
+                _vop video resolution modified "${sv_w}x${sv_h} -> ${ov_w}x${ov_h} (downscaled)"
+            fi
+            [[ "$sv_pix" != "$ov_pix" ]] && _vop video "pixel format" modified "$sv_pix -> $ov_pix"
         fi
     fi
 
@@ -1390,6 +1435,11 @@ item_verify_output() {
         _rep "Audio track $((i + 1))" "COPIED ($(audio_track_label "${sv[0]}" "${sv[1]}" "${sv[2]}" "${sv[10]}"), ${sv[13]} Hz$h)" >&3
         [[ "$h" == *MISMATCH* ]] &&
             _rep "Audio $((i + 1)) payload" "CHANGED: packet data differs from the source" >&3
+        if [[ "$h" != *MISMATCH* ]]; then
+            _vop audio "track $((i + 1))" preserved "$(audio_track_label "${sv[0]}" "${sv[1]}" "${sv[2]}" "${sv[10]}"), ${sv[13]} Hz, lang ${sv[8]:--}, copied${h:+ (${h#, })}"
+            [[ "${sv[5]:-0}" == 1 ]] &&
+                _vop commentary "track $((i + 1))" preserved "lang ${sv[8]:--}, title ${sv[9]:--}, copied"
+        fi
 
         so=$(audio_object_kind "${sv[0]}" "${sv[1]}" "${sv[9]}")
         if [[ -n "$so" ]]; then
@@ -1401,6 +1451,25 @@ item_verify_output() {
                 fails+=("audio $((i + 1)): ${so%% (*} not present after stream copy")
             fi
         fi
+    }
+
+    # _sub_ops I  ->  operation rows of subtitle track I (source order;
+    # the output track in the same position): format, language, title,
+    # default / forced flags, each compared with the source
+    _sub_ops() {
+        local i="$1" k name sv ov
+        local soc sc oc
+        soc=$(_field "${S_S[$i]}" 13); sc=$(_field "${S_S[$i]}" 1); oc=$(_field "${O_S[$i]}" 1)
+        if [[ "$soc" != "$oc" ]]; then
+            _vop subtitle "track $((i + 1))" converted "$soc -> $oc, lang $(_field "${S_S[$i]}" 9)"
+        else
+            _vop subtitle "track $((i + 1))" preserved "$oc, lang $(_field "${S_S[$i]}" 9)"
+        fi
+        for k in "9 language" "10 title" "4 default" "5 forced" "7 hearing impaired"; do
+            name="${k#* }"
+            sv=$(_field "${S_S[$i]}" "${k%% *}"); ov=$(_field "${O_S[$i]}" "${k%% *}")
+            [[ "$sv" == "$ov" ]] || _vop subtitle "track $((i + 1)) $name" modified "$sv -> $ov"
+        done
     }
 
     local -A trans=()
@@ -1527,9 +1596,11 @@ item_verify_output() {
             if [[ "${ITEM_EXP[atitle]:-}" == std ]]; then
                 if [[ "$ot" != "$et" ]]; then
                     _rep "Audio $((i + 1)) title" "UNEXPECTED: \"$ot\" (expected \"$et\")" >&3
+                    [[ "$st" != "$ot" ]] && _vop metadata "audio $((i + 1)) title" modified "\"$st\" -> \"$ot\" (not the planned title)"
                     warns+=("audio $((i + 1)) title differs from the planned title")
                 elif [[ "$st" != "$ot" ]]; then
                     _rep "Audio $((i + 1)) title" "UPDATED $( [[ "$st" == - ]] && echo "(none)" || echo "\"$st\"") -> \"$ot\"" >&3
+                    _vop metadata "audio $((i + 1)) title" modified "$( [[ "$st" == - ]] && echo "(none)" || echo "\"$st\"") -> \"$ot\""
                     ((updated += 1))
                 else
                     _rep "Audio $((i + 1)) title" "KEPT \"$ot\" (already standard)" >&3
@@ -1541,16 +1612,24 @@ item_verify_output() {
 
         _rep "Audio track $((i + 1))" \
             "$(_codec_label "$sc" "$sp") ${sl/#-/${sch}ch} -> $(_codec_label "$oc" "$op") $( [[ "$ol" == "-" || "$ol" == "unknown" ]] && echo "${och}ch" || echo "$ol") (transcoded)" >&3
+        if [[ -n "$oc" ]]; then
+            _vop audio "track $((i + 1))" converted \
+                "$(_codec_label "$sc" "$sp") ${sl/#-/${sch}ch} -> $(_codec_label "$oc" "$op") $( [[ "$ol" == "-" || "$ol" == "unknown" ]] && echo "${och}ch" || echo "$ol"), lang $(_field "${S_A[$i]}" 9)"
+            [[ "$(_field "${S_A[$i]}" 6)" == 1 ]] &&
+                _vop commentary "track $((i + 1))" converted "lang $(_field "${S_A[$i]}" 9), $(_codec_label "$sc" "$sp") -> $(_codec_label "$oc" "$op")"
+        fi
 
         if [[ "$sp" == *Atmos* ]]; then
             if [[ "$op" == *Atmos* ]]; then
                 _rep "Atmos metadata" "KEPT" >&3
             else
                 _rep "Atmos metadata" "DROPPED (audio transcoded; channel-based ${och}ch kept)" >&3
+                _vop audio "track $((i + 1)) object audio" removed "Atmos"
             fi
         fi
         if [[ "$sp" == *DTS:X* ]]; then
             _rep "DTS:X metadata" "DROPPED (audio transcoded; channel-based ${och}ch kept)" >&3
+            _vop audio "track $((i + 1)) object audio" removed "DTS:X"
         fi
 
         # a transcode never adds or removes channels (no downmix)
@@ -1639,11 +1718,13 @@ item_verify_output() {
             fails+=("audio $((i + 1)) title is no longer true (\"$ot\": $claims)")
         elif [[ "$ot" != "$et" ]]; then
             _rep "Audio $((i + 1)) title" "UNEXPECTED: \"$ot\" (expected \"$et\")" >&3
+            [[ "$st" != "$ot" ]] && _vop metadata "audio $((i + 1)) title" modified "\"$st\" -> \"$ot\" (not the planned title)"
             warns+=("audio $((i + 1)) title differs from the planned title")
         elif [[ "$st" == "-" && "$ot" == "-" ]]; then
             _rep "Audio $((i + 1)) title" "none (source had none; nothing invented)" >&3
         elif [[ "$st" != "$ot" ]]; then
             _rep "Audio $((i + 1)) title" "UPDATED \"$st\" -> \"$ot\"" >&3
+            _vop metadata "audio $((i + 1)) title" modified "\"$st\" -> \"$ot\""
             ((updated += 1))
         else
             _rep "Audio $((i + 1)) title" "KEPT \"$ot\" (still accurate)" >&3
@@ -1668,10 +1749,12 @@ item_verify_output() {
             _rep "Subtitle $((i + 1))" "mov_text -> SRT (format conversion; language/title/flags kept)" >&3
             _rep "Subtitle $((i + 1)) styling" "$(movtext_note "$src" "$sidx")" >&3
         fi
+        (( ${#S_S[@]} == ${#O_S[@]} )) && _sub_ops "$i"
     done
 
     for v in "${S_DROPPED[@]+"${S_DROPPED[@]}"}"; do
         printf '    dropped: %s\n' "$v" >&3
+        _vop "$( [[ "$v" == subtitle* ]] && echo subtitle || echo stream)" "${v%%:*}" removed "${v#*: }"
     done
 
     # ---- attachments: names + MIME types, not just the count
@@ -1681,8 +1764,10 @@ item_verify_output() {
         _rep "Attachments" "none" >&3
     elif [[ "$s" == "$o" ]]; then
         _rep "Attachments" "MATCH (${#S_ATT[@]} -> ${#O_ATT[@]}: file names + MIME types)" >&3
+        _vop attachments all preserved "${#S_ATT[@]} (file names + MIME types)"
     else
         _rep "Attachments" "CHANGED (${#S_ATT[@]} -> ${#O_ATT[@]}): $(tr '\n' ' ' <<< "$s")-> $(tr '\n' ' ' <<< "$o")" >&3
+        _vop attachments all modified "${#S_ATT[@]} -> ${#O_ATT[@]}"
         warns+=("attachments differ")
     fi
 
@@ -1706,8 +1791,10 @@ item_verify_output() {
         _rep "Chapters" "none" >&3
     elif [[ "$sch" == "$och" ]]; then
         _rep "Chapters" "MATCH ($s: start times + titles)" >&3
+        _vop chapters all preserved "$s (start times + titles)"
     else
         _rep "Chapters" "CHANGED ($s -> $o: start times/titles differ)" >&3
+        _vop chapters all modified "$s -> $o"
         fails+=("chapters differ from the source")
     fi
 
@@ -1723,6 +1810,7 @@ item_verify_output() {
             elif chapter_xml_same "$ref" "$oxml" "$ITEM_TMP/chapters_diff.txt"; then
                 rm -f -- "$ITEM_TMP/chapters_diff.txt"
                 _rep "Editions" "MATCH ($(chapter_xml_describe "$oxml"); UIDs + flags identical)" >&3
+                _vop chapters editions preserved "$(chapter_xml_describe "$oxml")"
             else
                 _rep "Editions" "CHANGED: $(chapter_xml_describe "$ref") -> $(chapter_xml_describe "$oxml")" >&3
                 grep -m 6 '^[<>]' "$ITEM_TMP/chapters_diff.txt" |
@@ -1747,6 +1835,7 @@ item_verify_output() {
         read -r ouid _ <<< "$(mkv_segment_uids "$out")"
         if [[ "${ouid,,}" == "${suid,,}" ]]; then
             _rep "Segment UID" "KEPT (referenced by ordered chapters / linked files)" >&3
+            _vop chapters "segment UID" preserved "kept for ordered chapters / linked files"
         else
             _rep "Segment UID" "CHANGED: ordered-chapter references may break" >&3
             fails+=("segment UID not kept")
@@ -1763,11 +1852,13 @@ item_verify_output() {
             _rep "$label" "n/a (track count changed)" >&3
         elif [[ "$sa" == "$oa" && "$ss" == "$os" ]]; then
             _rep "$label" "MATCH" >&3
+            _vop metadata "${label,,}" preserved "audio [$sa], subtitles [$ss]"
         else
             local d=""
             [[ "$sa" != "$oa" ]] && d+="audio [$sa] -> [$oa] "
             [[ "$ss" != "$os" ]] && d+="subtitles [$ss] -> [$os]"
             _rep "$label" "CHANGED: $d" >&3
+            _vop metadata "${label,,}" modified "$d"
             warns+=("$label changed")
         fi
     }
@@ -1801,6 +1892,10 @@ item_verify_output() {
         local vt vexp vcrf="" vbits
         vbits=$(video_pix_bits "$ov_pix")
         vt=$(stream_meta "$out" | awk -F'\t' -v i="$ovidx" '$1 == i { print $14; exit }')
+        local svt
+        svt=$(stream_meta "$src" | awk -F'\t' -v i="$vidx" '$1 == i { print $14; exit }')
+        [[ -n "$svt" && -n "$vt" && "$svt" != "$vt" ]] &&
+            _vop metadata "video title" modified "$( [[ "$svt" == - ]] && echo "(none)" || echo "\"$svt\"") -> \"$vt\""
         if [[ "${ITEM_TITLES_STATE:-}" == final ]]; then
             vcrf=$(item_title_crf)
         elif [[ "$video" == copy ]]; then
@@ -1834,8 +1929,8 @@ item_verify_output() {
     s=$(format_title "$src")
     o=$(format_title "$out")
     if [[ -n "$s" ]]; then
-        [[ "$s" == "$o" ]] && _rep "Global title" "MATCH" >&3 ||
-            { _rep "Global title" "CHANGED" >&3; warns+=("global title changed"); }
+        [[ "$s" == "$o" ]] && { _rep "Global title" "MATCH" >&3; _vop metadata "global title" preserved "\"$s\""; } ||
+            { _rep "Global title" "CHANGED" >&3; warns+=("global title changed"); _vop metadata "global title" modified "\"$s\" -> \"$o\""; }
     fi
 
     s="${S_ORDER[*]-}"
@@ -1844,6 +1939,7 @@ item_verify_output() {
         _rep "Stream order" "MATCH" >&3
     else
         _rep "Stream order" "CHANGED ($s -> $o)" >&3
+        _vop metadata "stream order" modified "$s -> $o"
         warns+=("stream order changed")
     fi
 
@@ -1860,7 +1956,7 @@ item_verify_output() {
     fi
 
     exec 3>&-
-    unset -f _flags_line _verify_copied_audio _out_kbps _title_warn
+    unset -f _flags_line _verify_copied_audio _out_kbps _title_warn _sub_ops
 
     (( ${#fails[@]} == 0 ))
 }
