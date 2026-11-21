@@ -128,7 +128,8 @@ Schema (`"schema": "movie-compresser/provenance-manifest/1"`):
     "<id>": {
       "id": "<id>",                       // = PROVENANCE_ID in the file
       "kind": "movie" | "episode" | "unknown",
-      "series": {"show": "Show", "episode": "S01E02"},      // episodes
+      "series": {"show": "Show", "season": "Season 01", "episode": "S01E02"},  // episodes; "season"
+                                          // only for season folders (out/<show>/<season>/...)
       "status": "active" | "replaced",    // replaced: a later output took its path
       "replaced_by": "<id>", "replaced_at": "...",
       "provenance": "recorded" | "partial" | "recovered" | "unknown",
@@ -158,7 +159,8 @@ Operation object:
   "settings": {"video", "crf", "crf_planned", "x265_preset", "x265_tune", "x265_params", "pix_fmt",
                "video_filter", "x265_settings", "x265_rate_control_in_stream", "scaled",
                "dolby_vision_policy", "dolby_vision_output", "hdr10plus_policy", "video_ceiling_bytes",
-               "crf_range", "season_batch", "audio_transcode": [...], ...},
+               "crf_range", "season_batch", "season_group", "season_crf_planned",
+               "audio_transcode": [...], ...},   // season_*: multi-season series jobs
   "source": { /* compact media properties */ },
   "output": { /* compact media properties */ },
   "changes": [{"scope", "subject", "action", "detail", "basis": "verified"}],

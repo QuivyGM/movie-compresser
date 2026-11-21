@@ -746,6 +746,11 @@ def settings_from(ev, spool_dir):
         s["crf_range"] = [to_float(exp.get("crf_min")), to_float(exp.get("crf_max"))]
     if exp.get("batch_mode"):
         s["season_batch"] = exp["batch_mode"]
+    # multi-season series jobs: the season group and its planned shared CRF
+    if exp.get("season"):
+        s["season_group"] = exp["season"]
+    if exp.get("season_crf"):
+        s["season_crf_planned"] = to_float(exp["season_crf"])
     if exp.get("down_mode"):
         s["crf_search"] = exp["down_mode"]
     # audio: what was planned per transcoded track (the verification
@@ -800,13 +805,36 @@ def kind_of(ev, output):
     return None
 
 
-def series_of(kind, path):
+SEASON_DIR_RE = re.compile(r"(?i)^(season|series|staffel|saison)[ ._-]*\d+\b|^s\d{1,3}$|^specials?\b")
+
+
+def series_of(kind, path, season=None):
+    """show / season / episode of an episode output. Outputs mirror the
+    source layout (out/<show>/<season folder>/<episode>, series_compress.sh):
+    SEASON (the job's season group, item_expect season=) names the folders
+    below the show; without it a parent folder named like a season
+    ("Season 01", "Specials") is taken as the season folder."""
     if kind != "episode":
         return None
-    name = os.path.basename(path or "")
+    path = path or ""
+    name = os.path.basename(path)
     m = EPISODE_RE.search(name)
-    return {"show": os.path.basename(os.path.dirname(path or "")) or None,
-            "episode": ("S%02dE%02d" % (int(m.group(1)), int(m.group(2)))) if m else None}
+    parent = os.path.dirname(path)
+    show_dir, season_name = parent, None
+    if season and season != "(root)":
+        depth = len([c for c in season.split("/") if c])
+        tail = parent.split(os.sep)[-depth:] if depth else []
+        if "/".join(tail) == season.strip("/"):
+            show_dir = os.sep.join(parent.split(os.sep)[:-depth])
+        season_name = season
+    elif not season and SEASON_DIR_RE.search(os.path.basename(parent)):
+        show_dir = os.path.dirname(parent)
+        season_name = os.path.basename(parent)
+    out = {"show": os.path.basename(show_dir) or None,
+           "episode": ("S%02dE%02d" % (int(m.group(1)), int(m.group(2)))) if m else None}
+    if season_name:
+        out["season"] = season_name
+    return out
 
 
 def event_to_entry(spool_dir):
@@ -892,7 +920,7 @@ def event_to_entry(spool_dir):
         "id": ev["id"],
         "op": op,
         "kind": kind,
-        "series": series_of(kind, output),
+        "series": series_of(kind, output, ev.get("exp_season")),
         "parent_id": ev.get("parent_id") if UUID_RE.match(ev.get("parent_id") or "") else None,
         "tags_embedded": ev.get("tags") == "written",
         "file": {"path": output, "name": os.path.basename(output),
@@ -1425,7 +1453,8 @@ FILE_AREAS = [
     (r"^work/lib/(ui|fs_guard|naming|provenance)\.(sh|py)$", "none"), (r"^\.git", "none"),
     (r"^(in|out)/", "none"), (r"^work/lib/media_stats\.sh$", "metadata"),
     (r"^work/lib/bitrate\.sh$", "encoder"), (r"^work/movie_compress\.sh$", "encoder:movie"),
-    (r"^work/series_compress\.sh$", "encoder:series"), (r"^audio_compress_menu\.sh$", "audio"),
+    (r"^work/series_compress\.sh$", "encoder:series"), (r"^work/lib/series_seasons\.sh$", "encoder:series"),
+    (r"^audio_compress_menu\.sh$", "audio"),
     (r"^work/lib/audio_plan\.sh$", "audio"),
 ]
 FUNC_AREAS = {
@@ -1448,6 +1477,7 @@ FUNC_AREAS = {
         (r"^(next_tmux_session|cleanup_finished_jobs|output_|path_taken|unique_output_path|"
          r"resolve_output_conflict|start_job|emit_job_header|emit_job_footer|emit_failed_item|"
          r"actual_file_gib|compresser_|_compresser|compression_date_now|mkv_identify_tracks|"
+         r"emit_job_season|_emit_season_expect|"
          r"_mkv_codec_ok|mkv_track_map|_sig_crf|crf_attempt_leftovers)", "none"),
     ],
     "work/lib/hdr_dovi.sh": [
@@ -1461,11 +1491,13 @@ FUNC_AREAS = {
         (r"^(probe_hdr|hdr_)", "hdr"),
         (r"^(discover_paths|_discovery|video_files_in_dir|media_files_recursive|series_dirs|file_bytes|"
          r"media_signature|x265_rate_control|x265_sei_options|compression_|format_title|stream_tag|"
-         r"chapter_xml_summary|chapter_xml_describe|chapter_xml_same|chapter_xml_canon)", "none"),
+         r"chapter_xml_summary|chapter_xml_describe|chapter_xml_same|chapter_xml_canon|"
+         r"series_season_groups|series_group_|series_groups_sort|series_extras_dir|series_episode_count|"
+         r"SERIES_EXTRAS_DIRS|SERIES_ROOT_GROUP)", "none"),
         (r"^(mkv_chapters_xml|chapter_meta|format_start_time|mkv_segment_uids)$", "metadata"),
     ],
     "work/lib/job_runtime.sh": [
-        (r"^(item_crf_encode|job_crf_batch|_keep_accepted|_drop_attempt|item_attempt_|_down_threshold|"
+        (r"^(item_crf_encode|job_crf_batch|_job_crf_batch_run|_keep_accepted|_drop_attempt|item_attempt_|_down_threshold|"
          r"item_video_bytes|_crf_step_ratio|item_actual_|job_batch_add|_batch|_bceil|_season|"
          r"_median_bytes|_mbps_of|item_retry_enabled|attempt_line|item_rows_final|item_run)", "encoder"),
         (r"^(item_restore_mkv_chapters|item_add_cover|item_tag_compression|item_finalize_titles|"

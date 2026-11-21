@@ -3745,6 +3745,34 @@ emit_job_footer() {
     echo 'job_finish'
 }
 
+# emit_job_season NAME SEASON_CRF NUMBER COUNT ITEMS  ->  start of one
+# season of a multi-season series job (series_compress.sh): the items
+# that follow, up to emit_job_season_end, are one independent season
+# (own season CRF batch: job_runtime.sh job_season_begin / job_crf_batch).
+# NUMBER / COUNT: this season's position in the job; ITEMS: its items.
+emit_job_season() {
+    printf '# ==== season %s/%s: %s\n' "$3" "$4" "$1"
+    printf 'job_season_begin %q %q %q %q %q\n\n' "$1" "$2" "$3" "$4" "$5"
+}
+
+# emit_job_season_end  ->  the season boundary: its CRF batch is encoded,
+# checked (retries / CRF - 1 test of this season only) and finalised
+# before the next season starts. Without a batch (Custom, source copies)
+# this does nothing.
+emit_job_season_end() {
+    echo 'job_crf_batch'
+    echo
+}
+
+# _emit_season_expect  ->  " season=... season_crf=... ep_label=..." for
+# item_expect when the generator set EMIT_SEASON (multi-season series
+# jobs; EMIT_SEASON_CRF the season's planned shared CRF, EMIT_EP_LABEL
+# the menu's episode label); nothing otherwise
+_emit_season_expect() {
+    [[ -n "${EMIT_SEASON:-}" ]] || return 0
+    printf ' season=%q season_crf=%q' "$EMIT_SEASON" "${EMIT_SEASON_CRF:-}"
+}
+
 # Ends a generated pass-2 ffmpeg command (output = "$ITEM_PART"),
 # appends one item_add_cover step per MAP_COVERS entry and, for MKV
 # sources, restores the full chapter structure (FFmpeg flattens it).
@@ -4054,9 +4082,17 @@ emit_encode_item() {
     # series High / Base: strict shared season CRF (job_runtime.sh job_crf_batch)
     if [[ "$mode" == "crf" && "$rbatch" == season ]]; then
         expect+=' batch_mode=season'
-        declare -F episode_label > /dev/null &&
+        if [[ -n "${EMIT_EP_LABEL:-}" ]]; then
+            expect+=$(printf ' ep_label=%q' "$EMIT_EP_LABEL")
+        elif declare -F episode_label > /dev/null; then
             expect+=$(printf ' ep_label=%q' "$(episode_label "$in")")
+        fi
+    elif [[ -n "${EMIT_SEASON:-}" && -n "${EMIT_EP_LABEL:-}" ]]; then
+        expect+=$(printf ' ep_label=%q' "$EMIT_EP_LABEL")
     fi
+    # multi-season series job: the item's season group and season CRF
+    # (progress-check.sh, provenance)
+    expect+=$(_emit_season_expect)
     [[ "$mode" == "crf" && -n "$actual_sig" ]] &&
         expect+=$(printf ' actual_sig=%q' "$actual_sig")
     [[ "$mode" == "crf" && "$crf_est" =~ ^[0-9.]+=[0-9]+(:[0-9.]+=[0-9]+)*$ ]] &&
@@ -4223,7 +4259,8 @@ emit_copy_item() {
 
     printf '# ---- item %s  (source video kept: stream copy)\n' "$index"
     printf 'if item_begin %q %q %q %q %q "" &&\n' "$index" "$in" "$out" "$tier" "$overwrite"
-    printf '   item_expect vidx=%q video=copy mode=copy dv=none hdr10p=none scaled=0 copyts=0 atrans= ahash=1 amap=%q atitle=std &&\n' "$vidx" "${MAP_AMAP:-}"
+    printf '   item_expect vidx=%q video=copy mode=copy dv=none hdr10p=none scaled=0 copyts=0 atrans= ahash=1 amap=%q atitle=std%s%s &&\n' "$vidx" "${MAP_AMAP:-}" \
+        "$( [[ -n "${EMIT_SEASON:-}" && -n "${EMIT_EP_LABEL:-}" ]] && printf ' ep_label=%q' "$EMIT_EP_LABEL")" "$(_emit_season_expect)"
     printf '   item_run mux ffmpeg -y -i %q \\\n' "$in"
     printf '      %s\\\n' "$MAP_ARGS"
     printf '      -c:v:0 copy -c:a copy %s\\\n' "$MAP_CODEC_ARGS"

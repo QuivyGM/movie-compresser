@@ -66,6 +66,10 @@
 #     track operations per output, PROVENANCE_* tags, the manifest
 #     (repeats, recovery, concurrency), scan / tag / relink / compare
 #     (provenance_tests.sh; needs python3)
+# 19. Jellyfin-style season folders: discovery, season selection, one
+#     shared CRF per season, per-season job batches, progress-check
+#     season queue, verify.sh scope / grouped summary (stand-ins, no
+#     ffmpeg: series_seasons_tests.sh)
 #
 # Runs in a temporary copy of work/ so real logs/jobs are untouched.
 # Everything here is synthetic: it proves the mechanics, not behaviour
@@ -595,9 +599,16 @@ echo "== series output naming (no encodes)"
         done
     done
     check "series menu uses the naming functions" \
-        "grep -q 'OUT_SERIES=\$(series_output_dir \"\$OUT_DIR\" \"\$SERIES_DIR\")' '$SRC_WORK/series_compress.sh' && grep -q 'series_episode_output \"\$OUT_SERIES\"' '$SRC_WORK/series_compress.sh'"
+        "grep -q 'OUT_SERIES=\$(series_output_dir \"\$OUT_DIR\" \"\$SERIES_DIR\")' '$SRC_WORK/series_compress.sh' && grep -q 'OUT_SEASON=\$(series_output_dir \"\$OUT_DIR\" \"\$SERIES_DIR\" \"\$(season_rel \"\$k\")\")' '$SRC_WORK/series_compress.sh' && grep -q 'series_episode_output \"\$OUT_SEASON\"' '$SRC_WORK/series_compress.sh'"
     check "series menu: no encode info in the folder name" \
-        "! grep -nE 'OUT_SERIES=.*(HEVC|1080p|TIER|CRF)' '$SRC_WORK/series_compress.sh'"
+        "! grep -nE 'OUT_(SERIES|SEASON)=.*(HEVC|1080p|TIER|CRF)' '$SRC_WORK/series_compress.sh'"
+    for d in "Season 01" "Season 00 - Specials" "Season 01/Disc 2"; do
+        eq "season '$d' -> out/<series>/'$d'" "$(series_output_dir "$O" "/home/u/compress/in/Columbo (1968)" "$d")" "$O/Columbo (1968)/$d"
+    done
+    eq "root group -> out/<series>"           "$(series_output_dir "$O" "/home/u/compress/in/Show" "(root)")" "$O/Show"
+    eq "empty group -> out/<series>"          "$(series_output_dir "$O" "/home/u/compress/in/Show" "")" "$O/Show"
+    eq "season episode name"                  "$(series_episode_output "$(series_output_dir "$O" "/x/in/Columbo (1968)" "Season 01")" "/x/in/Columbo (1968)/Season 01/Columbo S01E01.mkv" High 0)" \
+        "$O/Columbo (1968)/Season 01/Columbo S01E01 HEVC High.mkv"
     check "movie naming unchanged: <name>[ 1080p] HEVC <Tier>.mkv in out/" \
         "grep -qF 'OUT=\"\$OUT_DIR/\${NAME} 1080p HEVC \${TIER}.mkv\"' '$SRC_WORK/movie_compress.sh' && grep -qF 'OUT=\"\$OUT_DIR/\${NAME} HEVC \${TIER}.mkv\"' '$SRC_WORK/movie_compress.sh'"
     unset O od ep

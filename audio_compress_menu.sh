@@ -769,14 +769,17 @@ fi
 # OUTPUT NAME
 # ============================================================
 
-OUT="$OUT_DIR/${NAME} AudioCompressed.mkv"
+# next to the selected file (its folder; series outputs live in
+# out/<show>/[<season>/], movies directly in out/)
+OUT_FOLDER=$(dirname -- "$IN")
+OUT="$OUT_FOLDER/${NAME} AudioCompressed.mkv"
 
 counter=2
 
 # a symlink (valid or broken) at a name counts as taken, and so does a
 # name another encode is writing or a running job will write
 while path_taken "$OUT" || output_busy "$OUT"; do
-    OUT="$OUT_DIR/${NAME} AudioCompressed ${counter}.mkv"
+    OUT="$OUT_FOLDER/${NAME} AudioCompressed ${counter}.mkv"
     ((counter++))
 done
 
@@ -786,7 +789,7 @@ done
 
 echo
 SPACE_SRC=$(file_bytes "$IN")
-compress_space_confirm "$OUT_DIR" "$SPACE_SRC" "$SPACE_SRC" "$WORK_DIR" 0 || exit 1
+compress_space_confirm "$OUT_FOLDER" "$SPACE_SRC" "$SPACE_SRC" "$WORK_DIR" 0 || exit 1
 
 # ============================================================
 # TMUX SESSION

@@ -86,6 +86,16 @@ eq    "relative root symlink"                "$(video_files_in_dir "$D/disk3/rel
 eq    "chained root symlink"                 "$(video_files_in_dir "$D/disk3/chain-in")" "$D/disk3/chain-in/Movie.mkv"
 eq    "no warnings for a symlinked root"     "$(video_files_in_dir "$R" 2>&1 >/dev/null)" ""
 check "root symlinks untouched"              "[[ -L '$R' && \"\$(readlink '$R')\" == '$D/disk2/in' && -L '$D/disk3/rel-in' ]]"
+# season folders (Jellyfin layout) on another disk, through the root link
+mkdir -p "$D/disk2/in/Nested/Season 01" "$D/disk4/s2"
+printf e > "$D/disk2/in/Nested/Season 01/S01E01.mkv"
+printf e > "$D/disk4/s2/S02E01.mkv"
+ln -s "$D/disk4/s2" "$D/disk2/in/Nested/Season 02"
+eq    "nested series through symlinked in/"  "$(series_dirs "$R" | tr '\n' '|')" "$R/Nested|$R/Show|"
+eq    "season groups through symlinked in/"  "$(series_season_groups "$R/Nested" | tr '\n' '|')" "$R/Nested/Season 01|$R/Nested/Season 02|"
+eq    "flat series: the folder is its only group" "$(series_season_groups "$R/Show")" "$R/Show"
+eq    "no warnings for nested seasons"       "$(series_season_groups "$R/Nested" 2>&1 >/dev/null)" ""
+check "season folder links untouched"        "[[ -L '$D/disk2/in/Nested/Season 02' ]]"
 ln -s "$D/nowhere" "$D/home/compress/gone"
 eq    "broken root symlink: nothing, no error" "$(video_files_in_dir "$D/home/compress/gone" 2>&1; echo "rc=$?")" "rc=0"
 

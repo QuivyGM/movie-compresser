@@ -131,6 +131,15 @@ job_init() {
     ITEM_BELOW_FLOOR=0        # movie Base result below its video floor (flagged)
     ITEM_ATTEMPT_ROWS=()
     JOB_BATCH=()
+    # multi-season series jobs (job_season_begin): the current season and
+    # the final CRF of every completed one (progress-check.sh)
+    JOB_SEASON_NAME=""
+    JOB_SEASON_NO=""
+    JOB_SEASONS=""
+    JOB_SEASON_CRF=""
+    JOB_SEASON_ITEMS=""
+    JOB_SEASON_STATE=""
+    declare -gA JOB_SEASON_FINAL=()
     JOB_OVER_NAMES=()
     JOB_FLOOR_NAMES=()
     declare -gA JOB_DONE_PARTS=()   # completed attempt files: never deleted on interruption
@@ -170,6 +179,19 @@ job_write_state() {
         printf 'progress=%s\n' "$JOB_PROGRESS"
         printf 'log_dir=%s\n' "$JOB_LOG_DIR"
         printf 'compresser_version=%s\n' "$JOB_COMPRESSER_VERSION"
+        if [[ -n "${JOB_SEASON_NAME:-}" ]]; then
+            local n
+            printf 'season=%s\n' "${JOB_SEASON_NAME//$'\n'/ }"
+            printf 'season_no=%s\n' "$JOB_SEASON_NO"
+            printf 'seasons=%s\n' "$JOB_SEASONS"
+            printf 'season_crf=%s\n' "$JOB_SEASON_CRF"
+            printf 'season_items=%s\n' "$JOB_SEASON_ITEMS"
+            printf 'season_state=%s\n' "$JOB_SEASON_STATE"
+            printf 'label=%s\n' "${ITEM_EXP[ep_label]:-}"
+            for n in "${!JOB_SEASON_FINAL[@]}"; do
+                printf 'season_final_%s=%s\n' "$n" "${JOB_SEASON_FINAL[$n]}"
+            done
+        fi
     } > "$tmp" 2>/dev/null &&
     mv -f "$tmp" "$JOB_STATE" 2>/dev/null
 
@@ -1704,6 +1726,31 @@ job_batch_add() {
     JOB_BATCH+=("$1")
 }
 
+# job_season_begin NAME SEASON_CRF NUMBER COUNT ITEMS  (multi-season
+# series jobs, encode_common.sh emit_job_season)
+#
+# The items up to the next job_crf_batch are one independent season:
+# its own season CRF batch (encoded, checked, retried at CRF + 1 /
+# tested at CRF - 1 and finalised by that job_crf_batch), never mixed
+# with another season. Job scripts without it (single-season series
+# jobs, earlier versions) run exactly as before: one batch at the end.
+job_season_begin() {
+    JOB_SEASON_NAME="$1"
+    JOB_SEASON_CRF="$2"
+    JOB_SEASON_NO="$3"
+    JOB_SEASONS="$4"
+    JOB_SEASON_ITEMS="$5"
+    JOB_SEASON_STATE="encoding"
+    JOB_BATCH=()
+
+    echo
+    echo "############################################################"
+    printf 'Season %s/%s: %s  (%s, season CRF %s)\n' "$3" "$4" "$1" \
+        "$( (( ${5:-0} == 1 )) && echo "1 episode" || echo "${5:-?} episodes")" "${2:--}"
+    echo "############################################################"
+    job_write_state
+}
+
 # _median_bytes VALUE...  ->  median (whole number)
 _median_bytes() {
     printf '%s\n' "$@" | sort -n | awk '{ v[NR] = $1 } END {
@@ -1815,6 +1862,28 @@ _season_lines() {
     local id w=3
 
     SEASON_OVER=0
+
+    if [[ -n "${JOB_SEASON_NAME:-}" ]]; then
+        # multi-season job: one summary line per check, plus only the
+        # episodes above the ceiling
+        local big="" over=()
+        for id in "${active[@]}"; do
+            [[ -z "$big" ]] || (( _sv[$id] > _sv[$big] )) && big="$id"
+            if (( _sv[$id] > $(_bceil "$id") )); then
+                ((SEASON_OVER += 1))
+                over+=("$id")
+            fi
+        done
+        echo
+        printf '%s CRF %s actual: %s, largest %s GiB (%s) / %s GiB ceiling -> %s\n' \
+            "$JOB_SEASON_NAME" "$1" "$( (( ${#active[@]} == 1 )) && echo "1 episode" || echo "${#active[@]} episodes")" \
+            "$(_gib "${_sv[$big]}")" "${lbl[$big]}" "$(_gib "$(_bceil "$big")")" \
+            "$( (( SEASON_OVER == 0 )) && echo "every episode fits" || echo "$SEASON_OVER over the ceiling")"
+        for id in "${over[@]+"${over[@]}"}"; do
+            printf '  %s %s GiB / %s GiB -> over ceiling\n' "${lbl[$id]}" "$(_gib "${_sv[$id]}")" "$(_gib "$(_bceil "$id")")"
+        done
+        return 0
+    fi
     for id in "${active[@]}"; do
         (( ${#lbl[$id]} > w )) && w=${#lbl[$id]}
     done
@@ -1880,6 +1949,26 @@ _season_notes() {
 #   enough headroom); single episodes above the nominal ceiling are only
 #   listed.
 job_crf_batch() {
+    local rc=0 ran=0
+
+    (( ${#JOB_BATCH[@]} )) && ran=1
+    BATCH_FINAL_CRF=""
+    _job_crf_batch_run || rc=$?
+    # one batch per season (job_season_begin): the next season starts
+    # with an empty batch; a second call (the job footer) does nothing
+    JOB_BATCH=()
+
+    if [[ -n "${JOB_SEASON_NAME:-}" && "${JOB_SEASON_STATE:-}" != done ]]; then
+        (( ran )) || BATCH_FINAL_CRF=""
+        JOB_SEASON_FINAL[$JOB_SEASON_NO]="${BATCH_FINAL_CRF:-$JOB_SEASON_CRF}"
+        JOB_SEASON_STATE=done
+        job_write_state
+    fi
+    return "$rc"
+}
+
+# _job_crf_batch_run  ->  job_crf_batch for the current batch (JOB_BATCH)
+_job_crf_batch_run() {
     (( ${#JOB_BATCH[@]} )) || return 0
 
     local id c="" max="" min="" med m2 fits=0 nc fail_id why n_above
@@ -1944,10 +2033,11 @@ job_crf_batch() {
 
     (( ${#active[@]} )) || return 0
 
+    JOB_SEASON_STATE="check:$c"
     if [[ -n "$BATCH_CEIL" ]]; then
         echo
         echo "============================================================"
-        echo "Season CRF check ($BATCH_TIER, ${#active[@]} episode(s))"
+        echo "${JOB_SEASON_NAME:+$JOB_SEASON_NAME: }Season CRF check ($BATCH_TIER, ${#active[@]} episode(s))"
     fi
 
     # ---- season mode, phase 1: up while ANY episode is above the ceiling
@@ -1976,6 +2066,7 @@ job_crf_batch() {
         fi
 
         nc=$((c + 1))
+        JOB_SEASON_STATE="retry:$nc"
         echo "CRF $c season does not fit ($SEASON_OVER episode(s) over the ceiling)."
         echo "Retrying the entire season at CRF $nc..."
         _season_notes "$c" vb REJECTED "over ceiling; season retry CRF $nc" \
@@ -2020,6 +2111,7 @@ job_crf_batch() {
             else
                 echo
                 echo "Testing season CRF $nc for better quality..."
+                JOB_SEASON_STATE="test:$nc"
 
                 if ! _batch_season "$nc"; then
                     _batch_note "$fail_id" "$nc" 0 FAILED "$why; keep season CRF $c"
@@ -2058,7 +2150,7 @@ job_crf_batch() {
 
     if (( strict )); then
         echo
-        echo "Final season CRF: $c"
+        echo "Final season CRF: $c${JOB_SEASON_NAME:+ ($JOB_SEASON_NAME)}"
         echo "Episodes: ${#active[@]}/${#JOB_BATCH[@]} at CRF $c"
         echo "============================================================"
     fi
@@ -2185,6 +2277,8 @@ job_crf_batch() {
     fi
 
     # ---- finalise: verify every episode at the accepted CRF, final name
+    BATCH_FINAL_CRF="$c"
+    JOB_SEASON_STATE="accepted:$c"
     for id in "${active[@]}"; do
         ITEM_BEGIN_MODE=resume
         "item_ctx_$id"

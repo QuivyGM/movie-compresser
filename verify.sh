@@ -31,6 +31,15 @@
 #
 # Recursive, so series folders are included. Non-MKV files are only
 # inspected; mkvpropedit is never run on them.
+#
+# Scope (after Location and Mode): every file, one show (a top-level
+# folder) or one season of a show (its season folders as the series
+# menu finds them: media_probe.sh series_season_groups). The report is
+# grouped by show and season: one line per file (name, tier / CRF, video
+# size, VERIFIED / CORRECTED / UNPAIRED / CHECK REQUIRED); the full
+# detail block only for a file that is not VERIFIED, or for every file
+# with COMPRESS_VERBOSE=1. The end summary has the totals per season and
+# the overall totals.
 set -u
 
 BASE="$HOME/compress"
@@ -38,6 +47,7 @@ IN="$BASE/in"
 OUT="$BASE/out"
 LIB="$BASE/work/lib"
 
+source "$LIB/ui.sh"
 source "$LIB/media_probe.sh"
 source "$LIB/media_stats.sh"
 source "$LIB/bitrate.sh"
@@ -101,6 +111,9 @@ TAGS_UNRECOVERED=0
 TITLES_OK=0
 TITLES_FIX=0
 TITLES_UPDATED=0
+FILE_ISSUES=0       # problems of the current file not counted above
+FILE_VBYTES=""      # main video bytes of the current file
+FILE_RC=""          # x265 rate control of the current file ("crf 21.0")
 
 inspect_file() {
     local file="$1"
@@ -112,6 +125,8 @@ inspect_file() {
     local scan=0 update=0 totals
 
     rel="${file#"$root"/}"
+    FILE_VBYTES=""
+    FILE_RC=""
 
     echo
     echo "============================================================"
@@ -131,6 +146,7 @@ inspect_file() {
     if [[ -z "$vidx" ]]; then
         row "File size" "$(bytes_to_gib "$bytes") GiB"
         echo "  No video stream found."
+        ((FILE_ISSUES++))
         ((CHECKED++))
         return
     fi
@@ -161,6 +177,7 @@ inspect_file() {
         if (( STATS_SCANNED == 1 )); then
             scan=1
             if is_mkv "$file"; then
+                ((FILE_ISSUES++))
                 echo "  Statistics tags missing or rejected: values from a packet scan."
                 echo "  Verify does not modify files; use Validate + update to store"
                 echo "  correct statistics tags."
@@ -169,6 +186,7 @@ inspect_file() {
     fi
 
     (( scan == 1 )) && ((SCANNED++))
+    FILE_VBYTES="$vbytes"
 
     local other
     other=$(awk -v t="$bytes" -v v="$vbytes" -v a="$abytes" 'BEGIN {
@@ -183,6 +201,7 @@ inspect_file() {
         # single-pass CRF, every movie and series tier; two-pass: older outputs)
         local rc
         rc=$(x265_rate_control "$file" "$vidx")
+        FILE_RC="$rc"
         case "$rc" in
             "")        ;;
             "crf "*)   row "Video encode" "x265 CRF ${rc#crf } (single pass)" ;;
@@ -621,11 +640,225 @@ if (( VALIDATE == 1 )); then
     echo "Full packet scan of every file. This can take a while."
 fi
 
+# ------------------------------------------------------------
+# Scope: everything, one show (top-level folder) or one season of a show
+# ------------------------------------------------------------
+
+# top_dirs ROOT  ->  the top-level folders of ROOT that hold media files
+top_dirs() {
+    local d
+    while IFS= read -r -d '' d; do
+        [[ -n "$(DISCOVERY_QUIET=1 media_files_recursive "$d" | head -c 1)" ]] && printf '%s\n' "$d"
+    done < <(DISCOVERY_QUIET=1 discover_paths "$1" 1 d)
+}
+
+# pick_number PROMPT COUNT  ->  PICKED = 1..COUNT
+pick_number() {
+    local c
+    while true; do
+        read -rp "$1" c || exit 0
+        if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= $2 )); then
+            PICKED="$c"
+            return 0
+        fi
+        echo "Invalid selection."
+    done
+}
+
+echo
+echo "Scope:"
+echo "1) All"
+echo "2) One show (folder)"
+echo "3) One season of a show"
+
+while true; do
+    read -rp "Select [1-3]: " c || exit 0
+    case "$c" in
+        1|2|3) SCOPE="$c"; break ;;
+        *) echo "Invalid selection." ;;
+    esac
+done
+
+SCOPE_SHOW=""
+SCOPE_GROUP=""
+
+if (( SCOPE > 1 )); then
+    mapfile -t SHOWS < <(top_dirs "$ROOT")
+    if (( ${#SHOWS[@]} == 0 )); then
+        echo "No show folders found in: $ROOT"
+        exit 1
+    fi
+    echo
+    echo "Show:"
+    for i in "${!SHOWS[@]}"; do
+        printf '%2d) %s\n' "$((i + 1))" "$(basename "${SHOWS[$i]}")"
+    done
+    pick_number "Select [1-${#SHOWS[@]}]: " "${#SHOWS[@]}"
+    SCOPE_SHOW="${SHOWS[$((PICKED - 1))]}"
+fi
+
+if (( SCOPE == 3 )); then
+    mapfile -t GROUPS_ < <(DISCOVERY_QUIET=1 series_season_groups "$SCOPE_SHOW")
+    if (( ${#GROUPS_[@]} == 0 )); then
+        echo "No season folders with episodes in: $SCOPE_SHOW"
+        exit 1
+    fi
+    echo
+    echo "Season:"
+    for i in "${!GROUPS_[@]}"; do
+        printf '%2d) %s  (%s)\n' "$((i + 1))" "$(series_group_name "$SCOPE_SHOW" "${GROUPS_[$i]}")" \
+            "$(ui_plural "$(DISCOVERY_QUIET=1 video_files_in_dir "${GROUPS_[$i]}" | grep -c .)" file)"
+    done
+    pick_number "Select [1-${#GROUPS_[@]}]: " "${#GROUPS_[@]}"
+    SCOPE_GROUP="${GROUPS_[$((PICKED - 1))]}"
+fi
+
 [[ "$ROOT" == "$OUT" ]] && build_source_index "$IN"
 
-while IFS= read -r -d '' file; do
-    inspect_file "$file" "$ROOT" "$VALIDATE"
-done < <(media_files_recursive "$ROOT")
+# ------------------------------------------------------------
+# Files, grouped by show and season
+#
+# Group key: "SHOW<TAB>SEASON"; SHOW "" for files directly in ROOT,
+# SEASON the folder below the show ("(root)" for files in the show
+# folder itself; series_group_name).
+# ------------------------------------------------------------
+
+if [[ -n "$SCOPE_GROUP" ]]; then
+    mapfile -d '' -t FILES < <(discover_paths "$SCOPE_GROUP" 1 f "${MEDIA_EXTS[@]}")
+elif [[ -n "$SCOPE_SHOW" ]]; then
+    mapfile -d '' -t FILES < <(media_files_recursive "$SCOPE_SHOW")
+else
+    mapfile -d '' -t FILES < <(media_files_recursive "$ROOT")
+fi
+
+declare -A GROUP_FILES=() SHOW_SEEN=()
+SHOW_ORDER=()
+for file in "${FILES[@]+"${FILES[@]}"}"; do
+    rel="${file#"$ROOT"/}"
+    if [[ "$rel" == */* ]]; then
+        show="${rel%%/*}"
+        season=$(series_group_name "$ROOT/$show" "$(dirname -- "$file")")
+    else
+        show=""
+        season=""
+    fi
+    if [[ -z "${SHOW_SEEN["k$show"]+x}" ]]; then
+        SHOW_SEEN["k$show"]=1
+        SHOW_ORDER+=("$show")
+    fi
+    GROUP_FILES["$show"$'\t'"$season"]+="$file"$'\n'
+done
+
+# show_seasons SHOW  ->  its season keys in season order
+show_seasons() {
+    local key
+    for key in "${!GROUP_FILES[@]}"; do
+        [[ "${key%%$'\t'*}" == "$1" ]] && printf '%s\n' "${key#*$'\t'}"
+    done | series_groups_sort
+}
+
+# file_status BEFORE...  ->  VERIFIED / CORRECTED / UNPAIRED / CHECK
+# REQUIRED of the file just inspected, from the counters before it
+file_status() {
+    local cr="$1" tf="$2" ns="$3" tu="$4" tw="$5" fi_="$6"
+    if (( CHECK_REQUIRED > cr || TITLES_FIX > tf || FILE_ISSUES > fi_ )); then
+        echo "CHECK REQUIRED"
+    elif (( NO_SOURCE > ns )); then
+        echo "UNPAIRED"
+    elif (( TITLES_UPDATED > tu || TAGS_WRITTEN > tw )); then
+        echo "CORRECTED"
+    else
+        echo "VERIFIED"
+    fi
+}
+
+# file_tier_crf FILE  ->  "High CRF 20", "CRF 21", "source", "-"
+file_tier_crf() {
+    local tier="" crf=""
+    if [[ "$ROOT" == "$OUT" ]]; then
+        tier=$(output_tier "$(basename "$1")")
+        [[ "$tier" == Unknown ]] && tier=""
+    else
+        tier="source"
+    fi
+    IFS=$'\t' read -r crf _ <<< "$(compression_tags "$1" 2>/dev/null)"
+    [[ "$crf" == "-" ]] && crf=""
+    [[ -z "$crf" && "$FILE_RC" == "crf "* ]] && crf="${FILE_RC#crf }"
+    crf="${crf%.0}"
+    printf '%s' "${tier}${tier:+${crf:+ }}${crf:+CRF $crf}"
+    [[ -n "$tier$crf" ]] || printf -- '-'
+}
+
+DETAIL=$(mktemp)
+trap 'rm -f -- "$DETAIL"' EXIT
+NAME_W=40
+declare -A G_FILES=() G_OK=() G_ISSUES=()
+G_ORDER=()
+
+for show in "${SHOW_ORDER[@]+"${SHOW_ORDER[@]}"}"; do
+    echo
+    echo "############################################################"
+    if [[ -z "$show" ]]; then
+        echo "$(ui_bold "(files in $(basename "$ROOT")/)")"
+    else
+        echo "$(ui_bold "$show")"
+    fi
+    echo "############################################################"
+
+    while IFS= read -r season; do
+        key="$show"$'\t'"$season"
+        G_ORDER+=("$key")
+        G_FILES[$key]=0 G_OK[$key]=0 G_ISSUES[$key]=0
+        if [[ -n "$show" ]]; then
+            echo
+            echo "-- $season"
+        fi
+        while IFS= read -r file; do
+            [[ -n "$file" ]] || continue
+            ui_progress "Checking $(basename "$file")..."
+            b_cr=$CHECK_REQUIRED b_tf=$TITLES_FIX b_ns=$NO_SOURCE b_tu=$TITLES_UPDATED b_tw=$TAGS_WRITTEN b_fi=$FILE_ISSUES
+            inspect_file "$file" "$ROOT" "$VALIDATE" > "$DETAIL" 2>&1
+            st=$(file_status "$b_cr" "$b_tf" "$b_ns" "$b_tu" "$b_tw" "$b_fi")
+            ui_progress ""
+            G_FILES[$key]=$(( G_FILES[$key] + 1 ))
+            case "$st" in
+                VERIFIED|CORRECTED) G_OK[$key]=$(( G_OK[$key] + 1 )) ;;
+                *) G_ISSUES[$key]=$(( G_ISSUES[$key] + 1 )) ;;
+            esac
+            case "$st" in
+                VERIFIED)  stc=$(ui_ok "$st") ;;
+                CORRECTED) stc=$(ui_ok "$st") ;;
+                UNPAIRED)  stc=$(ui_warn "$st") ;;
+                *)         stc=$(ui_err "$st") ;;
+            esac
+            name=$(basename "$file")
+            (( ${#name} > NAME_W )) && name="${name:0:$((NAME_W - 1))}~"
+            printf '  %-*s  %-16s %10s  %s\n' "$NAME_W" "$name" "$(file_tier_crf "$file")" \
+                "$( [[ "$FILE_VBYTES" =~ ^[0-9]+$ ]] && echo "$(bytes_to_gib "$FILE_VBYTES") GiB" || echo "-")" "$stc"
+            if [[ "$st" != VERIFIED ]] || ui_verbose; then
+                sed 's/^/    /' "$DETAIL"
+            fi
+        done <<< "${GROUP_FILES[$key]}"
+    done < <(if [[ -z "$show" ]]; then echo ""; else show_seasons "$show"; fi)
+done
+
+if (( ${#G_ORDER[@]} )); then
+    echo
+    echo "============================================================"
+    echo "Per season:"
+    GW=10
+    for key in "${G_ORDER[@]}"; do
+        g="${key%%$'\t'*}"; s="${key#*$'\t'}"
+        label="${g:-(top level)}${s:+ / $s}"
+        (( ${#label} > GW )) && GW=${#label}
+    done
+    for key in "${G_ORDER[@]}"; do
+        g="${key%%$'\t'*}"; s="${key#*$'\t'}"
+        label="${g:-(top level)}${s:+ / $s}"
+        printf '  %-*s  %4s files  %4s verified  %4s issues\n' "$GW" "$label" \
+            "${G_FILES[$key]}" "${G_OK[$key]}" "${G_ISSUES[$key]}"
+    done
+fi
 
 echo
 echo "============================================================"

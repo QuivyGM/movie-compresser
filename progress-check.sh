@@ -23,7 +23,17 @@
 #                  per wall-clock second, overhead included); without a
 #                  completed item, from the current encode speed.
 #                  "Unknown" when there is nothing reliable to base it on.
+#
+# Multi-season series jobs (several season folders in one job): the JOB
+# QUEUE shows one row per season (episodes done, its CRF, the season
+# batch state: encoding / CRF check / retry at CRF N / testing CRF N /
+# accepted); -v or PROGRESS_VERBOSE=1 lists every episode instead.
 set -u
+
+case "${1:-}" in
+    -v|--verbose) PROGRESS_VERBOSE=1 ;;
+    -h|--help)    echo "usage: progress-check.sh [-v]   (-v: every episode of a multi-season job)"; exit 0 ;;
+esac
 
 WORK="$HOME/compress/work"
 RECENT_HOURS=72
@@ -428,14 +438,20 @@ meta_text() {
 # ITEM_MANUAL / ITEM_COPY per item index from the job script's item_begin
 # and item_expect lines (planned values; none for old job formats)
 script_item_meta() {
-    local line idx="" w crf
+    local line idx="" w crf kv
     local -a words
 
     ITEM_IN=() ITEM_TIER=() ITEM_CRF=() ITEM_MANUAL=() ITEM_COPY=()
+    ITEM_SEASON=() ITEM_LABEL=() SEASON_NAMES=() SEASON_PLAN_CRF=()
     [[ -f "$1" ]] || return 0
 
     while IFS= read -r line; do
-        if [[ "$line" =~ (^|[[:space:]])item_begin[[:space:]]+([0-9]+)[[:space:]] ]]; then
+        if [[ "$line" =~ ^job_season_begin[[:space:]] ]]; then
+            # multi-season series job: NAME SEASON_CRF NUMBER COUNT ITEMS
+            mapfile -t words < <(xargs -n 1 2>/dev/null <<< "${line#job_season_begin }")
+            SEASON_NAMES+=("${words[0]:-?}")
+            SEASON_PLAN_CRF+=("${words[1]:-}")
+        elif [[ "$line" =~ (^|[[:space:]])item_begin[[:space:]]+([0-9]+)[[:space:]] ]]; then
             idx="${BASH_REMATCH[2]}"
             [[ -z "${ITEM_IN[$idx]+x}" ]] || { idx=""; continue; }
             mapfile -t words < <(xargs -n 1 2>/dev/null <<< "${line#*item_begin }")
@@ -447,9 +463,106 @@ script_item_meta() {
             ITEM_CRF[$idx]="$crf"
             [[ "$line" == *" down_mode=manual"* ]] && ITEM_MANUAL[$idx]=1
             [[ "$line" == *" mode=copy"* ]] && ITEM_COPY[$idx]=1
+            if [[ "$line" == *" season="* ]]; then
+                mapfile -t words < <(xargs -n 1 2>/dev/null <<< "${line#*item_expect }")
+                for kv in "${words[@]}"; do
+                    case "$kv" in
+                        season=*)   ITEM_SEASON[$idx]="${kv#season=}" ;;
+                        ep_label=*) ITEM_LABEL[$idx]="${kv#ep_label=}" ;;
+                    esac
+                done
+            fi
             idx=""
         fi
-    done < <(grep -E 'item_(begin|expect) ' "$1" 2>/dev/null)
+    done < <(grep -E 'item_(begin|expect) |^job_season_begin ' "$1" 2>/dev/null)
+}
+
+# season_state_text STATE  ->  the season batch state for the queue
+# ("encoding", "CRF check", "retry at CRF 21", "testing CRF 19",
+# "accepted CRF 20", "done")
+season_state_text() {
+    case "$1" in
+        encoding)   printf 'encoding' ;;
+        check:*)    printf 'CRF check' ;;
+        retry:*)    printf 'retry at CRF %s' "${1#retry:}" ;;
+        test:*)     printf 'testing CRF %s' "${1#test:}" ;;
+        accepted:*) printf 'accepted CRF %s' "${1#accepted:}" ;;
+        done)       printf 'done' ;;
+        *)          printf '%s' "$1" ;;
+    esac
+}
+
+# print_season_queue CURRENT ITEMS  ->  the JOB QUEUE of a multi-season
+# series job: one row per season (SEASON_NAMES / ITEM_SEASON from the
+# job script, ST from the state file)
+print_season_queue() {
+    local cur="$1" items="$2" j s n tag namew=6 cnt crf extra state cs="" done_items
+    local -A total=() before=()
+
+    for ((j = 1; j <= items; j++)); do
+        s="${ITEM_SEASON[$j]:-}"
+        [[ -n "$s" ]] || continue
+        total[$s]=$(( ${total[$s]:-0} + 1 ))
+        (( j < cur )) && before[$s]=$(( ${before[$s]:-0} + 1 ))
+    done
+
+    # the current season: the state's, else the current item's
+    cs="${ST[season]:-${ITEM_SEASON[$cur]:-}}"
+    for s in "${SEASON_NAMES[@]}"; do
+        (( ${#s} > namew )) && namew=${#s}
+    done
+
+    echo
+    echo
+    echo "JOB QUEUE"
+    echo "$RULE_THIN"
+    echo
+    printf '  %-11s%s    Elapsed: %s\n' "ETA:" "${R[total_eta]:-Unknown}" "${R[total_elapsed]:-Unknown}"
+    echo
+
+    local now_n=0 seen_now=0
+    for n in "${!SEASON_NAMES[@]}"; do
+        s="${SEASON_NAMES[$n]}"
+        [[ "$s" == "$cs" ]] && now_n="$n"
+    done
+
+    for n in "${!SEASON_NAMES[@]}"; do
+        s="${SEASON_NAMES[$n]}"
+        crf="${SEASON_PLAN_CRF[$n]:-}"
+        extra=""
+        if (( n < now_n )); then
+            tag="[DONE]"
+            cnt="${total[$s]:-0}/${total[$s]:-0}"
+            crf="${ST[season_final_$((n + 1))]:-$crf}"
+        elif (( n == now_n )); then
+            tag="[NOW]"
+            state="${ST[season_state]:-encoding}"
+            cnt="${before[$s]:-0}/${total[$s]:-0}"
+            case "$state" in
+                retry:*|test:*|accepted:*) crf="${state#*:}" ;;
+                done) tag="[DONE]"; cnt="${total[$s]:-0}/${total[$s]:-0}"; crf="${ST[season_final_$((n + 1))]:-$crf}" ;;
+            esac
+            if [[ "$tag" == "[NOW]" ]]; then
+                extra="   current: ${ST[label]:-${ITEM_LABEL[$cur]:-${R[name]:-?}}}   ($(season_state_text "$state"))"
+            fi
+        elif (( n == now_n + 1 )); then
+            tag="[NEXT]"
+            cnt="0/${total[$s]:-0}"
+        else
+            tag="[WAIT]"
+            cnt="0/${total[$s]:-0}"
+        fi
+        printf '  %-7s %-*s  %7s   %s%s\n' "$tag" "$namew" "$s" "$cnt" "${crf:+CRF $crf}" "$extra"
+    done
+
+    echo
+    done_items=$(( cur - 1 ))
+    (( done_items < 0 )) && done_items=0
+    printf '  Completed: %s%s\n' "$done_items" "$( (( ${ST[failed]:-0} > 0 )) && echo " (${ST[failed]} failed)")"
+    printf '  Remaining: %s queued\n' "$(( items - cur > 0 ? items - cur : 0 ))"
+    printf '  Seasons:   %s (one shared CRF per season; -v lists every episode)\n' "${#SEASON_NAMES[@]}"
+    [[ -n "${R[note_crf]:-}" ]] && echo "  Note: CRF retries/tests not yet started are excluded"
+    return 0
 }
 
 # print_header  ->  "c1 — Movie" and the wide rule
@@ -551,7 +664,10 @@ print_job() {
 
     print_header
     print_current
-    if [[ "$items" =~ ^[0-9]+$ && "$cur" =~ ^[0-9]+$ ]] && (( items > 1 && cur >= 1 )); then
+    if [[ "$items" =~ ^[0-9]+$ && "$cur" =~ ^[0-9]+$ ]] && (( items > 1 && cur >= 1 )) &&
+       (( ${#SEASON_NAMES[@]} > 1 )) && [[ "${PROGRESS_VERBOSE:-0}" != 1 ]]; then
+        print_season_queue "$cur" "$items"
+    elif [[ "$items" =~ ^[0-9]+$ && "$cur" =~ ^[0-9]+$ ]] && (( items > 1 && cur >= 1 )); then
         print_queue "$cur" "$items"
     else
         [[ -n "${R[note_crf]:-}" ]] && echo "  Note: CRF retries/tests not yet started are excluded"
@@ -599,7 +715,8 @@ declare -A ST
 declare -A LIVE
 declare -A R
 declare -A DUR
-declare -A ITEM_IN ITEM_TIER ITEM_CRF ITEM_MANUAL ITEM_COPY ITEM_RUN_CRF
+declare -A ITEM_IN ITEM_TIER ITEM_CRF ITEM_MANUAL ITEM_COPY ITEM_RUN_CRF ITEM_SEASON ITEM_LABEL
+SEASON_NAMES=() SEASON_PLAN_CRF=()
 DUR_OUT=""
 shown=0
 
@@ -813,6 +930,7 @@ for entry in "${sessions[@]+"${sessions[@]}"}"; do
         fi
     fi
 
+    SEASON_NAMES=()
     print_job
     ((shown++))
 done

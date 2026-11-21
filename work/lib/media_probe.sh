@@ -136,15 +136,136 @@ media_files_recursive() {
 }
 
 # series_dirs ROOT  ->  folders (or folder symlinks) directly in ROOT
-# that contain movie/episode files, one per line, sorted
+# that contain movie/episode files anywhere below them (Jellyfin-style
+# "Show/Season 01/..." as well as flat "Show/..."; files only in extras
+# folders do not count, see series_season_groups), one per line, sorted
 series_dirs() {
     local d
 
     while IFS= read -r -d '' d; do
-        if [[ -n "$(DISCOVERY_QUIET=1 video_files_in_dir "$d" | head -n 1)" ]]; then
+        if [[ -n "$(DISCOVERY_QUIET=1 series_season_groups "$d" | head -n 1)" ]]; then
             printf '%s\n' "$d"
         fi
     done < <(discover_paths "$1" 1 d)
+}
+
+# ------------------------------------------------------------
+# Season groups (Jellyfin-style series layouts)
+#
+#   Show/S01E01.mkv                      group "(root)"
+#   Show/Season 00 - Specials/*.mkv      group "Season 00 - Specials"
+#   Show/Season 01/*.mkv                 group "Season 01"
+#   Show/Season 01/Disc 2/*.mkv          group "Season 01/Disc 2"
+#
+# Every directory under the show (the show folder included, any depth)
+# that DIRECTLY contains movie/episode files is one season group; its
+# name is its path relative to the show folder. Jellyfin extras folders
+# (SERIES_EXTRAS_DIRS, any case, at any depth) and everything below them
+# are ignored. discover_paths rules apply (symlinked season folders are
+# followed, one entry per real folder, loops skipped).
+# ------------------------------------------------------------
+
+SERIES_EXTRAS_DIRS=(extras featurettes "behind the scenes" "deleted scenes" interviews scenes
+    shorts trailers samples sample other clips backdrops theme-music)
+SERIES_ROOT_GROUP="(root)"
+
+# series_extras_dir NAME  ->  0 when NAME (one folder name) is a Jellyfin
+# extras folder
+series_extras_dir() {
+    local n="${1,,}" e
+    for e in "${SERIES_EXTRAS_DIRS[@]}"; do
+        [[ "$n" == "$e" ]] && return 0
+    done
+    return 1
+}
+
+# series_group_name SHOW_DIR GROUP_DIR  ->  "(root)" | "Season 01" | ...
+series_group_name() {
+    local show="${1%/}" dir="${2%/}"
+    if [[ "$dir" == "$show" ]]; then
+        printf '%s' "$SERIES_ROOT_GROUP"
+    else
+        printf '%s' "${dir#"$show"/}"
+    fi
+}
+
+# series_group_rel GROUP_NAME  ->  the relative output path of a group
+# ("" for the show root)
+series_group_rel() {
+    [[ "$1" == "$SERIES_ROOT_GROUP" ]] || printf '%s' "$1"
+}
+
+# series_group_is_specials GROUP_NAME  ->  0 for "Season 00[...]",
+# "Season 0", "Specials" / "Special" (the whole first path component,
+# any case; "Special Ops" is a regular folder)
+series_group_is_specials() {
+    local n="${1%%/*}"
+    n="${n,,}"
+    [[ "$n" =~ ^season[\ ._-]*0+([^0-9]|$) || "$n" =~ ^specials?$ ]]
+}
+
+# series_groups_sort  ->  group names on stdin (one per line) in season
+# order: specials first, then the show root, then natural order
+# (sort -V: "Season 2" before "Season 10")
+series_groups_sort() {
+    local n
+    while IFS= read -r n; do
+        [[ -n "$n" ]] || continue
+        if series_group_is_specials "$n"; then
+            printf '0\t%s\n' "$n"
+        elif [[ "$n" == "$SERIES_ROOT_GROUP" ]]; then
+            printf '1\t%s\n' "$n"
+        else
+            printf '2\t%s\n' "$n"
+        fi
+    done | sort -t $'\t' -k1,1n -k2,2V | cut -f2-
+}
+
+# series_season_groups SHOW_DIR  ->  the season group folders of a show
+# (SHOW_DIR itself for files in the show root), one path per line, in
+# season order (series_groups_sort). Paths keep the names they were found
+# under (symlink names included).
+series_season_groups() {
+    local show="${1%/}" d rel c skip name
+    local -a dirs=() parts
+    local -A by_name=()
+
+    [[ -d "$show" ]] || return 0
+
+    dirs=("$show")
+    while IFS= read -r -d '' d; do
+        dirs+=("$d")
+    done < <(discover_paths "$show" "" d)
+
+    for d in "${dirs[@]}"; do
+        skip=0
+        if [[ "$d" != "$show" ]]; then
+            rel="${d#"$show"/}"
+            IFS=/ read -ra parts <<< "$rel"
+            for c in "${parts[@]}"; do
+                series_extras_dir "$c" && { skip=1; break; }
+            done
+        fi
+        (( skip )) && continue
+        [[ -n "$(DISCOVERY_QUIET=1 video_files_in_dir "$d" | head -n 1)" ]] || continue
+        name=$(series_group_name "$show" "$d")
+        by_name[$name]="$d"
+    done
+
+    (( ${#by_name[@]} )) || return 0
+    while IFS= read -r name; do
+        printf '%s\n' "${by_name[$name]}"
+    done < <(printf '%s\n' "${!by_name[@]}" | series_groups_sort)
+}
+
+# series_episode_count SHOW_DIR  ->  episodes in every season group
+series_episode_count() {
+    local g n=0 c
+    while IFS= read -r g; do
+        c=$(DISCOVERY_QUIET=1 video_files_in_dir "$g" | grep -c .)
+        n=$(( n + c ))
+    done < <(DISCOVERY_QUIET=1 series_season_groups "$1")
+    printf '%s' "$n"
 }
 
 # file_bytes FILE  ->  size of the file (of the target for a symlink)
