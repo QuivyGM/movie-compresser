@@ -77,6 +77,9 @@
 #     detail blocks only on problems, --brief, 120 columns, Validate +
 #     update layout (verify_summary_tests.sh; needs ffmpeg with libx265
 #     and mkvpropedit)
+# 22. series Custom size tier: ceiling / CRF range input, the ceiling
+#     search and season batch, "HEVC Size1.2G" names and tags everywhere
+#     (customsize_tier_tests.sh; stand-ins, no ffmpeg)
 #
 # Runs in a temporary copy of work/ so real logs/jobs are untouched.
 # Everything here is synthetic: it proves the mechanics, not behaviour
@@ -2425,6 +2428,13 @@ grep -E '^  (ok|FAIL) ' "$T/verify_summary.out"
 PASS=$((PASS + $(grep -c '^  ok ' "$T/verify_summary.out")))
 FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/verify_summary.out")))
 while IFS= read -r s; do SKIPPED+=("${s#skipped: }"); done < <(grep '^skipped: ' "$T/verify_summary.out")
+
+echo
+echo "== series Custom size tier (customsize_tier_tests.sh)"
+bash "$SRC_WORK/tests/customsize_tier_tests.sh" > "$T/customsize.out" 2>&1
+grep -E '^  (ok|FAIL) ' "$T/customsize.out"
+PASS=$((PASS + $(grep -c '^  ok ' "$T/customsize.out")))
+FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/customsize.out")))
 
 echo
 echo "============================================================"

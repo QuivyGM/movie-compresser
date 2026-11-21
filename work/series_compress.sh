@@ -806,6 +806,7 @@ if ui_verbose; then
     echo "3) Custom CRF  exactly the CRF you enter, any 0-${CRF_LIMIT} (no range or ceiling; audio copied unchanged)"
     crf_tier_load series Compact
     echo "4) Compact     CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of each episode's runtime (audio copied unchanged)"
+    echo "5) Custom size the video ceiling you enter (GiB/episode), CRF ${SERIES_CUSTOMSIZE_CRF_SEARCH_MIN}-${SERIES_CUSTOMSIZE_CRF_MAX} or the range you enter, search starts at ${SERIES_CUSTOMSIZE_CRF_START} (audio copied unchanged)"
 else
     crf_tier_load series Base
     printf '1) %-7s CRF %-7s <=%s GiB/episode\n' Base "${CRF_MIN}-${CRF_MAX}" "$CRF_CEILING_GIB"
@@ -814,16 +815,20 @@ else
     printf '3) %-7s exact CRF (0-%s)\n' Custom "$CRF_LIMIT"
     crf_tier_load series Compact
     printf '4) %-7s CRF %-7s <=%s GiB/h\n' Compact "${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR"
+    printf '5) %-7s CRF %-7s <=entered GiB/episode\n' "Custom size" "${SERIES_CUSTOMSIZE_CRF_SEARCH_MIN}-${SERIES_CUSTOMSIZE_CRF_MAX}"
 fi
 (( MULTI == 1 )) && echo "   (every season gets its own shared season CRF)"
 
 CUSTOM_CRF=""
 
-# Compact is 4 (after Custom) so the existing selections 1-3 keep their
-# meaning
+# Compact is 4 (after Custom) and Custom size 5, so the existing
+# selections keep their meaning. Custom size: TIER "Size<GiB>G" (naming.sh
+# size_tier_token; the ceiling is part of the tier, the output name and
+# the COMPRESSION_TIER tag) with the CRF range entered here
+# (policy.sh customsize_range_parse -> CUSTOMSIZE_CRF_*).
 while true; do
     ui_verbose && echo
-    read -rp "Select [1-4]: " t
+    read -rp "Select [1-5]: " t
 
     case "$t" in
         1) TIER="Base"; break ;;
@@ -838,11 +843,29 @@ while true; do
             done
             break
             ;;
+        5)
+            while true; do
+                read -rp "Video ceiling (GiB/episode, e.g. 1.2): " size_in || exit 0
+                TIER=$(size_tier_token "$size_in") && break
+                echo "Enter a positive number of GiB per episode, e.g. 1.2 or 0.75 (at most 3 decimals)."
+            done
+            while true; do
+                read -rp "CRF range [Enter = ${SERIES_CUSTOMSIZE_CRF_SEARCH_MIN}-${SERIES_CUSTOMSIZE_CRF_MAX}]: " range_in || exit 0
+                customsize_range_parse "$range_in" && break
+                echo "Invalid CRF range: $CUSTOMSIZE_RANGE_ERR."
+            done
+            break
+            ;;
         *) echo "Invalid selection." ;;
     esac
 done
 
 crf_tier_load series "$TIER" "$CUSTOM_CRF"
+# how the tier is shown ("Custom size 1.2 GiB/episode"; the others as is)
+TIER_LABEL=$(tier_display "$TIER")
+if size_tier_gib "$TIER" > /dev/null; then
+    printf '%s: CRF %s-%s, search starts at %s\n' "$TIER_LABEL" "$CRF_MIN" "$CRF_MAX" "$CRF_START"
+fi
 
 # Dolby Vision profile 7: the profile 8.1 conversion discards the
 # enhancement layer; asked or not depending on the tier and its type in
@@ -1007,7 +1030,7 @@ episode_over_ceiling_prompt() {
     else
         echo "$(ui_warn WARNING): $(ep_name "$i") cannot meet the ${CRF_CEILING_GIB} GiB per-episode video ceiling"
     fi
-    echo "within the allowed ${TIER} quality range: even CRF ${CRF_MAX} (the lowest quality ${TIER}"
+    echo "within the allowed ${TIER_LABEL} quality range: even CRF ${CRF_MAX} (the lowest quality ${TIER_LABEL}"
     echo "allows) is estimated at ~$(bytes_to_gib "${EP_EST[$i]}") GiB video, ~$(crf_oversize_gib "${EP_EST[$i]}" "$(series_ep_ceil "$i")") GiB above the ceiling."
     echo "------------------------------------------------------------"
     echo "1) Encode it anyway (the whole season at CRF ${CRF_MAX})"
@@ -1102,7 +1125,7 @@ season_crf() {
     # Compact: every episode's own ceiling from its exact runtime
     # (SERIES_EP_CEIL; empty for High / Base / Custom)
     if ! series_ep_ceilings "$TIER"; then
-        echo "$(ui_err "Episode runtime unknown")$( (( MULTI == 1 )) && echo " ($(season_name "$k"))"): no $TIER video ceiling can be calculated."
+        echo "$(ui_err "Episode runtime unknown")$( (( MULTI == 1 )) && echo " ($(season_name "$k"))"): no $TIER_LABEL video ceiling can be calculated."
         (( MULTI == 1 )) && echo "$(season_name "$k") is excluded."
         season_exclude "$k" "episode runtime unknown"
         SEASON_FAILED=1
@@ -1125,7 +1148,7 @@ season_crf() {
                 "$( (( DOWNSCALED == 1 )) && echo ", downscaled like the final encode")"
         else
             printf 'Estimating %s at %sx%s...\n' \
-                "$( [[ "$TIER" == "Custom" ]] && echo "CRF $CUSTOM_CRF" || echo "$TIER")" "$OUT_WIDTH" "$OUT_HEIGHT"
+                "$( [[ "$TIER" == "Custom" ]] && echo "CRF $CUSTOM_CRF" || echo "$TIER_LABEL")" "$OUT_WIDTH" "$OUT_HEIGHT"
         fi
     fi
 
@@ -1175,11 +1198,11 @@ season_crf() {
         if (( ${#SERIES_EP_CEIL[@]} )); then
             # Compact: the episode with the least room under its own ceiling
             echo "$(ui_warn WARNING): the ${CRF_GIB_PER_HOUR} GiB/h per-episode video ceilings cannot be met"
-            echo "within the allowed ${TIER} quality range: even CRF ${CRF_MAX} (the lowest quality ${TIER}"
+            echo "within the allowed ${TIER_LABEL} quality range: even CRF ${CRF_MAX} (the lowest quality ${TIER_LABEL}"
             echo "allows) gives $(ep_name "$SB_DECIDE_IDX") ~$(bytes_to_gib "$SB_DECIDE_BYTES") GiB video, ~$(crf_oversize_gib "$SB_DECIDE_BYTES" "$(series_ep_ceil "$SB_DECIDE_IDX")") GiB above its $(bytes_to_gib "$(series_ep_ceil "$SB_DECIDE_IDX")") GiB ceiling."
         else
             echo "$(ui_warn WARNING): the ${CRF_CEILING_GIB} GiB per-episode video ceiling cannot be met"
-            echo "within the allowed ${TIER} quality range: even CRF ${CRF_MAX} (the lowest quality ${TIER}"
+            echo "within the allowed ${TIER_LABEL} quality range: even CRF ${CRF_MAX} (the lowest quality ${TIER_LABEL}"
             echo "allows) gives a largest episode of ~$(bytes_to_gib "${CRF_EST[$CRF]}") GiB video, ~$(crf_oversize_gib "${CRF_EST[$CRF]}" "$CRF_CEILING_BYTES") GiB above the ceiling."
         fi
         echo "------------------------------------------------------------"
@@ -1332,7 +1355,7 @@ season_crf() {
         echo
         echo "------------------------------------------------------------"
         echo "Source-quality guard: ${#GUARD[@]} episode(s) are already below what"
-        echo "their ${TIER} CRF would need (a re-encode would not be smaller, only lossier):"
+        echo "their ${TIER_LABEL} CRF would need (a re-encode would not be smaller, only lossier):"
         for i in "${GUARD[@]}"; do
             printf "  %-40.40s source %s, CRF %s estimate ~%s\n" "$(ep_name "$i")" \
                 "$(size_text "${EP_VBYTES[$i]}")" "${EP_CRF[$i]}" "$(size_text "${EP_EST[$i]}")"
@@ -1409,7 +1432,7 @@ done
 if (( SUMMARY == 1 )); then
     echo
     printf 'Estimating %s at the output resolution of each season...\n' \
-        "$( [[ "$TIER" == "Custom" ]] && echo "CRF $CUSTOM_CRF" || echo "$TIER")"
+        "$( [[ "$TIER" == "Custom" ]] && echo "CRF $CUSTOM_CRF" || echo "$TIER_LABEL")"
 fi
 
 EXCL_BEFORE=${#EXCLUDED[@]}
@@ -1438,12 +1461,12 @@ season_preview() {
     if ui_verbose; then
         echo
         echo "------------------------------------------------------------"
-        echo "Tier:                 $TIER"
+        echo "Tier:                 $TIER_LABEL"
         if [[ "$TIER" == "Custom" ]]; then
             echo "Video encode:         x265 CRF ${CRF}, single pass, every episode (entered CRF)"
         else
             echo "Video encode:         x265 CRF ${CRF}, single pass, every episode"
-            echo "                      (${TIER}: CRF ${CRF_MIN}-${CRF_MAX}, $(series_ceiling_text) video ceiling$( (( CRF_OVER_CEILING == 1 || ${#ABOVE[@]} > 0 )) && echo "; ceiling NOT met"))"
+            echo "                      (${TIER_LABEL}: CRF ${CRF_MIN}-${CRF_MAX}, $(series_ceiling_text) video ceiling$( (( CRF_OVER_CEILING == 1 || ${#ABOVE[@]} > 0 )) && echo "; ceiling NOT met"))"
         fi
         echo "Resolution:           ${WIDTH}x${HEIGHT} -> ${OUT_WIDTH}x${OUT_HEIGHT}"
         echo "Dynamic range:        $(hdr_description)"
@@ -1831,7 +1854,7 @@ for k in "${ACTIVE[@]}"; do
         # HDR10+ kept) is a conflict; versions with other settings are kept
         # and this encode gets the next free " (N)" name without asking.
         path_taken "${EP_OUT[$i]}" || continue
-        sig=$(output_plan_sig "${EP_VIDEO[$i]}" "" "${DV_POLICY:-none}" "${HDR10P_POLICY:-none}")
+        sig=$(output_plan_sig "${EP_VIDEO[$i]}" "" "${DV_POLICY:-none}" "${HDR10P_POLICY:-none}" "$TIER")
         if [[ -z "$sig" ]]; then
             EP_MATCH[$i]="${EP_OUT[$i]}"
         else
@@ -1974,7 +1997,7 @@ fi
 # season_confirm_text  ->  "High | CRF 20 | 1920x1080 | SDR | audio
 # copied" of the loaded season (compact confirmation)
 season_confirm_text() {
-    printf '%s | %s | %sx%s | %s | audio copied%s' "$TIER" "$(ui_bold "CRF $CRF")" \
+    printf '%s | %s | %sx%s | %s | audio copied%s' "$TIER_LABEL" "$(ui_bold "CRF $CRF")" \
         "$OUT_WIDTH" "$OUT_HEIGHT" "$(hdr_policy_short)" \
         "$( (( CRF_OVER_CEILING == 1 || ${#ABOVE[@]} > 0 )) && echo " | $(ui_warn "ceiling not met")")"
 }

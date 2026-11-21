@@ -675,12 +675,21 @@ compression_tag_duplicates() {
 }
 
 # compression_tier_name TIER  ->  TIER when it is a menu CRF tier
-# (Quality / High / Base / Compact / Custom), else nothing
+# (Quality / High / Base / Compact / Custom), "Custom size 1.2 GiB" for the
+# series Custom size tier "Size1.2G" (or that name itself), else nothing
 compression_tier_name() {
     case "$1" in
         Quality|High|Base|Compact|Custom) printf '%s' "$1" ;;
+        *)
+            if [[ "$1" =~ ^Size([0-9]+([.][0-9]+)?)G$ || "$1" =~ ^Custom\ size\ ([0-9]+([.][0-9]+)?)\ GiB$ ]]; then
+                printf 'Custom size %s GiB' "${BASH_REMATCH[1]}"
+            fi
+            ;;
     esac
 }
+
+# COMPRESSION_TIER values compression_tier_name writes (an ERE)
+COMPRESSION_TIER_RE='^(Quality|High|Base|Compact|Custom|Custom size [0-9]+([.][0-9]+)? GiB)$'
 
 # work/logs/compression_tags.tsv: one row per finished CRF encode, written
 # by the job when the output got its final name (job_runtime.sh
@@ -735,7 +744,14 @@ compression_record_lookup() {
     [[ -n "$hits" ]] || return 1
 
     # tiers that are not menu CRF tiers are not recorded
-    hits=$(awk -F'\t' -v OFS='\t' '$2 !~ /^(Quality|High|Base|Compact|Custom)$/ { $2 = "-" } { print }' <<< "$hits")
+    # crf_estimates.tsv records the job's tier as it ran ("Size1.2G"):
+    # the tag name of it (compression_tier_name), "-" for no menu tier
+    local c t f mapped=""
+    while IFS=$'\t' read -r c t f; do
+        t=$(compression_tier_name "$t")
+        mapped+="$c"$'\t'"${t:--}"$'\t'"$f"$'\n'
+    done <<< "$hits"
+    hits="${mapped%$'\n'}"
     n=$(cut -f1,2 <<< "$hits" | sort -u | wc -l)
     (( n == 1 )) || return 2
     head -n 1 <<< "$hits"
@@ -893,19 +909,22 @@ _sig_crf() {
     awk -v c="$1" 'BEGIN { printf "%g", c }'
 }
 
-# output_plan_sig VIDEO_SPEC [TUNE [DV_POLICY [HDR10P_POLICY]]]
+# output_plan_sig VIDEO_SPEC [TUNE [DV_POLICY [HDR10P_POLICY [TIER]]]]
 #   ->  settings signature of a planned encode, comparable with
 #       output_file_sig: "crf=18 tune=- dv=1 hdr10p=0" / "copy dv=1 hdr10p=0"
 # VIDEO_SPEC "crf:N" or "copy"; "" for anything else (no signature: the
 # name-only conflict prompt is used). The tier and the 1080p downscale
-# are part of the output name already.
+# are part of the output name already. A Custom size TIER ("Size1.2G")
+# adds its ceiling (" size=1.2"): an output with another ceiling has
+# other settings.
 output_plan_sig() {
-    local spec="$1" tune="${2:-}" dv=0 h10p=0
+    local spec="$1" tune="${2:-}" dv=0 h10p=0 size=""
 
     [[ "${3:-}" == preserve ]] && dv=1
     [[ "${4:-}" == preserve ]] && h10p=1
+    [[ "${5:-}" =~ ^Size([0-9]+([.][0-9]+)?)G$ ]] && size=" size=${BASH_REMATCH[1]}"
     case "$spec" in
-        crf:*) printf 'crf=%s tune=%s dv=%s hdr10p=%s' "$(_sig_crf "${spec#crf:}")" "${tune:--}" "$dv" "$h10p" ;;
+        crf:*) printf 'crf=%s tune=%s dv=%s hdr10p=%s%s' "$(_sig_crf "${spec#crf:}")" "${tune:--}" "$dv" "$h10p" "$size" ;;
         copy)  printf 'copy dv=%s hdr10p=%s' "$dv" "$h10p" ;;
     esac
     return 0
@@ -938,7 +957,11 @@ output_file_sig() {
             exit 0
         fi
         x265_sei_options "$f" "$vidx" | grep -qx 'rc-grain' && tune=grain
-        printf 'crf=%s tune=%s dv=%s hdr10p=%s' "$(_sig_crf "$crf")" "$tune" "$HDR_DV" "$HDR_HDR10PLUS"
+        # Custom size: the ceiling recorded in COMPRESSION_TIER
+        local ctier size=""
+        IFS=$'\t' read -r _ ctier <<< "$(compression_tags "$f")"
+        [[ "$ctier" =~ ^Custom\ size\ ([0-9]+([.][0-9]+)?)\ GiB$ ]] && size=" size=${BASH_REMATCH[1]}"
+        printf 'crf=%s tune=%s dv=%s hdr10p=%s%s' "$(_sig_crf "$crf")" "$tune" "$HDR_DV" "$HDR_HDR10PLUS" "$size"
     ) || true
 }
 
@@ -954,6 +977,7 @@ output_sig_text() {
             tune=grain) out+=("film grain") ;;
             dv=1)       out+=("Dolby Vision") ;;
             hdr10p=1)   out+=("HDR10+") ;;
+            size=*)     out+=("Custom size ${w#size=} GiB") ;;
         esac
     done
     (( ${#out[@]} )) || out=("settings not readable")

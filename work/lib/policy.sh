@@ -39,8 +39,14 @@ POLICY_KEYS_CRF=(
     SERIES_COMPACT_CRF_SEARCH_MIN SERIES_COMPACT_CRF_START SERIES_COMPACT_CRF_MAX
 )
 
-# High / Base / Compact tiers (*_CRF_START / *_CRF_SEARCH_MIN / *_CRF_MAX)
-POLICY_CRF_TIERS=(MOVIE_HIGH MOVIE_BASE MOVIE_COMPACT SERIES_HIGH SERIES_BASE SERIES_COMPACT)
+# High / Base / Compact tiers (*_CRF_START / *_CRF_SEARCH_MIN / *_CRF_MAX);
+# series Custom size: the default CRF range of the menu prompt
+POLICY_CRF_TIERS=(MOVIE_HIGH MOVIE_BASE MOVIE_COMPACT SERIES_HIGH SERIES_BASE SERIES_COMPACT SERIES_CUSTOMSIZE)
+
+# Series Custom size: optional (a config without them gets these values;
+# set, they are validated like the other CRF keys)
+POLICY_CUSTOMSIZE_DEFAULTS=(SERIES_CUSTOMSIZE_CRF_START=18 SERIES_CUSTOMSIZE_CRF_SEARCH_MIN=11
+    SERIES_CUSTOMSIZE_CRF_MAX=30)
 
 # Former High / Base *_CRF_MIN: search start and hard floor in one. A
 # config that sets only it keeps the former behaviour (START = SEARCH_MIN
@@ -150,6 +156,18 @@ validate_policy() {
             errs+=("$k=\"$v\": outside the x265 CRF range 0-$CRF_LIMIT")
         elif [[ " ${POLICY_KEYS_COUNT[*]} " == *" $k "* ]] && (( 10#$v < 1 )); then
             errs+=("$k=\"$v\": must be at least 1")
+        fi
+    done
+
+    # series Custom size defaults (optional keys): whole CRF values
+    local d
+    for d in "${POLICY_CUSTOMSIZE_DEFAULTS[@]}"; do
+        k="${d%%=*}"
+        v="${!k:-}"
+        if [[ ! "$v" =~ ^[0-9]+$ ]]; then
+            errs+=("$k=\"$v\": must be a whole number")
+        elif (( 10#$v > CRF_LIMIT )); then
+            errs+=("$k=\"$v\": outside the x265 CRF range 0-$CRF_LIMIT")
         fi
     done
 
@@ -303,6 +321,7 @@ load_policy() {
 
     policy_retired_note
     _policy_legacy_crf_min
+    _policy_customsize_defaults
     validate_policy
 }
 
@@ -334,6 +353,55 @@ _policy_legacy_crf_min() {
         echo "      *_CRF_SEARCH_MIN instead to allow it:" >&2
         printf '        %s\n' "${mapped[@]}" >&2
     fi
+    return 0
+}
+
+# _policy_customsize_defaults  ->  SERIES_CUSTOMSIZE_CRF_* not set in the
+# config get their defaults (POLICY_CUSTOMSIZE_DEFAULTS)
+_policy_customsize_defaults() {
+    local d k
+    for d in "${POLICY_CUSTOMSIZE_DEFAULTS[@]}"; do
+        k="${d%%=*}"
+        [[ -n "${!k+x}" ]] || printf -v "$k" '%s' "${d#*=}"
+    done
+    return 0
+}
+
+# customsize_range_parse INPUT  ->  CUSTOMSIZE_CRF_MIN / _MAX / _START for
+# the series Custom size tier: "" (Enter) = SERIES_CUSTOMSIZE_CRF_SEARCH_MIN
+# - SERIES_CUSTOMSIZE_CRF_MAX, else "MIN-MAX" (whole CRFs 0-CRF_LIMIT, MIN
+# <= MAX). The search starts at SERIES_CUSTOMSIZE_CRF_START, moved into the
+# range when outside it. Returns 1 (CUSTOMSIZE_RANGE_ERR says why, nothing
+# set) for anything else.
+customsize_range_parse() {
+    local v="${1//[[:space:]]/}" lo hi st
+
+    CUSTOMSIZE_RANGE_ERR=""
+    _policy_customsize_defaults
+    if [[ -z "$v" ]]; then
+        lo="$SERIES_CUSTOMSIZE_CRF_SEARCH_MIN"
+        hi="$SERIES_CUSTOMSIZE_CRF_MAX"
+    elif [[ "$v" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        lo=$((10#${BASH_REMATCH[1]}))
+        hi=$((10#${BASH_REMATCH[2]}))
+        if (( lo > CRF_LIMIT || hi > CRF_LIMIT )); then
+            CUSTOMSIZE_RANGE_ERR="CRFs go from 0 to $CRF_LIMIT"
+            return 1
+        fi
+        if (( lo > hi )); then
+            CUSTOMSIZE_RANGE_ERR="the lower CRF comes first (MIN-MAX, e.g. 14-26)"
+            return 1
+        fi
+    else
+        CUSTOMSIZE_RANGE_ERR="enter MIN-MAX (whole CRFs, e.g. 14-26) or press Enter"
+        return 1
+    fi
+    st=$((10#$SERIES_CUSTOMSIZE_CRF_START))
+    if (( st < lo )); then st=$lo; fi
+    if (( st > hi )); then st=$hi; fi
+    CUSTOMSIZE_CRF_MIN=$lo
+    CUSTOMSIZE_CRF_MAX=$hi
+    CUSTOMSIZE_CRF_START=$st
     return 0
 }
 
@@ -518,7 +586,8 @@ crf_ceiling_tier() {
     case "${1:-}" in
         High|Base|Compact) return 0 ;;
     esac
-    return 1
+    # series Custom size ("Size1.2G")
+    [[ "${1:-}" =~ ^Size[0-9]+([.][0-9]+)?G$ ]]
 }
 
 # movie_ceiling_bytes GIB_PER_HOUR DURATION_SECONDS  ->  whole bytes
@@ -622,6 +691,10 @@ movie_floor_source_exempt() {
 # source exemption is the menu's (movie_floor_source_exempt).
 # Custom: CRF_START = CRF_MIN = CRF_MAX = CUSTOM_CRF, no ceiling
 # (CRF_CEILING_BYTES=0).
+# Series Custom size ("Size<GiB>G"): High / Base with the ceiling of the
+# tier name (GiB per episode) and the CRF range of the menu
+# (CUSTOMSIZE_CRF_MIN / _MAX / _START, customsize_range_parse; unset: the
+# SERIES_CUSTOMSIZE_CRF_* defaults).
 crf_tier_load() {
     local scope="${1^^}" tier="$2" u
 
@@ -681,6 +754,21 @@ crf_tier_load() {
             CRF_CEILING_GIB=""
             CRF_CEILING_BYTES=0
             ;;
+        Size*G)
+            if [[ "$scope" != SERIES || ! "$tier" =~ ^Size([0-9]+([.][0-9]+)?)G$ ]]; then
+                echo "crf_tier_load: unknown $1 tier $tier" >&2
+                return 1
+            fi
+            CRF_CEILING_GIB="${BASH_REMATCH[1]}"
+            CRF_CEILING_BYTES=$(_gib_bytes "$CRF_CEILING_GIB")
+            _policy_customsize_defaults
+            CRF_MIN="${CUSTOMSIZE_CRF_MIN:-$SERIES_CUSTOMSIZE_CRF_SEARCH_MIN}"
+            CRF_MAX="${CUSTOMSIZE_CRF_MAX:-$SERIES_CUSTOMSIZE_CRF_MAX}"
+            CRF_START="${CUSTOMSIZE_CRF_START:-$SERIES_CUSTOMSIZE_CRF_START}"
+            # (no trailing "&&": the menus run with set -e)
+            if (( CRF_START < CRF_MIN )); then CRF_START="$CRF_MIN"; fi
+            if (( CRF_START > CRF_MAX )); then CRF_START="$CRF_MAX"; fi
+            ;;
         Quality)
             # movie only; the "ceiling" is the upper edge of the band
             # (what the post-encode retry checks the actual video against)
@@ -733,7 +821,9 @@ crf_policy_lines() (
 
     crf_tier_load "$scope" "$tier" "${3:-}" "${4:-}" || return 1
 
-    echo "$tier video policy:"
+    local label="$tier"
+    [[ "$tier" =~ ^Size([0-9]+([.][0-9]+)?)G$ ]] && label="Custom size"
+    echo "$label video policy:"
     if [[ "$tier" == "Custom" ]]; then
         if [[ "$scope" == series ]]; then
             echo "  CRF: exact user CRF${CRF_MIN:+ ($CRF_MIN)}; no High/Base CRF range or size ceiling"
@@ -745,6 +835,8 @@ crf_policy_lines() (
         echo "  CRF range: ${CRF_MIN}-${CRF_MAX}, search starts at ${CRF_START} (lowest CRF at which every episode fits)"
         if series_rate_tier "$tier"; then
             echo "  video ceiling: ${CRF_GIB_PER_HOUR} GiB per hour of each episode's runtime (every episode its own ceiling)"
+        elif [[ "$label" == "Custom size" ]]; then
+            echo "  video ceiling: ${CRF_CEILING_GIB} GiB/episode (entered in the menu)"
         else
             echo "  video ceiling: ${CRF_CEILING_GIB} GiB/episode"
         fi

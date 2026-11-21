@@ -429,6 +429,8 @@ term_width() {
 # meta_text TIER CRF MANUAL [STATUS]  ->  "Base | CRF 21 (manual) | Encoding"
 meta_text() {
     local out="${1:-?}"
+    # series Custom size ("Size1.2G", naming.sh tier_display)
+    [[ "$out" =~ ^Size([0-9]+([.][0-9]+)?)G$ ]] && out="Custom size ${BASH_REMATCH[1]} GiB/episode"
     [[ -n "${2:-}" ]] && out+=" | CRF $2$( [[ "${3:-}" == 1 ]] && echo " (manual)")"
     [[ -n "${4:-}" ]] && out+=" | $4"
     printf '%s' "$out"

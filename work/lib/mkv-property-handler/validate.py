@@ -152,7 +152,8 @@ def check_compression(info, r, tiers):
         r.add("INFO", "Compression CRF", "not recorded (stream copy, two-pass or not from these scripts)")
 
     if info.tier:
-        if info.tier not in tiers:
+        # series Custom size: "Custom size <GiB> GiB" (compression_tier_name)
+        if info.tier not in tiers and not re.fullmatch(r"Custom size \d+(\.\d+)? GiB", info.tier):
             r.add("INVALID", "Compression tier", f"'{info.tier}' is not a tier name ({', '.join(tiers)})")
         if not info.crf:
             r.add("INCONSISTENT", "Compression tier", "present without COMPRESSION_CRF (the scripts always write both)")

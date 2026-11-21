@@ -297,6 +297,7 @@ _dv_el_name() {
 #   tier                  MEL         FEL                     unknown
 #   Quality               automatic   warning + confirmation  confirmation
 #   High / Base / Compact automatic   automatic + warning     confirmation
+#   (and series Custom size)
 #   Custom                automatic   confirmation            confirmation
 #
 # (there are no explicit Dolby Vision preservation settings, so Custom
@@ -311,7 +312,7 @@ dv_el_policy() {
     [[ "${DV_POLICY:-none}" == preserve && "${DV_MODE:-}" == 2 ]] || return 0
 
     case "${DV_EL_TYPE:-unknown}:$tier" in
-        MEL:High|MEL:Base|MEL:Compact)
+        MEL:High|MEL:Base|MEL:Compact|MEL:Size*G)
             # a FEL found later by the job is discarded automatically too
             DV_EL_DISCARD="MEL,FEL"
             return 0
@@ -320,11 +321,11 @@ dv_el_policy() {
             DV_EL_DISCARD="MEL"
             return 0
             ;;
-        FEL:High|FEL:Base|FEL:Compact)
+        FEL:High|FEL:Base|FEL:Compact|FEL:Size*G)
             DV_EL_DISCARD="MEL,FEL"
             echo
             echo "$(ui_warn WARNING): $label: Dolby Vision profile 7 with a FEL (full enhancement layer)."
-            echo "  $tier discards it automatically: only the RPU is kept (profile 8.1);"
+            echo "  $(tier_display "$tier" 2>/dev/null || echo "$tier") discards it automatically: only the RPU is kept (profile 8.1);"
             echo "  the FEL's additional picture data is not in the output."
             return 0
             ;;

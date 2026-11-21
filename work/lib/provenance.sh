@@ -184,10 +184,12 @@ _prov_op_type() {
 }
 
 # _prov_preset  ->  the menu preset of the item: Quality / High / Base /
-# Compact / Custom, "Audio <tiers>" for the audio menu, else the tier
-# label as the job recorded it
+# Compact / Custom, "Custom size 1.2 GiB" (series "Size1.2G"), "Audio
+# <tiers>" for the audio menu, else the tier label as the job recorded it
 _prov_preset() {
     local t="${ITEM_TIER:-}"
+
+    [[ "$t" =~ ^Size([0-9]+([.][0-9]+)?)G$ ]] && t="Custom size ${BASH_REMATCH[1]} GiB"
 
     t="${t//$'\t'/ }"
     t="${t//$'\n'/ }"

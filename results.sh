@@ -437,7 +437,7 @@ group_of() {
 declare -A F_SIZE=() F_SRC=() F_CRF=() F_TIER=() F_ISSUES=() F_TITLES=()
 declare -A G_EXTRA=()       # key -> issues not tied to one output (kept failed encodes)
 
-CRF_TIERS_RE='^(Quality|High|Base|Compact|Custom)$'
+CRF_TIERS_RE="$COMPRESSION_TIER_RE"   # encode_common.sh: the menu CRF tiers, Custom size included
 
 # crf_text VALUE  ->  "21", "20.5" ("" for none)
 crf_text() {

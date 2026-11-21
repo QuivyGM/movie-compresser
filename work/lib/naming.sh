@@ -8,10 +8,58 @@
 #            path below it, e.g. "Season 01", mirroring in/; older runs:
 #            "<series>[ 1080p] HEVC <Tier>/...")
 #   audio:   "<any of the above> AudioCompressed[ N].mkv"
-# Tier: Quality | High | Base | Compact | Normal | Custom | CRF<nn>
+# Tier: Quality | High | Base | Compact | Normal | Custom | CRF<nn> |
+#       Size<GiB>G (series "Custom size": the video ceiling per episode,
+#       e.g. "Size1.2G", "Size0.75G"; size_tier_token)
 
 NAMING_SUFFIX_RE=' AudioCompressed( [0-9]+)?$'
-NAMING_TIER_RE='( 1080p)? HEVC (Quality|High|Base|Compact|Normal|Custom|CRF[0-9]+)( EAC3)?( \([0-9]+\))?$'
+NAMING_TIER_WORD='(Quality|High|Base|Compact|Normal|Custom|CRF[0-9]+|Size[0-9]+([.][0-9]+)?G)'
+NAMING_TIER_RE="( 1080p)? HEVC $NAMING_TIER_WORD( EAC3)?( \\([0-9]+\\))?\$"
+
+# ------------------------------------------------------------
+# Custom size tier (series): TIER = "Size<GiB>G", the per-episode video
+# ceiling the user entered, in the output name as it is. Shown as
+# "Custom size 1.2 GiB/episode", recorded as COMPRESSION_TIER
+# "Custom size 1.2 GiB" (encode_common.sh compression_tier_name).
+# ------------------------------------------------------------
+
+# size_gib_norm INPUT  ->  INPUT as a canonical positive GiB value
+# ("1.20" -> "1.2", ".75" -> "0.75", "2" -> "2"); non-zero (nothing
+# printed) for anything else: not a plain decimal number, zero, more
+# than 3 decimals, above 1000
+size_gib_norm() {
+    local v="${1:-}"
+    v="${v//[[:space:]]/}"
+    [[ "$v" =~ ^([0-9]*)([.]([0-9]{1,3}))?$ && -n "${BASH_REMATCH[1]}${BASH_REMATCH[3]}" ]] || return 1
+    awk -v v="$v" 'BEGIN {
+        if (v + 0 <= 0 || v + 0 > 1000) exit 1
+        s = sprintf("%.3f", v + 0); sub(/0+$/, "", s); sub(/[.]$/, "", s); print s }'
+}
+
+# size_tier_token GIB  ->  "Size1.2G" (GIB normalised by size_gib_norm)
+size_tier_token() {
+    local g
+    g=$(size_gib_norm "$1") || return 1
+    printf 'Size%sG' "$g"
+}
+
+# size_tier_gib TIER  ->  the GiB of a "Size<GiB>G" tier ("1.2");
+# non-zero for every other tier
+size_tier_gib() {
+    [[ "${1:-}" =~ ^Size([0-9]+([.][0-9]+)?)G$ ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# tier_display TIER  ->  how a tier is shown: "Custom size 1.2 GiB/episode"
+# for a Size tier, every other tier as it is
+tier_display() {
+    local g
+    if g=$(size_tier_gib "${1:-}"); then
+        printf 'Custom size %s GiB/episode' "$g"
+    else
+        printf '%s' "${1:-}"
+    fi
+}
 
 # series_output_dir OUT_ROOT SERIES_DIR [GROUP_REL]
 #   ->  OUT_ROOT/<SERIES_DIR basename>[/GROUP_REL]
@@ -53,7 +101,7 @@ output_source_stem() {
         -e "s/$NAMING_TIER_RE//" <<< "$n"
 }
 
-# output_tier NAME  ->  Quality / High / ... / CRF20 (+ " + EAC3",
+# output_tier NAME  ->  Quality / High / ... / CRF20 / Custom size 1.2 GiB (+ " + EAC3",
 # " + AudioCompressed"), or "Unknown"
 output_tier() {
     local n="$1"
@@ -77,8 +125,11 @@ output_tier() {
         return
     fi
 
-    tier=$(grep -oE 'HEVC (Quality|High|Base|Compact|Normal|Custom|CRF[0-9]+)( EAC3)?' <<< "$n" |
+    tier=$(grep -oE "HEVC $NAMING_TIER_WORD( EAC3)?" <<< "$n" |
         tail -n 1 | sed -E 's/^HEVC //; s/ EAC3$/ + EAC3/')
+    # Custom size: "Custom size 1.2 GiB" (as the COMPRESSION_TIER tag)
+    [[ "$tier" =~ ^Size([0-9]+([.][0-9]+)?)G(.*)$ ]] &&
+        tier="Custom size ${BASH_REMATCH[1]} GiB${BASH_REMATCH[3]}"
 
     [[ "$n" =~ \ 1080p\ HEVC\  ]] && tier="$tier (1080p)"
 
