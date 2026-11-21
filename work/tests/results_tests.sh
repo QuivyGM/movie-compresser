@@ -143,17 +143,23 @@ check "2 no prompt, no errors"           "! grep -qiE 'select|\\[y/N\\]|command 
 echo
 echo "== 1 last job"
 L="$LOGS/compression_tags.tsv"
+# Every record time is one instant (UTC below), written the way the job
+# writes it: the ledger in local time (date '+%F %T'), the provenance
+# journal / spool in UTC, job.state as an epoch. The order of the jobs is
+# then the same in every timezone (TZ=UTC, TZ=Asia/Seoul, ...).
+lt()  { date -d "$1" '+%F %T'; }       # ledger time of an instant
+hm()  { date -d "$1" '+%F %H:%M'; }    # header time of an instant
 snapshot > "$T/snap.nojob"
 check "2 the run itself changed nothing"   "diff -q <(snapshot) '$T/snap.nojob' > /dev/null"
 printf '%s\n' "$COMPRESSION_LEDGER_HEADER" > "$L"
-printf '2026-11-20 10:00:00\t%s\t21\tHigh\t%s\tseries1\t%s\n' \
-    "$O1/Columbo S01E01 HEVC High.mkv" "$VB" "$IN/$C/Season 01/Columbo S01E01.mkv" >> "$L"
-printf '2026-11-20 10:05:00\t%s\t21\tHigh\t%s\tseries1\t%s\n' \
-    "$O1/Columbo S01E02 HEVC High.mkv" "$VB" "$IN/$C/Season 01/Columbo S01E02.mkv" >> "$L"
-printf '2026-11-21 09:30:00\t%s\t21\tHigh\t%s\tc1\t%s\n' \
-    "$OUT/Movie A (2001) HEVC High.mkv" "$VB" "$IN/Movie A (2001).mkv" >> "$L"
+printf '%s\t%s\t21\tHigh\t%s\tseries1\t%s\n' \
+    "$(lt 2026-11-20T01:00:00Z)" "$O1/Columbo S01E01 HEVC High.mkv" "$VB" "$IN/$C/Season 01/Columbo S01E01.mkv" >> "$L"
+printf '%s\t%s\t21\tHigh\t%s\tseries1\t%s\n' \
+    "$(lt 2026-11-20T01:05:00Z)" "$O1/Columbo S01E02 HEVC High.mkv" "$VB" "$IN/$C/Season 01/Columbo S01E02.mkv" >> "$L"
+printf '%s\t%s\t21\tHigh\t%s\tc1\t%s\n' \
+    "$(lt 2026-11-21T00:30:00Z)" "$OUT/Movie A (2001) HEVC High.mkv" "$VB" "$IN/Movie A (2001).mkv" >> "$L"
 rs "$T/job1.log"
-check "1 ledger: header of the latest job"  "head -n1 '$T/job1.log' | grep -qx 'Last job: c1, finished 2026-11-21 09:30'"
+check "1 ledger: header of the latest job"  "head -n1 '$T/job1.log' | grep -qx \"Last job: c1, finished \$(hm 2026-11-21T00:30:00Z)\""
 check "1 ledger: only that job's output"    "grep -q '^  Movie A (2001) HEVC High.mkv ' '$T/job1.log' && ! grep -q 'Movie B' '$T/job1.log' && ! grep -q 'Columbo' '$T/job1.log'"
 
 # provenance journal: series1 again (session name reused), a later job
@@ -168,7 +174,7 @@ print(json.dumps({"entry": "output", "id": "x", "op": {"time": t, "recorded": t,
 jrec 2026-11-21T03:00:00Z series1 "$LOGS/series1-20261121-115500" "$OUT/$C/Season 02/Columbo S02E01 HEVC High.mkv"
 jrec 2026-11-21T03:01:00Z series1 "$LOGS/series1-20261121-115500" "$OUT/$C/Season 02/Columbo S02E99 HEVC High.mkv"
 rs "$T/job2.log"
-check "1 journal: later job wins"           "head -n1 '$T/job2.log' | grep -qx \"Last job: series1, finished \$(date -d 2026-11-21T03:01:00Z '+%F %H:%M')\""
+check "1 journal: later job wins"           "head -n1 '$T/job2.log' | grep -qx \"Last job: series1, finished \$(hm 2026-11-21T03:01:00Z)\""
 check "1 journal: same session name, only this run" "grep -qE '^  Season 02 ' '$T/job2.log' && ! grep -qE '^  Season 01 ' '$T/job2.log'"
 check "1 recorded output no longer in out/ noted" "sed -n 2p '$T/job2.log' | grep -qx '(1 recorded output of this job no longer in out/)'"
 
@@ -190,7 +196,7 @@ printf '%s\n' version=1 session=series2 status=failed ok=1 failed=1 started=1 \
     "updated=$(date -d 2026-11-21T05:10:00Z +%s)" "log_dir=$LOGS/series2-20261121-135900" \
     > "$LOGS/series2-20261121-135900/job.state"
 rs "$T/job5.log"
-check "1 spool event + failed job state"    "head -n1 '$T/job5.log' | grep -qx \"Last job: series2, finished \$(date -d 2026-11-21T05:10:00Z '+%F %H:%M') with 1 failed item\""
+check "1 spool event + failed job state"    "head -n1 '$T/job5.log' | grep -qx \"Last job: series2, finished \$(hm 2026-11-21T05:10:00Z) with 1 failed item\""
 check "1 its output, kept verify-failed encode next to it" \
     "grep -qx 'Other Show' '$T/job5.log' && grep -q 'Other S01E02 HEVC High.mkv.verify-failed: verification mismatch' '$T/job5.log' && ! grep -q Columbo '$T/job5.log'"
 
@@ -270,8 +276,8 @@ rs "$T/titles.log" "$O1/Columbo S01E02 HEVC High.mkv"
 check "6 titles only: counted, status OK"  "grep -qE '^  Season 01 +1 .* 1 of 1 +OK\$' '$T/titles.log' && ! grep -q 'Issues:' '$T/titles.log'"
 check "6 clean episode: OK, titles OK"     "grep -qE '^  Season 01 +1 .* OK +OK\$' '$T/file.log'"
 # a job record of this encode with another CRF: tag vs record mismatch
-printf '2026-11-19 08:00:00\t%s\t25\tBase\t%s\tseries9\t%s\n' \
-    "$OUT/Other Show/Season 01/Other S01E01 HEVC High.mkv" "$VB" "$IN/Other Show/Season 01/Other S01E01.mkv" >> "$L"
+printf '%s\t%s\t25\tBase\t%s\tseries9\t%s\n' \
+    "$(lt 2026-11-18T23:00:00Z)" "$OUT/Other Show/Season 01/Other S01E01 HEVC High.mkv" "$VB" "$IN/Other Show/Season 01/Other S01E01.mkv" >> "$L"
 snapshot > "$T/snap.before"
 rs "$T/rec.log" "Other Show"
 rs "$T/rec_all.log" --all

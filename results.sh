@@ -48,7 +48,10 @@
 #                      Enter or failed; running and interrupted jobs are
 #                      never "finished"
 # The job with the latest end time that has at least one recorded output
-# still in out/ is shown.
+# still in out/ is shown. All times are compared as epochs: the journal /
+# spool times are UTC ("Z"), the ledger rows local time of this machine
+# (as the job wrote them: date '+%F %T'), job.state epochs; the log folder
+# names are only used as job identities, never as times.
 set -u
 
 BASE="$HOME/compress"
