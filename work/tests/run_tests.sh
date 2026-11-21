@@ -70,6 +70,9 @@
 #     shared CRF per season, per-season job batches, progress-check
 #     season queue, verify.sh scope / grouped summary (stand-ins, no
 #     ffmpeg: series_seasons_tests.sh)
+# 20. results.sh: last-job / path / --all scope, invalid paths, summary
+#     numbers, issues vs titles-only, read-only (results_tests.sh; needs
+#     ffmpeg with libx265 and mkvpropedit)
 #
 # Runs in a temporary copy of work/ so real logs/jobs are untouched.
 # Everything here is synthetic: it proves the mechanics, not behaviour
@@ -2400,6 +2403,14 @@ grep -E '^  (ok|FAIL) ' "$T/dir_layout.out"
 PASS=$((PASS + $(grep -c '^  ok ' "$T/dir_layout.out")))
 FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/dir_layout.out")))
 grep -q '^SKIP: ' "$T/dir_layout.out" && SKIPPED+=("dir_layout_tests.sh (no real symlinks)")
+
+echo
+echo "== results.sh summary of out/ (results_tests.sh)"
+bash "$SRC_WORK/tests/results_tests.sh" > "$T/results.out" 2>&1
+grep -E '^  (ok|FAIL) ' "$T/results.out"
+PASS=$((PASS + $(grep -c '^  ok ' "$T/results.out")))
+FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/results.out")))
+while IFS= read -r s; do SKIPPED+=("${s#skipped: }"); done < <(grep '^skipped: ' "$T/results.out")
 
 echo
 echo "============================================================"
