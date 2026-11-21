@@ -16,7 +16,8 @@
 #      (a retry in one never re-encodes the other); job scripts without
 #      season markers run as generated
 #   7. progress-check.sh: one queue row per season (-v: every episode)
-#   8. verify.sh: scope (all / one show / one season), grouped summary
+#   8. verify.sh: path scope (Location from the path), --brief, grouped
+#      summary (season header, one line per episode, totals)
 #
 #   bash ~/compress/work/tests/series_seasons_tests.sh
 #
@@ -564,28 +565,40 @@ ep "$OC/Season 01/Columbo S01E01 HEVC High.mkv"
 ep "$OC/Season 01/Columbo S01E07 HEVC High.mkv"        # no source
 ep "$OC/Season 00 - Specials/Columbo S00E01 HEVC High.mkv"
 ep "$CB/out/Flat/Flat S01E01 HEVC High.mkv"
-vrun() { printf "$1" | HOME="$H" PATH="$STUB:$PATH" timeout 60 bash "$CB/verify.sh" > "$2" 2>&1; }
+vrun() { local in="$1" log="$2"; shift 2; printf "$in" | HOME="$H" PATH="$STUB:$PATH" timeout 60 bash "$CB/verify.sh" "$@" > "$log" 2>&1; }
 
-vrun "2\n1\n1\n" "$T/v1.log"
-check "8 scope menu"                             "grep -qx '1) All' '$T/v1.log' && grep -qx '2) One show (folder)' '$T/v1.log' && grep -qx '3) One season of a show' '$T/v1.log'"
-check "8 header per show, sub-header per season" "grep -qx 'Columbo (1968)' '$T/v1.log' && grep -qx -- '-- Season 00 - Specials' '$T/v1.log' && grep -qx -- '-- Season 01' '$T/v1.log' && grep -qx 'Flat' '$T/v1.log' && grep -qx -- '-- (root)' '$T/v1.log'"
-check "8 one summary line per file" \
-    "grep -qE '^  Columbo S01E01 HEVC High\\.mkv +High +[0-9.]+ GiB  VERIFIED\$' '$T/v1.log' && grep -qE '^  Columbo S01E07 HEVC High\\.mkv +High +[0-9.]+ GiB  UNPAIRED\$' '$T/v1.log'"
-check "8 detail only for a file that is not VERIFIED" \
+vrun "2\n1\n" "$T/v1.log"
+check "8 no Scope prompt (Location + Mode only)" "grep -qx '2) OUT' '$T/v1.log' && grep -qx '1) Verify' '$T/v1.log' && ! grep -qi 'scope:\|one show\|one season' '$T/v1.log'"
+check "8 header per show, sub-header per season" \
+    "grep -qx '== Columbo (1968)' '$T/v1.log' && grep -q '^-- Season 00 - Specials: 1 episode, ' '$T/v1.log' && grep -q '^-- Season 01: 2 episodes, ' '$T/v1.log' && grep -qx '== Flat' '$T/v1.log' && grep -q '^-- (root): 1 episode' '$T/v1.log'"
+check "8 one line per episode (S00E01 labels)" \
+    "grep -qE '^  S01E01  .*  OK\$' '$T/v1.log' && grep -qE '^  S01E07  .*  UNPAIRED\$' '$T/v1.log'"
+check "8 detail only for a real problem (unpaired)" \
     "grep -q '^    Columbo (1968)/Season 01/Columbo S01E07 HEVC High.mkv\$' '$T/v1.log' && ! grep -q '^    Columbo (1968)/Season 01/Columbo S01E01 HEVC High.mkv\$' '$T/v1.log'"
+check "8 no whitespace-only lines"               "! grep -qE '^[[:space:]]+\$' '$T/v1.log'"
 check "8 nested output paired with its season source" "! grep -q 'S00E01.*UNPAIRED' '$T/v1.log'"
-check "8 per-season totals and overall totals" \
-    "grep -qE '^  Columbo \\(1968\\) / Season 01 +2 files +1 verified +1 issues\$' '$T/v1.log' && grep -qE '^  Flat / \\(root\\) +1 files +1 verified +0 issues\$' '$T/v1.log' && grep -q '^Files checked:     4\$' '$T/v1.log' && grep -q '^Unpaired outputs:  1\$' '$T/v1.log'"
+check "8 total line" \
+    "grep -qx 'Total: 2 shows, 3 seasons, 4 files; problems: 1 (0 CHECK REQUIRED, 1 UNPAIRED); titles to correct: 0' '$T/v1.log'"
 
-vrun "2\n1\n2\n2\n" "$T/v2.log"
-check "8 one show"                               "grep -qE '^ 2\\) Flat\$' '$T/v2.log' && grep -q '^Files checked:     1\$' '$T/v2.log' && ! grep -q 'Columbo S01E01' '$T/v2.log'"
-vrun "2\n1\n3\n1\n2\n" "$T/v3.log"
-check "8 one season (series_season_groups)"      "grep -qE '^ 1\\) Season 00 - Specials  \\(1 file\\)\$' '$T/v3.log' && grep -q '^Files checked:     2\$' '$T/v3.log' && grep -qx -- '-- Season 01' '$T/v3.log' && ! grep -q 'S00E01 HEVC' <(sed -n '/^-- /,\$p' '$T/v3.log')"
-COMPRESS_VERBOSE=1 vrun "2\n1\n3\n1\n2\n" "$T/v4.log"
-printf '2\n1\n3\n1\n2\n' | COMPRESS_VERBOSE=1 HOME="$H" PATH="$STUB:$PATH" timeout 60 bash "$CB/verify.sh" > "$T/v4.log" 2>&1
+vrun "1\n" "$T/v2.log" out/Flat
+check "8 path: show (Location from the path)"   "! grep -q 'Location:' '$T/v2.log' && grep -qx 'Verify: out/Flat' '$T/v2.log' && grep -q '^Total: 1 show, 1 season, 1 file;' '$T/v2.log' && ! grep -q 'S01E01  .*UNPAIRED' '$T/v2.log'"
+vrun "" "$T/v2b.log" --verify "Columbo (1968)/Season 01/Columbo S01E07 HEVC High.mkv"
+check "8 path: file relative to out/"           "grep -qx 'Verify: out/Columbo (1968)/Season 01/Columbo S01E07 HEVC High.mkv' '$T/v2b.log' && grep -q '^Total: 1 show, 1 season, 1 file;' '$T/v2b.log'"
+vrun "" "$T/v3.log" --verify "out/Columbo (1968)/Season 01"
+check "8 path: season, --verify (no prompt)"   "! grep -q 'Select' '$T/v3.log' && grep -q '^Total: 1 show, 1 season, 2 files;' '$T/v3.log' && ! grep -q 'S00E01' '$T/v3.log'"
+COMPRESS_VERBOSE=1 vrun "" "$T/v4.log" --verify "$OC/Season 01"
 check "8 COMPRESS_VERBOSE=1: detail for every file" "grep -q '^    Columbo (1968)/Season 01/Columbo S01E01 HEVC High.mkv\$' '$T/v4.log'"
-vrun "1\n1\n1\n" "$T/v5.log"
-check "8 IN: sources grouped, extras folder its own group" "grep -qx -- '-- Extras' '$T/v5.log' && grep -qE '^  Columbo S01E01\\.mkv +source +' '$T/v5.log'"
+vrun "" "$T/v5.log" --verify --brief "$OC"
+check "8 --brief: one line per season"          "[[ \$(grep -c '^  Columbo (1968) / ' '$T/v5.log') == 2 ]] && grep -q '^  Columbo (1968) / Season 01: 2 eps, video .*, 1 OK, 1 UNPAIRED' '$T/v5.log' && ! grep -q '^  S01E01' '$T/v5.log'"
+vrun "1\n1\n" "$T/v6.log"
+check "8 IN: sources grouped, extras folder its own group" "grep -q '^-- Extras: 1 episode' '$T/v6.log' && grep -qE '^  S01E01  ' '$T/v6.log'"
+vrun "" "$T/v7.log" --verify "Columbo (1968)"
+eq    "8 path in both in/ and out/: exit 1"     "$(HOME="$H" PATH="$STUB:$PATH" bash "$CB/verify.sh" --verify "Columbo (1968)" > /dev/null 2>&1; echo $?)" 1
+check "8 path in both in/ and out/: clear error" "grep -q 'found in both in/ and out/' '$T/v7.log'"
+vrun "" "$T/v8.log" --verify "No Such Show"
+check "8 missing path: clear error"             "grep -q '^verify.sh: No Such Show: not found' '$T/v8.log' && ! grep -q 'Select' '$T/v8.log'"
+vrun "" "$T/v9.log" --verify /etc
+check "8 path outside in/ and out/: refused"    "grep -q 'not inside' '$T/v9.log'"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

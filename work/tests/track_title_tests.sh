@@ -344,7 +344,7 @@ rm -rf "$VH/compress/work/tests" "$VH/compress/work/logs"
 cp "$ROOT/verify.sh" "$VH/compress/"
 cp "$T/f/SDR.mkv" "$VH/compress/out/Bad HEVC High.mkv"           # release / stale / missing titles
 cp "$T/out/sdr.mkv" "$VH/compress/out/Good HEVC Custom.mkv"       # a finalized output
-printf '2\n1\n' | HOME="$VH" bash "$VH/compress/verify.sh" > "$T/v1.log" 2>&1
+printf '2\n1\n' | COMPRESS_VERBOSE=1 HOME="$VH" bash "$VH/compress/verify.sh" > "$T/v1.log" 2>&1
 check "Verify: release video title STALE"       "grep 'Video title *\"$REL\" - STALE (the stream is not: ' '$T/v1.log' | grep -q 'HEVC' && grep 'Video title *\"$REL\" - STALE' '$T/v1.log' | grep -q '2160p'"
 check "Verify: proposes the standard title"     "grep -A1 'Video title *\"$REL\"' '$T/v1.log' | grep -q -- '-> \"AVC | 720p | 8-bit\"'"
 check "Verify: missing audio title reported"     "grep -q 'no title - MISSING' '$T/v1.log'"
@@ -352,7 +352,7 @@ if (( HAVE_MKV == 1 )); then
     check "Verify: finalized output fully standard" "awk '/Good HEVC Custom/,/Track titles/' '$T/v1.log' | grep -q 'Track titles *OK (nothing to correct)'"
     check "verify_titles.sh agrees (window_tagger)" "bash '$VH/compress/work/lib/mkv-property-handler/verify_titles.sh' '$VH/compress/out/Good HEVC Custom.mkv' | grep -q \$'^Track titles\\tOK'"
     before=$(payload "$VH/compress/out/Bad HEVC High.mkv")
-    printf '2\n2\n' | HOME="$VH" bash "$VH/compress/verify.sh" > "$T/v2.log" 2>&1
+    printf '2\n2\n' | COMPRESS_VERBOSE=1 HOME="$VH" bash "$VH/compress/verify.sh" > "$T/v2.log" 2>&1
     check "Validate + update: titles corrected"   "grep -q 'Track titles *UPDATED' '$T/v2.log'"
     eq    "Validate + update: standard video title" "$(vtitle "$VH/compress/out/Bad HEVC High.mkv")" "AVC | 720p | 8-bit"
     B="$VH/compress/out/Bad HEVC High.mkv"
@@ -360,8 +360,8 @@ if (( HAVE_MKV == 1 )); then
           "Japanese | DTS | 5.1 | 1536 kbps/English | TrueHD | 5.1 | $(bps_kbps "$B" 1) kbps/Japanese | PCM | 2.0 | 2304 kbps/English | AAC | 2.0 | $(bps_kbps "$B" 3) kbps | Director's Commentary/AC-3 | 2.0 | 192 kbps/"
     eq    "Validate + update: streams untouched"  "$(payload "$B")" "$before"
     eq    "Validate + update: mkvmerge -J agrees" "$(mkvnames "$B")" "$(ffnames "$B")"
-    printf '2\n2\n' | HOME="$VH" bash "$VH/compress/verify.sh" > "$T/v3.log" 2>&1
-    check "repeat: nothing rewritten"             "grep -q 'Titles updated:    0' '$T/v3.log' && grep -q 'Titles to correct: 0' '$T/v3.log'"
+    printf '2\n2\n' | COMPRESS_VERBOSE=1 HOME="$VH" bash "$VH/compress/verify.sh" > "$T/v3.log" 2>&1
+    check "repeat: nothing rewritten"             "grep -q ', titles 0 files (0 titles)' '$T/v3.log' && grep -q 'titles to correct: 0\$' '$T/v3.log'"
 fi
 
 # ------------------------------------------------------------

@@ -124,11 +124,11 @@ mkdir -p "$H/compress/in" "$H/compress/out"
 cp -r "$SRC_WORK" "$H/compress/work"; rm -rf "$H/compress/work/tests"
 cp "$ROOT/verify.sh" "$H/compress/"
 cp "$F" "$H/compress/out/V.mkv"
-printf '2\n1\n' | HOME="$H" bash "$H/compress/verify.sh" > "$T/verify.log" 2>&1
+printf '2\n1\n' | COMPRESS_VERBOSE=1 HOME="$H" bash "$H/compress/verify.sh" > "$T/verify.log" 2>&1
 check "9: Verify leaves the file unchanged"     "cmp -s '$F' '$H/compress/out/V.mkv'"
 check "9: Verify reports the planned names"     "grep -q -- '-> \"Japanese | AC-3 | 5.1 | 640 kbps\"' '$T/verify.log' && grep -q 'Verify does not modify files' '$T/verify.log'"
 check "9: Verify shows the unparsed warning"    "grep -q 'WARNING: description \"Nolan\" not recognised' '$T/verify.log'"
-printf '2\n2\n' | HOME="$H" bash "$H/compress/verify.sh" > "$T/validate.log" 2>&1
+printf '2\n2\n' | COMPRESS_VERBOSE=1 HOME="$H" bash "$H/compress/verify.sh" > "$T/validate.log" 2>&1
 # Validate + update also refreshes the statistics (its own design): the
 # variable-rate tracks then carry a measured rate, the rest is identical
 VT=$(atitles "$H/compress/out/V.mkv")

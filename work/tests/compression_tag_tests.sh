@@ -572,11 +572,12 @@ if (( HAVE_FFMPEG == 1 )); then
         -map_metadata 0 "$T/reencoded.mkv"
     eq    "ffmpeg: source provenance not carried into a new encode" "$(compression_provenance "$T/reencoded.mkv")" $'-\t-\t-'
     eq    "ffmpeg: other source tags still carried" "$(compression_tags "$T/reencoded.mkv")" $'23\tBase'
-    printf '2\n1\n' | HOME="$VH" bash "$VH/compress/verify.sh" > "$T/verify.log" 2>&1
+    printf '2\n1\n' | COMPRESS_VERBOSE=1 HOME="$VH" bash "$VH/compress/verify.sh" > "$T/verify.log" 2>&1
     tr -d '\r' < "$T/verify.log" > "$T/verify.txt"
-    # vsec NAME  ->  the rows verify.sh printed for "NAME HEVC High.mkv"
-    vsec() { awk -v n="$1 HEVC High.mkv" '/^[^ =]/ { cur = $0 } cur == n' "$T/verify.txt"; }
-    check "verify.sh: all files checked"         "grep -q 'Files checked: *3' '$T/verify.txt'"
+    # vsec NAME  ->  the rows of the detail block verify.sh printed for
+    # "NAME HEVC High.mkv" (indented by 4 under its episode line)
+    vsec() { awk -v n="$1 HEVC High.mkv" '/^    [^ =]/ { cur = substr($0, 5) } cur == n { print substr($0, 5) }' "$T/verify.txt"; }
+    check "verify.sh: all files checked"         "grep -q '^Total: .*, 3 files;' '$T/verify.txt'"
     check "verify.sh: old output CRF Not recorded" "vsec Old | grep -qE '^  Compression CRF +Not recorded\$'"
     check "verify.sh: old output tier Not recorded" "vsec Old | grep -qE '^  Compression tier +Not recorded\$'"
     check "verify.sh: old output version Not recorded" "vsec Old | grep -qE '^  Compressor version +Not recorded\$'"
@@ -707,45 +708,45 @@ if (( HAVE_FFMPEG == 1 && HAVE_MKV == 1 )); then
     sums()  { (cd "$BO" && md5sum -- *.mkv); }
     crfs()  { local n; for n in Missing Stale NoRecord Kept; do printf '%s=%s ' "$n" "$(compression_tags "$BO/$n HEVC High.mkv" | tr '\t' /)"; done; }
     ncrf()  { local n; for n in Missing Stale NoRecord Kept; do mkvextract "$BO/$n HEVC High.mkv" tags "$T/n.xml" > /dev/null 2>&1; printf '%s ' "$(grep -c '<Name>COMPRESSION_CRF</Name>' "$T/n.xml")"; done; }
-    rows()  { tr -d '\r' < "$T/$1.log" | awk -v n="$2 HEVC High.mkv" '/^[^ =]/ { cur = $0 } cur == n && /Compress/'; }
+    rows()  { tr -d '\r' < "$T/$1.log" | awk -v n="$2 HEVC High.mkv" '/^    [^ =]/ { cur = substr($0, 5) } cur == n && /Compress/ { print substr($0, 5) }'; }
     M0=$(for n in Missing Stale NoRecord Kept; do meta "$n"; done)
     S0=$(sums)
 
-    printf '2\n1\n' | HOME="$BH" bash "$BH/compress/verify.sh" > "$T/bv.log" 2>&1
+    printf '2\n1\n' | COMPRESS_VERBOSE=1 HOME="$BH" bash "$BH/compress/verify.sh" > "$T/bv.log" 2>&1
     eq    "Verify: no file modified"             "$(sums)" "$S0"
     check "Verify: missing tags reported, not failed" "rows bv Missing | grep -qE '^  Compression CRF +Not recorded\$'"
     check "Verify: missing version reported, not failed" "rows bv Missing | grep -qE '^  Compressor version +Not recorded\$'"
     check "Verify: stale value reported as stored" "rows bv Stale | grep -qE '^  Compression CRF +30\$'"
     check "Verify: historical version reported"  "rows bv Stale | grep -qE '^  Compressor version +v1\\.0\\.0-3-gdeadbee\$'"
     check "Verify: no backfill"                  "! grep -q 'Compression tags' '$T/bv.log'"
-    check "Verify: missing audio title reported" "grep -q 'no title - MISSING' '$T/bv.log' && grep -q 'Titles to correct: 4' '$T/bv.log'"
+    check "Verify: missing audio title reported" "grep -q 'no title - MISSING' '$T/bv.log' && grep -q 'titles to correct: 4\$' '$T/bv.log'"
     atitles() { local n; for n in Missing Stale NoRecord Kept; do printf '%s ' "$(ffprobe -v error -select_streams a:0 -show_entries stream_tags=title -of default=nw=1:nk=1 "$BO/$n HEVC High.mkv" | tr -d '\r')"; done; }
     pay() { local n; for n in Missing Stale NoRecord Kept; do ffmpeg -v error -i "$BO/$n HEVC High.mkv" -map 0 -c copy -f streamhash -hash md5 - 2>/dev/null; done; }
     P0=$(pay)
 
-    printf '2\n2\n' | HOME="$BH" bash "$BH/compress/verify.sh" > "$T/bu1.log" 2>&1
+    printf '2\n2\n' | COMPRESS_VERBOSE=1 HOME="$BH" bash "$BH/compress/verify.sh" > "$T/bu1.log" 2>&1
     eq    "Validate + update: backfilled / corrected / not guessed / kept" "$(crfs)" \
           "Missing=21/High Stale=20/High NoRecord=-/- Kept=18/High "
     check "Validate + update: WRITTEN reported"  "rows bu1 Missing | grep -q 'Compression tags *WRITTEN (CRF 21, High; from compression_tags.tsv)'"
     check "Validate + update: CORRECTED reported" "rows bu1 Stale | grep -q 'Compression tags *CORRECTED (CRF 30, Base -> CRF 20, High; from compression_tags.tsv)'"
     check "Validate + update: not recovered reported" "rows bu1 NoRecord | grep -q 'Compression tags *not recovered (no job record of this encode); left missing'"
     check "Validate + update: existing tags without a record left unchanged" "rows bu1 Kept | grep -q 'not recovered (no job record of this encode); existing tags left unchanged'"
-    check "Validate + update: summary"           "grep -q 'CRF tags written:  2' '$T/bu1.log' && grep -q 'CRF not recovered: 2' '$T/bu1.log'"
+    check "Validate + update: summary"           "grep -q ', CRF tags 2; CRF tags not recovered: 2\$' '$T/bu1.log'"
     eq    "Validate + update: unrelated metadata unchanged" "$(for n in Missing Stale NoRecord Kept; do meta "$n"; done)" "$M0"
     eq    "Validate + update: historical version kept, none invented" "$(provs)" "$PV0"
     eq    "Validate + update: no duplicate tags"     "$(for n in Missing Stale NoRecord Kept; do compression_tag_duplicates "$BO/$n HEVC High.mkv"; done)" ""
     eq    "Validate + update: standard audio titles" "$(atitles)" "German | AC-3 | 1.0 | 96 kbps German | AC-3 | 1.0 | 96 kbps German | AC-3 | 1.0 | 96 kbps German | AC-3 | 1.0 | 96 kbps "
     eq    "Validate + update: stream data unchanged" "$(pay)" "$P0"
 
-    printf '2\n2\n' | HOME="$BH" bash "$BH/compress/verify.sh" > "$T/bu2.log" 2>&1
+    printf '2\n2\n' | COMPRESS_VERBOSE=1 HOME="$BH" bash "$BH/compress/verify.sh" > "$T/bu2.log" 2>&1
     eq    "repeat: same values"                  "$(crfs)" "Missing=21/High Stale=20/High NoRecord=-/- Kept=18/High "
     eq    "repeat: one COMPRESSION_CRF per file" "$(ncrf)" "1 1 0 1 "
-    check "repeat: reported UNCHANGED, nothing written" "rows bu2 Missing | grep -q 'UNCHANGED (CRF 21, High' && rows bu2 Stale | grep -q 'UNCHANGED (CRF 20, High' && ! grep -q 'CRF tags written:  [1-9]' '$T/bu2.log'"
+    check "repeat: reported UNCHANGED, nothing written" "rows bu2 Missing | grep -q 'UNCHANGED (CRF 21, High' && rows bu2 Stale | grep -q 'UNCHANGED (CRF 20, High' && grep -q ', CRF tags 0; CRF tags not recovered: 2\$' '$T/bu2.log'"
     eq    "repeat: unrelated metadata unchanged" "$(for n in Missing Stale NoRecord Kept; do meta "$n"; done)" "$M0"
     eq    "repeat: historical version still kept" "$(provs)" "$PV0"
-    check "repeat: titles already correct, none rewritten" "grep -q 'Titles correct:    4' '$T/bu2.log' && grep -q 'Titles updated:    0' '$T/bu2.log'"
+    check "repeat: titles already correct, none rewritten" "grep -q 'titles to correct: 0\$' '$T/bu2.log' && grep -q ', titles 0 files (0 titles),' '$T/bu2.log'"
     S2=$(sums)
-    printf '2\n1\n' | HOME="$BH" bash "$BH/compress/verify.sh" > "$T/bv2.log" 2>&1
+    printf '2\n1\n' | COMPRESS_VERBOSE=1 HOME="$BH" bash "$BH/compress/verify.sh" > "$T/bv2.log" 2>&1
     eq    "Verify after update: no file modified" "$(sums)" "$S2"
     check "Verify after update: values reported" "rows bv2 Missing | grep -qE '^  Compression CRF +21\$' && rows bv2 Missing | grep -qE '^  Compression tier +High\$'"
     check "no errors in verify.sh runs"          "! cat '$T'/bv.log '$T'/bu1.log '$T'/bu2.log | grep -qiE 'command not found|unbound variable|syntax error'"

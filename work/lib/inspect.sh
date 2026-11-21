@@ -105,7 +105,28 @@ FILE_RC=""          # x265 rate control of the current file ("crf 21.0")
 #   FILE_SRC / FILE_SRC_BYTES  the paired source (FILE_SRC_KIND OK)
 #   FILE_SRC_CANDIDATES  number of candidates (AMBIGUOUS)
 #   FILE_CRF_TAG / FILE_TIER_TAG  COMPRESSION_CRF / COMPRESSION_TIER ("-")
+#   FILE_DUR / FILE_RES / FILE_ABYTES  duration (s), resolution, audio bytes
+#   FILE_APPROX       "~" when the sizes are estimates (stream bit rates)
+#   FILE_VDESC        main video "hevc Main 10, 10-bit"; FILE_HDR: dynamic range
+#   FILE_AUDIO        audio tracks "AC-3 5.1 jpn, AAC 2.0 eng" ("none")
+#   FILE_TITLE_KINDS  title problems, one per line ("video title missing",
+#                     "audio title not standard", ...)
+#   Validate + update: FILE_STATS_REFRESHED 1 (statistics rewritten and
+#   verified), FILE_TITLES_WRITTEN (titles corrected), FILE_TAGS_WRITTEN 1
+#   (compression tags written / corrected), FILE_TAGS_UNRECOVERED 1
 inspect_file_reset() {
+    FILE_DUR=""
+    FILE_RES=""
+    FILE_ABYTES=""
+    FILE_APPROX=""
+    FILE_VDESC=""
+    FILE_HDR=""
+    FILE_AUDIO=""
+    FILE_TITLE_KINDS=""
+    FILE_STATS_REFRESHED=0
+    FILE_TITLES_WRITTEN=0
+    FILE_TAGS_WRITTEN=0
+    FILE_TAGS_UNRECOVERED=0
     FILE_VBYTES=""
     FILE_RC=""
     FILE_BYTES=""
@@ -148,6 +169,7 @@ inspect_file() {
     fi
 
     dur=$(get_duration "$file" 2>/dev/null || true)
+    FILE_DUR="$dur"
     bytes=$(file_bytes "$file")
     FILE_BYTES="$bytes"
     IFS=$'\t' read -r FILE_CRF_TAG FILE_TIER_TAG <<< "$(compression_tags "$file")"
@@ -163,6 +185,7 @@ inspect_file() {
     fi
 
     res=$(get_resolution "$file" "$vidx" 2>/dev/null || true)
+    FILE_RES="$res"
     codec=$(ffprobe -v error -select_streams "$vidx" \
         -show_entries stream=codec_name,pix_fmt -of csv=p=0 "$file" 2>/dev/null |
         head -n 1 | sed 's/,/ \/ /')
@@ -202,6 +225,8 @@ inspect_file() {
 
     (( scan == 1 )) && ((SCANNED++))
     FILE_VBYTES="$vbytes"
+    FILE_ABYTES="$abytes"
+    FILE_APPROX="$approx"
 
     local other
     other=$(awk -v t="$bytes" -v v="$vbytes" -v a="$abytes" 'BEGIN {
@@ -245,7 +270,8 @@ inspect_file() {
         done < <(compression_tag_duplicates "$file")
     fi
     probe_hdr "$file" "$vidx"
-    row "Dynamic range" "$(hdr_description)"
+    FILE_HDR=$(hdr_description)
+    row "Dynamic range" "$FILE_HDR"
     row "Video" "$(rate_size "$vbytes" "$dur" "$approx")"
     row "Audio ($acount track$( ((acount == 1)) || echo s))" "$(rate_size "$abytes" "$dur" "$approx")"
     row "Other / container" "$approx$(bytes_to_gib "$other") GiB"
@@ -334,6 +360,7 @@ check_track_titles() {
         fi
     done < <(stream_meta "$file")
 
+    FILE_VDESC="$vcodec${vprof:+ $vprof}${vbits:+, $vbits-bit}"
     row "Video stream" "$vcodec${vprof:+ $vprof}, ${res:-?}${vbits:+, $vbits-bit}, $HDR_KIND$( ((HDR_DV == 1)) && echo " + Dolby Vision")$( ((HDR_HDR10PLUS == 1)) && echo " + HDR10+")"
     # main video against its standard title (codec / resolution / bit
     # depth / HDR format of the stream; the CRF only from the x265
@@ -346,12 +373,15 @@ check_track_titles() {
     else
         if [[ "$vtitle" == "-" ]]; then
             row "Video title" "no title - MISSING"
+            FILE_TITLE_KINDS+="video title missing"$'\n'
         else
             claims=$(video_title_false_claims "$vtitle" "$vcodec" "$res" "$HDR_KIND" "$HDR_DV" "$h10p" "$vbits")
             if [[ -n "$claims" ]]; then
                 row "Video title" "\"$vtitle\" - STALE (the stream is not: $claims)"
+                FILE_TITLE_KINDS+="video title stale"$'\n'
             else
                 row "Video title" "\"$vtitle\" - NOT STANDARD"
+                FILE_TITLE_KINDS+="video title not standard"$'\n'
             fi
         fi
         row "" "-> \"$new\""
@@ -386,6 +416,7 @@ check_track_titles() {
             "${f[8]}" "${f[9]}" "${f[10]}" 1 "$kb")
         lang="${f[12]}"; [[ "$lang" == "-" ]] && lang="und"
         label="$(audio_track_label "${f[2]}" "${f[3]}" "${f[5]}" "${f[4]}"), $lang"
+        FILE_AUDIO+="${FILE_AUDIO:+, }$(audio_track_label "${f[2]}" "${f[3]}" "${f[5]}" "${f[4]}") $lang"
         (( f[6] == 1 )) && label+=", default"
         (( f[7] == 1 )) && label+=", forced"
         (( f[8] == 1 )) && label+=", commentary"
@@ -411,12 +442,15 @@ check_track_titles() {
         fi
         if [[ "${f[13]}" == "-" ]]; then
             row "Audio $an" "$label | no title - MISSING${note}"
+            FILE_TITLE_KINDS+="audio title missing"$'\n'
         else
             claims=$(audio_title_false_claims "${f[13]}" "${f[2]}" "${f[4]}" "${f[3]}" "$fn" "$fb" "$fr")
             if [[ -n "$claims" ]]; then
                 row "Audio $an" "$label | \"${f[13]}\" - STALE (INCORRECT per the stream: $claims)${note}"
+                FILE_TITLE_KINDS+="audio title stale"$'\n'
             else
                 row "Audio $an" "$label | \"${f[13]}\" - NOT STANDARD${note}"
+                FILE_TITLE_KINDS+="audio title not standard"$'\n'
             fi
         fi
         row "" "-> \"$new\""
@@ -453,6 +487,7 @@ check_track_titles() {
     case "$rc" in
         0)
             row "Track titles" "UPDATED ($fixes title(s); track names only, streams untouched)"
+            FILE_TITLES_WRITTEN="$fixes"
             ((TITLES_UPDATED++))
             ;;
         3)  row "Track titles" "$fixes to correct; $MKV_TITLES_MSG: not updated - CHECK REQUIRED" ;;
@@ -550,6 +585,7 @@ update_and_check() {
 
     if [[ "$cv" == "MATCH" && "$ca" == "MATCH" ]]; then
         echo "  Metadata: VERIFIED"
+        FILE_STATS_REFRESHED=1
         ((VERIFIED++))
     else
         echo "  Metadata: CHECK REQUIRED"
@@ -584,6 +620,7 @@ backfill_compression_tags() {
         [[ "$ccrf" != "-" ]] && what+="; existing tags left unchanged" || what+="; left missing"
         row "Compression tags" "$what"
         ((TAGS_UNRECOVERED++))
+        FILE_TAGS_UNRECOVERED=1
         return
     fi
 
@@ -614,6 +651,7 @@ backfill_compression_tags() {
         row "Compression tags" "CORRECTED (CRF $ccrf$([[ "$ctier" != "-" ]] && echo ", $ctier") -> CRF $crf${tier:+, $tier}; from $from)"
     fi
     ((TAGS_WRITTEN++))
+    FILE_TAGS_WRITTEN=1
 }
 
 # ------------------------------------------------------------

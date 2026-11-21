@@ -3,9 +3,9 @@
 # Verify mode (report only), as "LABEL<TAB>TEXT" lines.
 #
 # Used by window_tagger.py "Validate MKV metadata" so the audio / video
-# title rules stay in one place: check_track_titles is taken from verify.sh
-# itself and the libraries it needs are sourced from work/lib. Called with
-# VALIDATE=0, where check_track_titles returns before any write; mkvpropedit
+# title rules stay in one place: check_track_titles is taken from
+# work/lib/inspect.sh (verify.sh's inspection) and the libraries it needs
+# are sourced from work/lib. Called with VALIDATE=0, where check_track_titles returns before any write; mkvpropedit
 # is additionally shadowed by a function that refuses, so this script can
 # never modify FILE. Needs bash and ffprobe.
 set -u
@@ -31,8 +31,14 @@ row() { printf '%s\t%s\n' "$1" "$2"; }
 is_mkv() { [[ "${1,,}" == *.mkv ]]; }
 TITLES_OK=0 TITLES_FIX=0 TITLES_UPDATED=0 CHECK_REQUIRED=0
 
-eval "$(sed -n '/^check_track_titles() {$/,/^}$/p' "$REPO/verify.sh")"
-declare -F check_track_titles >/dev/null || { printf 'ERROR\tcheck_track_titles not found in verify.sh\n'; exit 3; }
+# work/lib/inspect.sh since verify.sh and results.sh share it (verify.sh
+# itself for an older checkout)
+for src in "$LIB/inspect.sh" "$REPO/verify.sh"; do
+    [[ -r "$src" ]] || continue
+    eval "$(sed -n '/^check_track_titles() {$/,/^}$/p' "$src")"
+    declare -F check_track_titles >/dev/null && break
+done
+declare -F check_track_titles >/dev/null || { printf 'ERROR\tcheck_track_titles not found in work/lib/inspect.sh or verify.sh\n'; exit 3; }
 
 file="$1"
 vidx=$(main_video_index "$file")

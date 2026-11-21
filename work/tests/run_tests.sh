@@ -73,6 +73,10 @@
 # 20. results.sh: last-job / path / --all scope, invalid paths, summary
 #     numbers, issues vs titles-only, read-only (results_tests.sh; needs
 #     ffmpeg with libx265 and mkvpropedit)
+# 21. verify.sh report: path scope, Common / Differs, titles-only status,
+#     detail blocks only on problems, --brief, 120 columns, Validate +
+#     update layout (verify_summary_tests.sh; needs ffmpeg with libx265
+#     and mkvpropedit)
 #
 # Runs in a temporary copy of work/ so real logs/jobs are untouched.
 # Everything here is synthetic: it proves the mechanics, not behaviour
@@ -1041,17 +1045,19 @@ ln -s Real.mkv "$VH/compress/in/Dup.mkv"
 ln -s nowhere.mkv "$VH/compress/in/Broken.mkv"
 sum_before=$(md5sum < "$VH/store/Target.mkv")
 printf '1\n2\ny\n' | HOME="$VH" bash "$VH/compress/verify.sh" > "$T/verify.log" 2>&1
-check "verify: regular file inspected"         "grep -q '^Real.mkv$' '$T/verify.log'"
-check "verify: symlinked file inspected"       "grep -q '^Link.mkv$' '$T/verify.log'"
+# COMPRESS_VERBOSE=1 (exported above): the detail block of every file,
+# indented by 4 under its line
+check "verify: regular file inspected"         "grep -q '^    Real.mkv$' '$T/verify.log'"
+check "verify: symlinked file inspected"       "grep -q '^    Link.mkv$' '$T/verify.log'"
 check "verify: symlink target shown"           "grep -q 'Symlink to .*store/Target.mkv' '$T/verify.log'"
-check "verify: duplicate symlink skipped"      "! grep -q '^Dup.mkv$' '$T/verify.log'"
+check "verify: duplicate symlink skipped"      "! grep -q '^    Dup.mkv$' '$T/verify.log'"
 check "verify: broken symlink warned"          "grep -q 'WARNING: broken symlink skipped: .*Broken.mkv' '$T/verify.log'"
-check "verify: 2 files checked"                "grep -q 'Files checked: *2' '$T/verify.log'"
+check "verify: 2 files checked"                "grep -q '^Total: .*, 2 files;' '$T/verify.log'"
 # same content: the total bitrate (file size / duration) must match the
 # regular copy; a link-sized value would be ~0
 vrate() {
-    awk -v n="$1" '$0 == n { f = 1; next }
-        f && /^=====/ { if (++c == 2) exit; next }
+    awk -v n="    $1" '$0 == n { f = 1; next }
+        f && /^ *=====/ { if (++c == 2) exit; next }
         f && /Total bitrate/ { print $3 }' "$T/verify.log"
 }
 check "verify: size of the target, not link"   "[[ -n \"\$(vrate Link.mkv)\" && \"\$(vrate Link.mkv)\" == \"\$(vrate Real.mkv)\" && \"\$(vrate Link.mkv)\" != 0.00 ]]"
@@ -1197,13 +1203,13 @@ if (( HAVE_MKV == 1 )); then
     tsum=$(md5sum < "$SH/store/Target.mkv")
 
     printf '1\n1\n' | HOME="$SH" bash "$SH/compress/verify.sh" > "$T/sverify1.log" 2>&1
-    check "stats 6: Verify scans files without tags" "grep -q 'Packet scanned: *3' '$T/sverify1.log'"
+    check "stats 6: Verify scans files without tags" "[[ \$(grep -c 'Scanning packets' '$T/sverify1.log') == 3 ]]"
     check "stats 6: Verify shows the stale reason"   "grep -q 'Stored statistics rejected: .*stale' '$T/sverify1.log'"
 
     printf '1\n2\ny\n' | HOME="$SH" bash "$SH/compress/verify.sh" > "$T/sverify2.log" 2>&1
-    check "stats 6: Validate + update wrote tags"    "grep -q 'Tags updated: *2' '$T/sverify2.log'"
+    check "stats 6: Validate + update wrote tags"    "grep -q '^Written: statistics 2,' '$T/sverify2.log'"
     check "stats 6: metadata-first read matches"     "[[ \$(grep -c 'Metadata-first read *MATCH' '$T/sverify2.log') == 2 ]]"
-    check "stats 6: both VERIFIED"                   "grep -q 'Verified: *2' '$T/sverify2.log'"
+    check "stats 6: both VERIFIED"                   "[[ \$(grep -c 'Metadata: VERIFIED' '$T/sverify2.log') == 2 ]]"
     for f in Plain Stale; do
         eq "stats 6: $f.mkv now read without a scan" "$(scans_during stats_load "$SH/compress/in/$f.mkv" "" exact)" 0
     done
@@ -1211,7 +1217,7 @@ if (( HAVE_MKV == 1 )); then
     eq    "stats 6: Stale.mkv tags now correct"      "$(stats_field 0 bytes)" "$(pk "$SH/compress/in/Stale.mkv" 0)"
 
     printf '1\n1\n' | HOME="$SH" bash "$SH/compress/verify.sh" > "$T/sverify3.log" 2>&1
-    check "stats 6: Verify afterwards: 1 scan (link)" "grep -q 'Packet scanned: *1' '$T/sverify3.log'"
+    check "stats 6: Verify afterwards: 1 scan (link)" "[[ \$(grep -c 'Scanning packets' '$T/sverify3.log') == 1 ]]"
     check "stats 6: values from stored tags"          "grep -q 'Values from *stored MKV statistics tags' '$T/sverify3.log'"
     check "stats 8: Validate never wrote the link"    "grep -q 'Symlink: statistics tags not updated' '$T/sverify2.log'"
     eq    "stats 8: link target unchanged"            "$(md5sum < "$SH/store/Target.mkv")" "$tsum"
@@ -2411,6 +2417,14 @@ grep -E '^  (ok|FAIL) ' "$T/results.out"
 PASS=$((PASS + $(grep -c '^  ok ' "$T/results.out")))
 FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/results.out")))
 while IFS= read -r s; do SKIPPED+=("${s#skipped: }"); done < <(grep '^skipped: ' "$T/results.out")
+
+echo
+echo "== verify.sh report layout (verify_summary_tests.sh)"
+bash "$SRC_WORK/tests/verify_summary_tests.sh" > "$T/verify_summary.out" 2>&1
+grep -E '^  (ok|FAIL) ' "$T/verify_summary.out"
+PASS=$((PASS + $(grep -c '^  ok ' "$T/verify_summary.out")))
+FAIL=$((FAIL + $(grep -c '^  FAIL ' "$T/verify_summary.out")))
+while IFS= read -r s; do SKIPPED+=("${s#skipped: }"); done < <(grep '^skipped: ' "$T/verify_summary.out")
 
 echo
 echo "============================================================"
