@@ -104,6 +104,41 @@ eq    "1 directory loop: groups unchanged, loop warned" \
 check "1 loop warning"                      "grep -q 'circular directory symlink skipped' '$T/loop.err'"
 rm -f "$C/Season 2/loop"
 
+# one scan per show, cached: same results as the per-folder scans
+mk "$D/store/ep/Columbo S01E09.mkv"
+ln -s "$D/store/ep/Columbo S01E09.mkv" "$C/Season 01/Columbo S01E09.mkv"      # symlinked episode
+ln -s "Columbo S01E01.mkv" "$C/Season 01/0 alias of E01.mkv"                   # same target: once
+ln -s nowhere.mkv "$C/Season 01/Broken.mkv"
+series_scan_reset
+series_scan_root "$I" 2> "$T/scan.err"
+eq    "1 cache: series_scan_root = series_dirs" \
+    "$(printf '%s|' "${SERIES_SCAN_DIRS[@]}")" "$(series_dirs "$I" 2>/dev/null | tr '\n' '|')"
+check "1 cache: nothing printed while scanning" "[[ ! -s '$T/scan.err' ]]"
+ok_all=1
+for show in "$C" "$I/Mixed" "$I/Flat" "$I/Linked"; do
+    while IFS= read -r g; do
+        [[ "$(video_files_in_dir "$g" 2>/dev/null)" == "$(discover_paths "$g" 1 f "${MOVIE_EXTS[@]}" 2>/dev/null | tr '\0' '\n')" ]] || { ok_all=0; echo "    differs: $g"; }
+    done < <(series_season_groups "$show" 2>/dev/null)
+done
+eq    "1 cache: episode lists = uncached per-folder scan (symlinks, aliases)" "$ok_all" 1
+eq    "1 cache: symlinked episode once, regular path preferred" \
+    "$(video_files_in_dir "$C/Season 01" 2>/dev/null | sed "s|$C/Season 01/||" | tr '\n' '|')" "Columbo S01E01.mkv|Columbo S01E02.mkv|Columbo S01E09.mkv|"
+check "1 cache: broken episode link warned on the episode read" \
+    "video_files_in_dir '$C/Season 01' 2>&1 >/dev/null | grep -q 'broken symlink skipped: .*Broken.mkv' && [[ -z \"\$(DISCOVERY_QUIET=1 video_files_in_dir '$C/Season 01' 2>&1 >/dev/null)\" ]]"
+check "1 cache: broken link warned on the season read" "series_season_groups '$C' 2>&1 >/dev/null | grep -q 'broken symlink skipped: .*Broken.mkv'"
+eq    "1 cache: episode count" "$(series_episode_count "$C")" "7"
+# the cache is read, not rescanned: a file added now is not seen until reset
+mk "$C/Season 01/Columbo S01E10.mkv"
+eq    "1 cache: one scan per show (no rescan)" "$(series_episode_count "$C")" "7"
+series_scan_reset
+eq    "1 cache: series_scan_reset rescans" "$(series_episode_count "$C")" "8"
+finds=$( ( series_scan_reset; find() { echo x >> "$T/finds"; command find "$@"; }; : > "$T/finds"
+          series_scan "$C"; series_season_groups "$C" >/dev/null 2>&1; series_episode_count "$C" >/dev/null
+          wc -l < "$T/finds" ) )
+eq    "1 cache: one find for the whole show" "$finds" 1
+rm -f "$C/Season 01/Columbo S01E09.mkv" "$C/Season 01/0 alias of E01.mkv" "$C/Season 01/Broken.mkv" "$C/Season 01/Columbo S01E10.mkv"
+series_scan_reset
+
 # ------------------------------------------------------------
 echo
 echo "== 2 season selection"

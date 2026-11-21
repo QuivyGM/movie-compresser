@@ -99,8 +99,11 @@ fi
 # ============================================================
 
 # folders and valid folder symlinks with episodes anywhere below them
-# (see discover_paths / series_season_groups)
-mapfile -t SERIES_DIRS < <(series_dirs "$IN_DIR")
+# (see discover_paths / series_season_groups). Each show is scanned once,
+# here in the menu's own shell (series_scan_root): the count line, the
+# season list and the episode lists below read that cache.
+series_scan_root "$IN_DIR"
+SERIES_DIRS=("${SERIES_SCAN_DIRS[@]+"${SERIES_SCAN_DIRS[@]}"}")
 
 if (( ${#SERIES_DIRS[@]} == 0 )); then
     echo

@@ -21,16 +21,119 @@
 MOVIE_EXTS=(mkv mp4 m4v)
 MEDIA_EXTS=(mkv mp4 m4v mov avi ts m2ts webm)
 
+# Batch based: one find and one realpath call per scan (no subprocess per
+# path). A show folder is scanned once (series_scan) and the result
+# reused by series_dirs, series_season_groups, series_episode_count and
+# video_files_in_dir, as long as the cache is filled in the shell that
+# reads it (series_scan_root / series_scan from the menu, not from a
+# $(...) subshell).
+
+# _discovery_warn TEXT  ->  stderr (DISCOVERY_QUIET=1: nothing), or the
+# _DISCOVERY_SINK variable while series_scan collects warnings
 _discovery_warn() {
-    [[ "${DISCOVERY_QUIET:-0}" == "1" ]] || echo "WARNING: $*" >&2
+    if [[ -n "${_DISCOVERY_SINK+x}" ]]; then
+        _DISCOVERY_SINK+="WARNING: $*"$'\n'
+    else
+        [[ "${DISCOVERY_QUIET:-0}" == "1" ]] || echo "WARNING: $*" >&2
+    fi
 }
 
-# _discovery_is_real PATH ROOT CANON_ROOT
-# True when PATH below ROOT goes through no symlink (its resolved path
-# is the canonical root plus the same relative path).
-_discovery_is_real() {
-    local rel="${1#"$2"/}"
-    [[ "$(readlink -f -- "$1")" == "$3/$rel" ]]
+# _discover_find ROOT FIND_ARGS...  ->  _DK (find %y kinds) and _DP (paths)
+# of find -L ROOT -mindepth 1 FIND_ARGS; find's own messages (loops,
+# unreadable folders) become warnings
+_discover_find() {
+    local root="$1" err line p
+    shift
+    _DK=()
+    _DP=()
+    err=$(mktemp)
+    while IFS= read -r -d '' line; do
+        _DK+=("${line%% *}")
+        _DP+=("${line#* }")
+    done < <(find -L "$root" -mindepth 1 "$@" -printf '%y %p\0' 2> "$err")
+    while IFS= read -r line; do
+        case "$line" in
+            *"File system loop detected"*)
+                # "find: File system loop detected; 'X' is part of ..."
+                p=$(sed -E "s/^.*detected; [‘'\`]([^’']*)[’'].*$/\1/" <<< "$line")
+                _discovery_warn "circular directory symlink skipped: $p"
+                ;;
+            *)
+                [[ -n "$line" ]] && _discovery_warn "${line#find: }"
+                ;;
+        esac
+    done < "$err"
+    rm -f -- "$err"
+}
+
+# _discover_canon  ->  _DC: the resolved path of every _DP entry ("" for
+# broken links), one realpath call for all of them
+_discover_canon() {
+    local i p
+    local -a idx=() in=() out=()
+    _DC=()
+    for i in "${!_DP[@]}"; do
+        _DC[i]=""
+        [[ "${_DK[$i]}" == l ]] && continue
+        idx+=("$i")
+        in+=("${_DP[$i]}")
+    done
+    (( ${#in[@]} )) || return 0
+    mapfile -d '' -t out < <(printf '%s\0' "${in[@]}" | xargs -0 -r realpath -z -- 2>/dev/null)
+    if (( ${#out[@]} != ${#in[@]} )); then
+        # an entry vanished between find and realpath: resolve one by one
+        out=()
+        for p in "${in[@]}"; do out+=("$(readlink -f -- "$p" 2>/dev/null)"); done
+    fi
+    for i in "${!idx[@]}"; do
+        _DC[${idx[$i]}]="${out[$i]}"
+    done
+}
+
+# _discover_pick ROOT CANON_ROOT TYPE INDEX...  ->  _PICK: the paths to
+# keep among the _DP / _DC entries INDEX... of kind TYPE: one per real
+# target; a path that goes through no symlink below ROOT (its resolved
+# path is CANON_ROOT plus the same relative path) wins, else the first
+# in sort order; directory symlinks to ROOT or a parent are loops
+_discover_pick() {
+    local root="$1" croot="$2" type="$3" i p canon cur isreal
+    local -A pick=() real=()
+    shift 3
+    _PICK=()
+    for i; do
+        [[ "${_DK[$i]}" == "$type" ]] || continue
+        p="${_DP[$i]}"
+        canon="${_DC[$i]}"
+        [[ -n "$canon" ]] || continue
+        if [[ "$type" == d ]] && [[ "$croot" == "$canon" || "$croot" == "$canon"/* ]]; then
+            _discovery_warn "circular directory symlink skipped: $p -> $(readlink -- "$p")"
+            continue
+        fi
+        isreal=0
+        [[ "$canon" == "$croot/${p#"$root"/}" ]] && isreal=1
+        cur="${pick[$canon]:-}"
+        if [[ -z "$cur" ]]; then
+            pick[$canon]="$p"
+            (( isreal )) && real[$canon]=1
+        elif [[ -z "${real[$canon]:-}" ]] && (( isreal )); then
+            # prefer the regular entry over a symlink to the same target
+            pick[$canon]="$p"
+            real[$canon]=1
+        elif [[ -z "${real[$canon]:-}" && "$p" < "$cur" ]]; then
+            pick[$canon]="$p"
+        fi
+    done
+    _PICK=("${pick[@]+"${pick[@]}"}")
+}
+
+# _discover_broken INDEX...  ->  a warning for every broken symlink
+_discover_broken() {
+    local i
+    for i; do
+        [[ "${_DK[$i]}" == l ]] &&
+            _discovery_warn "broken symlink skipped: ${_DP[$i]} -> $(readlink -- "${_DP[$i]}")"
+    done
+    return 0
 }
 
 # discover_paths ROOT MAXDEPTH TYPE EXT...
@@ -40,12 +143,9 @@ _discovery_is_real() {
 # keep the names they were found under (ROOT/... , symlink names
 # included); content is always read through them.
 discover_paths() {
-    local root="${1%/}" depth="$2" type="$3"
+    local root="${1%/}" depth="$2" type="$3" canon_root
+    local -a names=() opts=() _DK=() _DP=() _DC=() _PICK=()
     shift 3
-
-    local canon_root err line p kind canon cur
-    local names=() opts=()
-    local -A pick=() real=()
 
     [[ -d "$root" ]] || return 0
     canon_root=$(readlink -f -- "$root")
@@ -60,73 +160,153 @@ discover_paths() {
         done
         names+=(")")
     fi
-
     [[ -n "$depth" ]] && opts+=(-maxdepth "$depth")
 
-    err=$(mktemp)
+    _discover_find "$root" "${opts[@]+"${opts[@]}"}" \( -type "$type" -o -type l \) "${names[@]+"${names[@]}"}"
+    _discover_broken "${!_DP[@]}"
+    _discover_canon
+    _discover_pick "$root" "$canon_root" "$type" "${!_DP[@]}"
+    (( ${#_PICK[@]} )) || return 0
+    printf '%s\0' "${_PICK[@]}" | sort -z
+}
 
-    while IFS= read -r -d '' line; do
-        kind="${line%% *}"
-        p="${line#* }"
+# ------------------------------------------------------------
+# Per-show scan cache
+# ------------------------------------------------------------
 
-        if [[ "$kind" == "l" ]]; then
-            _discovery_warn "broken symlink skipped: $p -> $(readlink -- "$p")"
-            continue
+declare -gA _SCAN_DONE=() _SCAN_GROUPS=() _SCAN_FILES=() _SCAN_WARN=() _SCAN_WARN_DIR=()
+
+# series_scan_reset  ->  forget every cached show (files changed)
+series_scan_reset() {
+    _SCAN_DONE=() _SCAN_GROUPS=() _SCAN_FILES=() _SCAN_WARN=() _SCAN_WARN_DIR=()
+}
+
+# _movie_ext NAME  ->  0 for a MOVIE_EXTS extension (any case)
+_movie_ext() {
+    local n="${1,,}" e
+    for e in "${MOVIE_EXTS[@]}"; do
+        [[ "$n" == *."$e" ]] && return 0
+    done
+    return 1
+}
+
+# series_scan SHOW_DIR  ->  the cache of one show, from ONE find + ONE
+# realpath call: its season groups (series_season_groups' rules) and the
+# episode files of each group (video_files_in_dir's rules), and the
+# warnings those scans would print (kept for the first non-quiet read).
+# Nothing is printed. A show already in the cache is not scanned again.
+series_scan() {
+    local show="${1%/}" croot i p d par rel c name skip
+    local -a _DK=() _DP=() _DC=() _PICK=() dirs=() fidx=() parts=() sorted=()
+    local -A can=() by_name=() kids=() dirwarn=() nfiles=()
+    local _DISCOVERY_SINK=""
+
+    [[ -n "${_SCAN_DONE[$show]+x}" ]] && return 0
+    _SCAN_DONE[$show]=1
+    _SCAN_GROUPS[$show]=""
+    _SCAN_WARN[$show]=""
+    [[ -d "$show" ]] || return 0
+    croot=$(readlink -f -- "$show")
+
+    _discover_find "$show" \( -type d -o -type f -o -type l \)
+    # the season folder scan warns about every broken link, an episode
+    # scan about broken links with a movie extension in its folder
+    for i in "${!_DP[@]}"; do
+        [[ "${_DK[$i]}" == l ]] || continue
+        p="${_DP[$i]}"
+        _discovery_warn "broken symlink skipped: $p -> $(readlink -- "$p")"
+        _movie_ext "$p" && dirwarn[${p%/*}]+="WARNING: broken symlink skipped: $p -> $(readlink -- "$p")"$'\n'
+    done
+    # only folders and movie files need resolving
+    for i in "${!_DP[@]}"; do
+        if [[ "${_DK[$i]}" == f ]] && ! _movie_ext "${_DP[$i]}"; then
+            _DK[i]=x
         fi
+    done
+    _discover_canon
 
-        [[ "$kind" == "$type" ]] || continue
+    # season folders: discover_paths SHOW "" d
+    _discover_pick "$show" "$croot" d "${!_DP[@]}"
+    dirs=("$show" "${_PICK[@]+"${_PICK[@]}"}")
+    can[$show]="$croot"
+    for i in "${!_DP[@]}"; do
+        [[ "${_DK[$i]}" == d ]] && can[${_DP[$i]}]="${_DC[$i]}"
+    done
 
-        canon=$(readlink -f -- "$p") || continue
+    # episode files of each folder: discover_paths DIR 1 f (the entries
+    # directly in it), sorted once for all folders
+    for i in "${!_DP[@]}"; do
+        [[ "${_DK[$i]}" == f ]] && kids[${_DP[$i]%/*}]+="$i "
+    done
+    local -a all=()
+    for d in "${dirs[@]}"; do
+        [[ -n "${kids[$d]:-}" ]] || continue
+        # shellcheck disable=SC2086
+        _discover_pick "$d" "${can[$d]}" f ${kids[$d]}
+        all+=("${_PICK[@]+"${_PICK[@]}"}")
+    done
+    if (( ${#all[@]} )); then
+        mapfile -d '' -t sorted < <(printf '%s\0' "${all[@]}" | sort -z)
+    fi
+    for p in "${sorted[@]+"${sorted[@]}"}"; do
+        par="${p%/*}"
+        _SCAN_FILES[$par]+="$p"$'\n'
+        nfiles[$par]=1
+    done
+    for d in "${dirs[@]}"; do
+        _SCAN_WARN_DIR[$d]="${dirwarn[$d]:-}"
+        [[ -n "${_SCAN_FILES[$d]+x}" ]] || _SCAN_FILES[$d]=""
+    done
 
-        if [[ "$type" == "d" ]]; then
-            # a directory symlink leading to the root or one of its
-            # parents is a loop, not a separate folder
-            if [[ "$canon_root" == "$canon" || "$canon_root" == "$canon"/* ]]; then
-                _discovery_warn "circular directory symlink skipped: $p -> $(readlink -- "$p")"
-                continue
-            fi
+    # season groups: folders with episodes, extras folders left out
+    for d in "${dirs[@]}"; do
+        [[ -n "${nfiles[$d]:-}" ]] || continue
+        skip=0
+        if [[ "$d" != "$show" ]]; then
+            rel="${d#"$show"/}"
+            IFS=/ read -ra parts <<< "$rel"
+            for c in "${parts[@]}"; do
+                series_extras_dir "$c" && { skip=1; break; }
+            done
         fi
+        (( skip )) && continue
+        name=$(series_group_name "$show" "$d")
+        by_name[$name]="$d"
+    done
+    if (( ${#by_name[@]} )); then
+        while IFS= read -r name; do
+            _SCAN_GROUPS[$show]+="${by_name[$name]}"$'\n'
+        done < <(printf '%s\n' "${!by_name[@]}" | series_groups_sort)
+    fi
+    _SCAN_WARN[$show]="$_DISCOVERY_SINK"
+    return 0
+}
 
-        cur="${pick[$canon]:-}"
-
-        if [[ -z "$cur" ]]; then
-            pick[$canon]="$p"
-            _discovery_is_real "$p" "$root" "$canon_root" && real[$canon]=1
-        elif [[ -z "${real[$canon]:-}" ]] && _discovery_is_real "$p" "$root" "$canon_root"; then
-            # prefer the regular entry over a symlink to the same target
-            pick[$canon]="$p"
-            real[$canon]=1
-        elif [[ -z "${real[$canon]:-}" && "$p" < "$cur" ]]; then
-            pick[$canon]="$p"
-        fi
-    done < <(
-        find -L "$root" -mindepth 1 "${opts[@]+"${opts[@]}"}" \
-            \( -type "$type" -o -type l \) "${names[@]+"${names[@]}"}" \
-            -printf '%y %p\0' 2> "$err"
-    )
-
-    while IFS= read -r line; do
-        case "$line" in
-            *"File system loop detected"*)
-                # "find: File system loop detected; 'X' is part of ..."
-                p=$(sed -E "s/^.*detected; [‘'\`]([^’']*)[’'].*$/\1/" <<< "$line")
-                _discovery_warn "circular directory symlink skipped: $p"
-                ;;
-            *)
-                [[ -n "$line" ]] && _discovery_warn "${line#find: }"
-                ;;
-        esac
-    done < "$err"
-    rm -f -- "$err"
-
-    for p in "${pick[@]+"${pick[@]}"}"; do
-        printf '%s\0' "$p"
-    done | sort -z
+# series_scan_root ROOT  ->  SERIES_SCAN_DIRS: series_dirs ROOT, with every
+# show scanned once into the cache of the CURRENT shell (call it directly,
+# not in $(...)); later series_season_groups / series_episode_count /
+# video_files_in_dir calls on these shows are cache reads
+series_scan_root() {
+    local d
+    local -a top=()
+    SERIES_SCAN_DIRS=()
+    mapfile -d '' -t top < <(discover_paths "$1" 1 d)
+    for d in "${top[@]+"${top[@]}"}"; do
+        series_scan "$d"
+        [[ -n "${_SCAN_GROUPS[${d%/}]}" ]] && SERIES_SCAN_DIRS+=("$d")
+    done
+    return 0
 }
 
 # video_files_in_dir DIR  ->  movie/episode files directly in DIR,
-# one per line, sorted
+# one per line, sorted (from the show cache when DIR is a cached folder)
 video_files_in_dir() {
+    local d="${1%/}"
+    if [[ -n "${_SCAN_FILES[$d]+x}" ]]; then
+        [[ "${DISCOVERY_QUIET:-0}" == 1 ]] || printf '%s' "${_SCAN_WARN_DIR[$d]:-}" >&2
+        printf '%s' "${_SCAN_FILES[$d]}"
+        return 0
+    fi
     discover_paths "$1" 1 f "${MOVIE_EXTS[@]}" | tr '\0' '\n'
 }
 
@@ -141,12 +321,10 @@ media_files_recursive() {
 # folders do not count, see series_season_groups), one per line, sorted
 series_dirs() {
     local d
-
-    while IFS= read -r -d '' d; do
-        if [[ -n "$(DISCOVERY_QUIET=1 series_season_groups "$d" | head -n 1)" ]]; then
-            printf '%s\n' "$d"
-        fi
-    done < <(discover_paths "$1" 1 d)
+    series_scan_root "$1"
+    for d in "${SERIES_SCAN_DIRS[@]+"${SERIES_SCAN_DIRS[@]}"}"; do
+        printf '%s\n' "$d"
+    done
 }
 
 # ------------------------------------------------------------
@@ -226,45 +404,26 @@ series_groups_sort() {
 # season order (series_groups_sort). Paths keep the names they were found
 # under (symlink names included).
 series_season_groups() {
-    local show="${1%/}" d rel c skip name
-    local -a dirs=() parts
-    local -A by_name=()
+    local show="${1%/}"
 
     [[ -d "$show" ]] || return 0
-
-    dirs=("$show")
-    while IFS= read -r -d '' d; do
-        dirs+=("$d")
-    done < <(discover_paths "$show" "" d)
-
-    for d in "${dirs[@]}"; do
-        skip=0
-        if [[ "$d" != "$show" ]]; then
-            rel="${d#"$show"/}"
-            IFS=/ read -ra parts <<< "$rel"
-            for c in "${parts[@]}"; do
-                series_extras_dir "$c" && { skip=1; break; }
-            done
-        fi
-        (( skip )) && continue
-        [[ -n "$(DISCOVERY_QUIET=1 video_files_in_dir "$d" | head -n 1)" ]] || continue
-        name=$(series_group_name "$show" "$d")
-        by_name[$name]="$d"
-    done
-
-    (( ${#by_name[@]} )) || return 0
-    while IFS= read -r name; do
-        printf '%s\n' "${by_name[$name]}"
-    done < <(printf '%s\n' "${!by_name[@]}" | series_groups_sort)
+    # one scan of the show (series_scan), reused when already cached
+    series_scan "$show"
+    [[ "${DISCOVERY_QUIET:-0}" == 1 ]] || printf '%s' "${_SCAN_WARN[$show]}" >&2
+    printf '%s' "${_SCAN_GROUPS[$show]}"
 }
 
 # series_episode_count SHOW_DIR  ->  episodes in every season group
 series_episode_count() {
-    local g n=0 c
+    local show="${1%/}" g n=0 f
+    [[ -d "$show" ]] || { printf '0'; return 0; }
+    series_scan "$show"
     while IFS= read -r g; do
-        c=$(DISCOVERY_QUIET=1 video_files_in_dir "$g" | grep -c .)
-        n=$(( n + c ))
-    done < <(DISCOVERY_QUIET=1 series_season_groups "$1")
+        [[ -n "$g" ]] || continue
+        while IFS= read -r f; do
+            [[ -n "$f" ]] && ((n += 1))
+        done <<< "${_SCAN_FILES[$g]}"
+    done <<< "${_SCAN_GROUPS[$show]}"
     printf '%s' "$n"
 }
 
