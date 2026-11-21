@@ -63,7 +63,7 @@ SEASON_VARS=(
     EP_DUR EP_VIDX EP_VKBPS EP_VBYTES EP_AKBPS EP_ABYTES EP_ACH EP_ACODEC EP_ASR
     EP_RES EP_VCODEC EP_PIX EP_FPS EP_RANGE EP_SUBS EP_OTHER EP_HOW EP_H10P EP_REFRESH EP_KIND
     ANALYZE_FAIL INCOMPATIBLE DIFFERENT VERIFY_DETAILS VERIFY_ALL
-    REFERENCE WIDTH HEIGHT AUDIO_CHANNELS
+    REFERENCE WIDTH HEIGHT AUDIO_TRACKS_TEXT
     # dynamic range of the reference episode and its policy
     HDR_CODEC HDR_PRIMARIES HDR_TRANSFER HDR_MATRIX HDR_RANGE HDR_CHROMALOC HDR_KIND HDR_MASTER
     HDR_CLL HDR_HDR10PLUS HDR_DV HDR_DV_PROFILE HDR_DV_COMPAT HDR_DV_LEVEL HDR_DV_RPU HDR_DV_EL HDR_DV_BL
@@ -92,7 +92,7 @@ season_state_reset() {
         case "$v" in
             CRF_SERIES_EP_BYTES|CRF_SERIES_EP_FROM|CRF_SERIES_RATES|CRF_EP_EST|CRF_EST)
                 declare -gA "$v=()" ;;
-            FILES|EP_*|VERIFY_DETAILS|VERIFY_ALL|AUDIO_CHANNELS|SERIES_EP_CEIL|CRF_SERIES_SAMPLED|\
+            FILES|EP_*|VERIFY_DETAILS|VERIFY_ALL|SERIES_EP_CEIL|CRF_SERIES_SAMPLED|\
             CRF_SERIES_LABELS|CRF_TRIED|ABOVE|GUARD|GUARD_SAMPLED|LATE|PLAN_VIDEO|P_EP_*)
                 declare -ga "$v=()" ;;
             FILE_COUNT|LABEL_W|INCOMPATIBLE|DIFFERENT|HDR_HDR10PLUS|HDR_DV|DV_SUPPORTED|\
@@ -127,27 +127,72 @@ season_state_load() {
 # Compatibility (one season)
 # ------------------------------------------------------------
 
-# describe_list "a b c "  ->  "a, b, c" ("none" when empty)
+# describe_list "a a b "  ->  "a x2, b" (repeats folded; "none" when empty)
 describe_list() {
     local s="${1% }"
-    [[ -n "$s" ]] && printf '%s' "${s// /, }" || printf 'none'
+    [[ -n "$s" ]] || { printf 'none'; return 0; }
+    awk '{ for (i = 1; i <= NF; i++) {
+               if (i > 1 && $i == p) { n++; continue }
+               if (i > 1) out = out (out == "" ? "" : ", ") p (n > 1 ? " x" n : "")
+               p = $i; n = 1 }
+           printf "%s%s%s%s", out, (out == "" ? "" : ", "), p, (n > 1 ? " x" n : "") }' <<< "$s"
+}
+
+# word_count "a b c "  ->  3
+word_count() {
+    local -a w
+    read -ra w <<< "$1"
+    printf '%s' "${#w[@]}"
+}
+
+# fit_line TEXT  ->  TEXT cut to 120 columns (compact output rule;
+# COMPRESS_VERBOSE=1 keeps it whole)
+fit_line() {
+    local t="$1"
+    if ! ui_verbose && (( ${#t} > 120 )); then
+        t="${t:0:117}..."
+    fi
+    printf '%s' "$t"
+}
+
+# season_audio_tracks  ->  AUDIO_TRACKS_TEXT of the loaded season: the
+# audio track count per episode, "7" when every episode has the same,
+# otherwise "1-9" (each episode's own tracks are copied as they are)
+season_audio_tracks() {
+    local i
+    AUDIO_TRACKS_TEXT=$(
+        for i in "${!FILES[@]}"; do
+            word_count "${EP_ACH[$i]:-}"
+            echo
+        done | sort -n | awk 'NR == 1 { lo = $1 } { hi = $1 } END { print (lo == hi ? lo : lo "-" hi) }'
+    )
+}
+
+# season_audio_text  ->  "2 tracks, copied unchanged" / "1-2 tracks per
+# episode, copied unchanged" (compact header)
+season_audio_text() {
+    if [[ "$AUDIO_TRACKS_TEXT" == *-* ]]; then
+        printf '%s tracks per episode, copied unchanged' "$AUDIO_TRACKS_TEXT"
+    else
+        printf '%s, copied unchanged' "$(ui_plural "$AUDIO_TRACKS_TEXT" track)"
+    fi
 }
 
 # season_compat_check  ->  compares every episode of the loaded season
 # (EP_* arrays, FILES) with its first episode.
 #
 # Must match (they set the shared encode parameters):
-#   resolution, dynamic range (SDR/HDR10/HLG/Dolby Vision),
-#   audio track count and channels per track
-# Reported only (handled per episode):
-#   video codec, pixel format, frame rate, audio codecs and sample
-#   rates, subtitle tracks, attachments, HDR10+
+#   resolution, dynamic range (SDR/HDR10/HLG/Dolby Vision)
+# Reported only (handled per episode: every episode gets its own stream
+# map and all its audio is copied unchanged, see emit_encode_item):
+#   video codec, pixel format, frame rate, audio track count, channels,
+#   codecs and sample rates, subtitle tracks, attachments, HDR10+
 #
 # Sets INCOMPATIBLE / DIFFERENT (0|1), VERIFY_DETAILS (the lines of
 # episodes that differ: MISMATCH / OK*) and VERIFY_ALL (every episode,
 # "OK" lines included; verbose output).
 season_compat_check() {
-    local i d
+    local i d na na0
     local -a hard soft lines
 
     INCOMPATIBLE=0
@@ -163,8 +208,6 @@ season_compat_check() {
             hard+=("resolution ${EP_RES[$i]} vs ${EP_RES[0]}")
         [[ "${EP_RANGE[$i]}" == "${EP_RANGE[0]}" ]] ||
             hard+=("dynamic range ${EP_RANGE[$i]} vs ${EP_RANGE[0]}")
-        [[ "${EP_ACH[$i]}" == "${EP_ACH[0]}" ]] ||
-            hard+=("audio channels [$(describe_list "${EP_ACH[$i]}")] vs [$(describe_list "${EP_ACH[0]}")]")
 
         [[ "${EP_VCODEC[$i]}" == "${EP_VCODEC[0]}" ]] ||
             soft+=("video codec ${EP_VCODEC[$i]}")
@@ -172,10 +215,21 @@ season_compat_check() {
             soft+=("pixel format ${EP_PIX[$i]}")
         [[ "${EP_FPS[$i]}" == "${EP_FPS[0]}" ]] ||
             soft+=("frame rate ${EP_FPS[$i]}")
-        [[ "${EP_ACODEC[$i]}" == "${EP_ACODEC[0]}" ]] ||
-            soft+=("audio codecs [$(describe_list "${EP_ACODEC[$i]}")]")
-        [[ "${EP_ASR[$i]}" == "${EP_ASR[0]}" ]] ||
-            soft+=("sample rates [$(describe_list "${EP_ASR[$i]}")]")
+        # audio: a different track count makes every per-track list differ;
+        # compact shows one line for it, verbose keeps the lists
+        na=$(word_count "${EP_ACH[$i]}")
+        na0=$(word_count "${EP_ACH[0]}")
+        if (( na != na0 )); then
+            soft+=("audio tracks $na vs $na0 (each episode's tracks copied as they are)")
+        fi
+        if (( na == na0 )) || ui_verbose; then
+            [[ "${EP_ACH[$i]}" == "${EP_ACH[0]}" ]] ||
+                soft+=("audio channels [$(describe_list "${EP_ACH[$i]}")] vs [$(describe_list "${EP_ACH[0]}")]")
+            [[ "${EP_ACODEC[$i]}" == "${EP_ACODEC[0]}" ]] ||
+                soft+=("audio codecs [$(describe_list "${EP_ACODEC[$i]}")] vs [$(describe_list "${EP_ACODEC[0]}")]")
+            [[ "${EP_ASR[$i]}" == "${EP_ASR[0]}" ]] ||
+                soft+=("sample rates [$(describe_list "${EP_ASR[$i]}")] vs [$(describe_list "${EP_ASR[0]}")]")
+        fi
         [[ "${EP_SUBS[$i]}" == "${EP_SUBS[0]}" ]] ||
             soft+=("subtitles [$(describe_list "${EP_SUBS[$i]}")] vs [$(describe_list "${EP_SUBS[0]}")]")
         [[ "${EP_OTHER[$i]}" == "${EP_OTHER[0]}" ]] ||
@@ -186,12 +240,12 @@ season_compat_check() {
         lines=()
         if (( ${#hard[@]} )); then
             lines+=("$(ui_err MISMATCH)  $(basename "${FILES[$i]}")")
-            for d in "${hard[@]}"; do lines+=("            - $d"); done
-            for d in "${soft[@]+"${soft[@]}"}"; do lines+=("            (also: $d)"); done
+            for d in "${hard[@]}"; do lines+=("$(fit_line "            - $d")"); done
+            for d in "${soft[@]+"${soft[@]}"}"; do lines+=("$(fit_line "            (also: $d)")"); done
             INCOMPATIBLE=1
         elif (( ${#soft[@]} )); then
             lines+=("$(ui_warn "OK*")       $(basename "${FILES[$i]}")")
-            for d in "${soft[@]}"; do lines+=("            differs: $d"); done
+            for d in "${soft[@]}"; do lines+=("$(fit_line "            differs: $d")"); done
             DIFFERENT=1
         fi
 

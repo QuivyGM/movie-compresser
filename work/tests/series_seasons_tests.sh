@@ -141,6 +141,10 @@ check "3 distinct labels do not collide"    "! labels_collide \$'S01E01\nS01E02'
 check "3 duplicates within one season are not a cross-season collision" "! labels_collide \$'X\nX' \$'Y'"
 eq    "3 season CRF range"         "$(season_crf_range 20 19 22 20)" "CRF range: 19-22 across 4 seasons (per-season shared CRF)"
 eq    "3 no range for equal CRFs"  "$(season_crf_range 20 20)" ""
+eq    "3 describe_list folds repeats" "$(describe_list "6 2 2 2 6 ")|$(describe_list "")|$(describe_list "ac3 ")" "6, 2 x3, 6|none|ac3"
+eq    "3 word_count"               "$(word_count "6 2 2 ")|$(word_count "")" "3|0"
+eq    "3 fit_line: 120 columns"    "$(fit_line "$(printf 'x%.0s' {1..130})" | wc -c)|$(fit_line short)" "120|short"
+eq    "3 fit_line: verbose keeps it" "$(COMPRESS_VERBOSE=1 fit_line "$(printf 'x%.0s' {1..130})" | wc -c)" "130"
 eq    "3 season status"            "$(season_status_text 0 0 0)|$(season_status_text 1 2 1)" "OK|1 above ceiling, 2 source kept, 1 skipped"
 
 # ------------------------------------------------------------
@@ -183,7 +187,8 @@ cat > "$STUB/ffprobe" <<'EOF'
 f=""; for a; do f="$a"; done
 [[ -f "$f" ]] && grep -q '^dur=' "$f" 2>/dev/null || exit 1
 v() { sed -n "s/^$1=//p" "$f" | head -n 1; }
-dur=$(v dur); res=$(v res); rng=$(v range); vbps=$(v vbps)
+dur=$(v dur); res=$(v res); rng=$(v range); vbps=$(v vbps); aud=$(v audio)
+IFS=, read -ra ach <<< "${aud:-6}"
 : "${res:=1920x1080}" "${rng:=SDR}" "${vbps:=40000000}"
 w=${res%x*}; h=${res#*x}; pri=bt709; trc=bt709; pix=yuv420p
 [[ "$rng" == HDR10 ]] && { pri=bt2020; trc=smpte2084; pix=yuv420p10le; }
@@ -191,11 +196,15 @@ case "$*" in
     *format=format_name*)
         echo "format|format_name=mov,mp4,m4a|duration=$dur"
         echo "stream|index=0|codec_type=video|codec_name=h264|bit_rate=$vbps|duration=$dur|disposition:attached_pic=0"
-        echo "stream|index=1|codec_type=audio|codec_name=ac3|bit_rate=640000|duration=$dur|disposition:attached_pic=0" ;;
+        for n in "${!ach[@]}"; do
+            echo "stream|index=$((n + 1))|codec_type=audio|codec_name=ac3|bit_rate=640000|duration=$dur|disposition:attached_pic=0"
+        done ;;
     *format=duration*) echo "$dur" ;;
     *stream=index,codec_type,codec_name,channels*)
         echo "index=0|codec_type=video|codec_name=h264|width=$w|height=$h|pix_fmt=$pix|r_frame_rate=24000/1001|color_primaries=$pri|color_transfer=$trc|color_space=bt709|disposition:attached_pic=0"
-        echo "index=1|codec_type=audio|codec_name=ac3|channels=6|channel_layout=5.1(side)|sample_rate=48000|disposition:attached_pic=0" ;;
+        for n in "${!ach[@]}"; do
+            echo "index=$((n + 1))|codec_type=audio|codec_name=ac3|channels=${ach[$n]}|channel_layout=-|sample_rate=48000|disposition:attached_pic=0"
+        done ;;
     *stream=width,height*) echo "${w}x${h}" ;;
     *-show_streams*) printf '[STREAM]\ncodec_name=h264\ncolor_primaries=%s\ncolor_transfer=%s\n[/STREAM]\n' "$pri" "$trc" ;;
 esac
@@ -274,7 +283,7 @@ check "5 analysis: one line per season" \
     "grep -qE '^Season 00 - Specials +1  1920x1080 H264  SDR +from metadata +OK\$' '$L' && grep -qE '^Season 2 +2  1920x1080 H264  SDR +from metadata +MISMATCH\$' '$L' && grep -qE '^Season 10 +2 ' '$L'"
 check "5 only the problem episodes listed"       "has '$L' 'MISMATCH  Columbo S02E02.mkv' && ! has '$L' 'Columbo S01E02.mkv'"
 check "5 incompatible season excluded, rest offered" \
-    "has '$L' 'Excluded: resolution, dynamic range or audio layout differ' && hasx '$L' '1) Continue with the remaining 3 seasons (Season 00 - Specials, Season 01, Season 10)'"
+    "has '$L' 'Excluded: resolution or dynamic range differ' && hasx '$L' '1) Continue with the remaining 3 seasons (Season 00 - Specials, Season 01, Season 10)'"
 check "5 one CRF line per season, no CRF step lines" \
     "grep -qE '^Season 00 - Specials +CRF [0-9]+ +largest [0-9.]+ GiB \\(S00E01\\) / ceiling 5\\.00\$' '$L' && grep -qE '^Season 01 +CRF [0-9]+ +largest' '$L' && ! grep -qE '^(CRF [0-9]+|Result:|Boundary:)' '$L' && ! grep -qE '^  S01E0[0-9]  ~' '$L'"
 CRF_S00=$(sed -nE 's/^Season 00 - Specials +CRF ([0-9]+) .*/\1/p' "$L")
@@ -389,6 +398,31 @@ check "5 resolution prompt names the season it applies to" "has '$L' '(applies t
 check "5 only the 2160p season downscaled" \
     "[[ \$(grep -c 'Mixed\\\\ S01E0[12]\\\\ 1080p\\\\ HEVC\\\\ High.mkv' '$J') -ge 2 ]] && grep -q 'Mixed\\\\ S02E01\\\\ HEVC\\\\ High.mkv' '$J' && grep -qE '^Season 01 +High \\| CRF [0-9]+ \\| 1920x1080 ' '$L'"
 rm -f "$CB"/work/series[0-9]*.sh
+
+# audio layout differs between episodes: reported (OK*), never a reason
+# to exclude the season (only resolution / dynamic range are)
+A="$CB/in/Tracks"
+ep "$A/Season 01/Tracks S01E01.mkv" vrate20=500000 audio=6,2
+ep "$A/Season 01/Tracks S01E02.mkv" vrate20=500000 audio=6
+ep "$A/Season 01/Tracks S01E03.mkv" vrate20=500000 audio=2,2
+ep "$A/Season 02/Tracks S02E01.mkv" vrate20=500000 audio=6,2
+ep "$A/Season 02/Tracks S02E02.mkv" vrate20=500000 audio=6,2
+L="$T/m12.log"
+menu "6\n1\n2\ny\n" "$L"
+J=$(job_of)
+check "5 audio layout differs: OK*, not excluded" \
+    "grep -qE '^Season 01 +3  1920x1080 H264  SDR +from metadata +OK\\*\$' '$L' && ! has '$L' 'MISMATCH' && ! has '$L' 'Excluded' && ! has '$L' 'Continue with the remaining'"
+check "5 audio layout differs: reported per episode" \
+    "has '$L' 'differs: audio tracks 1 vs 2 (each episode'\''s tracks copied as they are)' && has '$L' 'differs: audio channels [2 x2] vs [6, 2]'"
+check "5 audio layout differs: header shows the track range" "grep -qE '^Audio: +1-2 tracks per episode, copied unchanged\$' '$L'"
+check "5 audio layout differs: both seasons queued" \
+    "grep -q '^job_season_begin Season\\\\ 01 ' '$J' && grep -q '^job_season_begin Season\\\\ 02 ' '$J' && [[ \$(grep -c '^job_batch_add ' '$J') == 5 ]]"
+check "5 audio layout differs: lines fit 120 columns" "[[ \$(awk 'length > 120' '$L' | grep -c .) == 0 ]]"
+rm -f "$CB"/work/series[0-9]*.sh
+L="$T/m13.log"
+menu "6\n2\n1\n2\nn\n" "$L" COMPRESS_VERBOSE=1
+check "5 audio layout differs, one season: header and stream notes" \
+    "has '$L' 'Audio tracks:  1-2 (differs per episode)' && has '$L' 'differs: audio channels [6] vs [6, 2]' && has '$L' 'All files compatible.' && has '$L' '(tracks of Tracks S01E01.mkv; each episode'\''s own tracks are copied)'"
 
 # verbose: per-episode detail grouped under season headers
 L="$T/m7.log"

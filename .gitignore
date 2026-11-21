@@ -17,6 +17,10 @@ work/*.progress
 work/*_passes/
 work/logs/
 
+# CRF sample / actual-result caches (lib/encode_common.sh; self-invalidating,
+# safe to delete at any time)
+work/cache/
+
 # backups / logs
 work/*.bak
 work/*.bak2

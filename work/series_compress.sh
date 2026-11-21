@@ -404,14 +404,15 @@ season_analyze() {
     done
 
     # VERIFY COMPATIBILITY (series_seasons.sh season_compat_check):
-    # resolution, dynamic range and audio channels must match within the
-    # season; other differences are only reported
+    # resolution and dynamic range must match within the season; other
+    # differences (audio layout included) are only reported
     season_compat_check
 
     # COMMON SOURCE INFO of the season
     REFERENCE="${FILES[0]}"
     IFS=x read -r WIDTH HEIGHT <<< "${EP_RES[0]}"
-    read -ra AUDIO_CHANNELS <<< "${EP_ACH[0]}"
+    # audio track count per episode may differ (each is copied as it is)
+    season_audio_tracks
 
     probe_hdr "$REFERENCE" "${EP_VIDX[0]}"
 
@@ -472,8 +473,8 @@ season_analysis_report() {
 
     if (( INCOMPATIBLE == 1 )); then
         echo
-        echo "Series settings do not match: resolution, dynamic range or audio"
-        echo "layout differ, so one shared encode setting cannot be used."
+        echo "Series settings do not match: resolution or dynamic range"
+        echo "differ, so one shared encode setting cannot be used."
         (( MULTI == 1 )) && echo "$(season_name "$k") is excluded."
         return 0
     fi
@@ -549,7 +550,7 @@ summary_analysis_table() {
             done
             probs+=("${VERIFY_DETAILS[@]+"${VERIFY_DETAILS[@]}"}")
             (( INCOMPATIBLE == 1 )) &&
-                probs+=("$(ui_err "Excluded"): resolution, dynamic range or audio layout differ (one shared season CRF cannot be used)")
+                probs+=("$(ui_err "Excluded"): resolution or dynamic range differ (one shared season CRF cannot be used)")
         fi
         (( ${#probs[@]} )) || continue
         echo
@@ -584,7 +585,7 @@ for k in "${SEASON_KEYS[@]}"; do
     if [[ -n "$ANALYZE_FAIL" ]]; then
         season_exclude "$k" "$ANALYZE_FAIL"
     elif (( INCOMPATIBLE == 1 )); then
-        season_exclude "$k" "resolution, dynamic range or audio layout differ"
+        season_exclude "$k" "resolution or dynamic range differ"
     fi
 done
 continue_or_cancel "$EXCL_BEFORE"
@@ -616,12 +617,18 @@ fi
 echo
 if (( SUMMARY == 1 )); then
     TOTAL_EPS=0
+    TRACK_RANGES=()
     for k in "${ACTIVE[@]}"; do
         season_state_load "$k"
         TOTAL_EPS=$(( TOTAL_EPS + FILE_COUNT ))
+        TRACK_RANGES+=("${AUDIO_TRACKS_TEXT/-/ }")
     done
     printf '%-16s%-18s %s\n' "Series:" "$SERIES_NAME" "Seasons: ${#ACTIVE[@]}   Episodes: $TOTAL_EPS"
-    printf '%-16s%s, copied unchanged\n' "Audio:" "every track"
+    # audio track count over every selected season ("2", or "1-3" when
+    # episodes differ; each episode's own tracks are copied)
+    AUDIO_TRACKS_TEXT=$(printf '%s\n' "${TRACK_RANGES[@]}" | tr ' ' '\n' | sort -n |
+        awk 'NR == 1 { lo = $1 } { hi = $1 } END { print (lo == hi ? lo : lo "-" hi) }')
+    printf '%-16s%s\n' "Audio:" "$(season_audio_text)"
 else
     for k in "${ACTIVE[@]}"; do
         season_state_load "$k"
@@ -633,7 +640,7 @@ else
             echo "Resolution:    ${WIDTH}x${HEIGHT}"
             echo "Video:         ${EP_VCODEC[0]} / ${EP_PIX[0]}"
             echo "Frame rate:    ${EP_FPS[0]}"
-            echo "Audio tracks:  ${#AUDIO_CHANNELS[@]}"
+            echo "Audio tracks:  ${AUDIO_TRACKS_TEXT}$([[ "$AUDIO_TRACKS_TEXT" == *-* ]] && echo " (differs per episode)")"
             echo "Values from:"
             {
                 printf "%s\n" "${EP_HOW[@]}"
@@ -661,7 +668,7 @@ else
             printf '%-16s%-18s %s\n' "Series:" "$SERIES_NAME" "Episodes: $FILE_COUNT"
             printf '%-16s%s %s %s\n' "Video:" "${WIDTH}x${HEIGHT}" "${EP_VCODEC[0]^^}" "$(ui_bit_depth "${EP_PIX[0]}")"
             printf '%-16s%s\n' "Dynamic range:" "$(hdr_compact_label)"
-            printf '%-16s%s, copied unchanged\n' "Audio:" "$(ui_plural "${#AUDIO_CHANNELS[@]}" track)"
+            printf '%-16s%s\n' "Audio:" "$(season_audio_text)"
             [[ -n "$AVG_VIDEO" ]] && printf '%-16s%s\n' "Avg video:" "$AVG_VIDEO"
         fi
     done
@@ -1448,7 +1455,10 @@ season_preview() {
         fi
         echo "Audio:                all tracks copied unchanged (on top of the video size)"
 
-        # same audio layout in every episode (verified above); details of the first
+        # track details of the first episode only, always labelled as such:
+        # count, order, channels, codecs and languages may differ per
+        # episode (each episode's own tracks are copied as they are)
+        echo "  (tracks of $(basename "$REFERENCE"); each episode's own tracks are copied)"
         while IFS= read -r note; do
             [[ -n "$note" ]] && echo "  $note"
         done < <(audio_copy_notes "$REFERENCE" "${EP_AKBPS[0]}")
@@ -1982,7 +1992,6 @@ else
         season_state_load "$k"
         CONFIRM_LINES+=("$(season_confirm_text)")
     done
-    echo
     if [[ $(printf '%s\n' "${CONFIRM_LINES[@]}" | sort -u | grep -c .) == 1 ]]; then
         printf '%-*s  %s\n' "$NAME_W" "All seasons:" "${CONFIRM_LINES[0]}"
     else

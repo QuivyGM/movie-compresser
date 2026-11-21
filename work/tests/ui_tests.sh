@@ -133,7 +133,7 @@ echo
 echo "== series menu"
 
 H="$T/home"
-mkdir -p "$H/compress/in/Show" "$H/compress/in/Mixed" "$H/compress/out" "$T/stub"
+mkdir -p "$H/compress/in/Show" "$H/compress/in/Mixed" "$H/compress/in/Tracks" "$H/compress/out" "$T/stub"
 cp -r "$SRC_WORK" "$H/compress/work"
 rm -rf "$H/compress/work/tests" "$H/compress/work/logs" "$H/compress/work/cache"
 rm -f "$H/compress/work"/[a-z]*[0-9].sh "$H/compress/work"/*.state "$H/compress/work"/*.progress
@@ -149,6 +149,12 @@ src() {
 for e in 1 2 3; do src 320x180 2 "$H/compress/in/Show/Show.S01E0$e.mkv"; done
 src 320x180 2 "$H/compress/in/Mixed/Mixed.S01E01.mkv"
 src 640x360 2 "$H/compress/in/Mixed/Mixed.S01E02.mkv"
+# same video, different audio layout per episode (5.1 + stereo vs mono)
+ffmpeg -v error -y -f lavfi -i "testsrc2=s=320x180:r=24:d=2" \
+    -f lavfi -i "sine=f=440:r=48000:d=2" -f lavfi -i "sine=f=660:r=48000:d=2" \
+    -map 0 -map 1 -map 2 -c:v libx264 -preset ultrafast -qp 0 -pix_fmt yuv420p \
+    -c:a ac3 -ac:a:0 6 -ac:a:1 2 "$H/compress/in/Tracks/Tracks.S01E01.mkv"
+src 320x180 2 "$H/compress/in/Tracks/Tracks.S01E02.mkv"
 
 # series High CRF_START (where every series sample starts) and
 # CRF_SEARCH_MIN (the tiny episodes fit at every CRF: the season search
@@ -208,6 +214,14 @@ menu series_compress.sh "1\n" "$L"
 sed 's/^/  | /' "$L"
 check "mismatch: flagged"                "grep -qE '^Analyzing 2 episodes\\.\\.\\. OK    Source stats: .*    Compatibility: MISMATCH\$' '$L'"
 check "mismatch: file + details shown"   "grep -q '^MISMATCH  Mixed.S01E02.mkv\$' '$L' && grep -q -- '- resolution 640x360 vs 320x180' '$L' && grep -q 'Compression cancelled.' '$L'"
+
+L="$T/series_tracks.log"
+menu series_compress.sh "3\n2\nn\n" "$L"
+sed 's/^/  | /' "$L"
+check "audio layout differs: not a mismatch" "grep -qE '^Analyzing 2 episodes\\.\\.\\. OK    Source stats: .*    Compatibility: OK\\*\$' '$L' && ! grep -q MISMATCH '$L' && ! grep -q 'Compression cancelled' '$L'"
+check "audio layout differs: reported"   "grep -q '^OK\\*       Tracks.S01E02.mkv\$' '$L' && grep -q 'differs: audio tracks 1 vs 2 ' '$L' && ! grep -q 'differs: sample rates' '$L'"
+check "audio layout differs: compact"    "compact '$L'"
+check "audio layout differs: header"     "grep -qE '^Audio: +1-2 tracks per episode, copied unchanged\$' '$L'"
 
 cp "$H/compress/work/lib/compress.conf" "$T/tiny.conf"
 sed -i 's/^SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=.*/SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=0.000001/' "$T/tiny.conf"
