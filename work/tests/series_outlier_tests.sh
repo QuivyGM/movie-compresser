@@ -399,7 +399,7 @@ ceil=$(awk -v a="$n11" -v b="$n12" 'BEGIN { printf "%.12f", (a + b) / 2 / 107374
 rate=$(rate_for "$ceil" "$H/compress/in/Show/Show.S01E03.mkv")
 C1=$(conf_with m1 SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=14 "SERIES_HIGH_VIDEO_GIB_PER_HOUR=$rate")
 L="$T/m1.log"
-menu "1\n2\ny\n" "$L" "$C1"
+menu "1\n1\ny\n" "$L" "$C1"
 sed -n '/^Estimating/,$p' "$L" | sed 's/^/  | /'
 J=$(ls "$H/compress/work"/series[0-9]*.sh 2>/dev/null | head -n 1)
 check "outlier raises the shared season CRF to 12" "grep -q '^Selected: CRF 12\$' '$L' && grep -qE '^Outlier:  S01E03 .*must fit the shared season CRF\)\$' '$L'"
@@ -415,7 +415,7 @@ check "menu output compact"                  "! grep -qP '\t' '$L' && [[ \$(awk 
 # verbose output with the outlier
 rm -f "$H/compress/work"/series[0-9]*.sh; rm -rf "$H/compress/out/Show"
 L="$T/m1v.log"
-COMPRESS_VERBOSE=1 menu "1\n2\nn\n" "$L" "$C1"
+COMPRESS_VERBOSE=1 menu "1\n1\nn\n" "$L" "$C1"
 check "verbose: policy text: one shared CRF" "grep -q 'one shared season CRF for every encoded episode; an outlier' '$L' && ! grep -q 'regular episode' '$L' && ! grep -qi 'own higher CRF' '$L'"
 check "verbose: one CRF for all episodes"    "grep -q '^  CRF 12 for all 3 episodes (shared season CRF)\$' '$L' && grep -q 'sampling CRF 12, episode 3/3 (Show.S01E03.mkv)' '$L'"
 check "verbose: analysis: the outlier decides" "grep -q '^    outlier: Show.S01E03.mkv (.*decides the shared season CRF)\$' '$L' && grep -q -- '-> every episode fits; 0 of 3 episode(s) above the ceiling' '$L' && grep -q -- '-> an episode is above the ceiling' '$L'"
@@ -428,7 +428,7 @@ rm -f "$H/compress/work"/series[0-9]*.sh; rm -rf "$H/compress/out/Show"
 C2=$(conf_with m2 SERIES_COMPACT_CRF_SEARCH_MIN=10 SERIES_COMPACT_CRF_START=10 SERIES_COMPACT_CRF_MAX=11 "SERIES_COMPACT_VIDEO_GIB_PER_HOUR=$rate" \
     SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=11 "SERIES_HIGH_VIDEO_GIB_PER_HOUR=$rate")
 L="$T/m2.log"
-menu "1\n4\n2\n" "$L" "$C2"
+menu "1\n3\n2\n" "$L" "$C2"
 sed -n '/^------/,/^Select/p' "$L" | sed 's/^/  | /'
 J=$(ls "$H/compress/work"/series[0-9]*.sh 2>/dev/null | head -n 1)
 check "Compact: outlier above at CRF_MAX: season warning + prompt" \
@@ -440,7 +440,7 @@ check "cancelled: no job"                    "[[ -z '$J' ]] && grep -q '^Compres
 # confirmation)
 rm -f "$H/compress/work"/series[0-9]*.sh; rm -rf "$H/compress/out/Show"
 L="$T/m3.log"
-menu "1\n2\ny\n" "$L" "$C2"
+menu "1\n1\ny\n" "$L" "$C2"
 sed -n '/^Expected sizes/,/^Start/p' "$L" | sed 's/^/  | /'
 J=$(ls "$H/compress/work"/series[0-9]*.sh 2>/dev/null | head -n 1)
 check "High over target: no prompt"          "! grep -q 'Select \[1-2\]' '$L' && ! grep -q 'WARNING: the' '$L' && ! grep -q 'Compression cancelled' '$L'"
@@ -455,7 +455,7 @@ check "High over target: estimate vs ceiling listed, shown again before the conf
 rm -f "$H/compress/work"/series[0-9]*.sh; rm -rf "$H/compress/out/Show"
 n_cache=$(find "$H/compress/work/cache/crf_samples" -type f | wc -l)
 L="$T/m4.log"
-menu "1\n2\nn\n" "$L" "$C1"
+menu "1\n1\nn\n" "$L" "$C1"
 check "sample cache filled"                  "(( n_cache >= 5 ))"
 eq    "second run: no new cached sections"   "$(find "$H/compress/work/cache/crf_samples" -type f | wc -l)" "$n_cache"
 check "second run: same choice"              "grep -q '^Selected: CRF 12\$' '$L'"
@@ -499,7 +499,7 @@ gmenu() {   # INPUT LOG
         bash "$H2/compress/work/series_compress.sh" > "$2" 2>&1
 }
 L="$T/g1.log"
-gmenu "1\n2\nn\n" "$L"
+gmenu "1\n1\nn\n" "$L"
 sed -n '/^Estimating/,/^Expected sizes/p' "$L" | sed 's/^/  | /'
 check "E01 / E04 sampled, E02 not in the batch samples" "grep -qE '^  S01E01  ~' '$L' && grep -qE '^  S01E04  ~' '$L' && ! grep -qE '^  S01E02  ~' '$L'"
 check "conservative estimate flagged E02: own sample taken" \
@@ -507,7 +507,7 @@ check "conservative estimate flagged E02: own sample taken" \
 check "own sample fits: no guard prompt"     "! grep -q 'Source-quality guard' '$L' && ! grep -q 'Select \\[1-3\\]' '$L'"
 n_cache=$(find "$H2/compress/work/cache/crf_samples" -type f | wc -l)
 L="$T/g2.log"
-gmenu "1\n2\nn\n" "$L"
+gmenu "1\n1\nn\n" "$L"
 eq    "second run: E02's sample reused from the cache" "$(find "$H2/compress/work/cache/crf_samples" -type f | wc -l)" "$n_cache"
 check "second run: still no guard prompt"     "! grep -q 'Source-quality guard' '$L'"
 
@@ -517,7 +517,7 @@ e2_src=$(vbytes "$G2/Guard.S01E02.mkv")
 e2_own=$(est "$G2/Guard.S01E02.mkv" 10)
 check "setup: E02 source below its own estimate" "(( e2_own >= e2_src ))"
 L="$T/g3.log"
-gmenu "1\n2\n2\nn\n" "$L"
+gmenu "1\n1\n2\nn\n" "$L"
 sed -n '/^Source check/,/^Select/p' "$L" | sed 's/^/  | /'
 check "own sample still not below: guard asks" \
     "grep -q '^Source check (' '$L' && grep -q '^Source-quality guard: 1 episode(s) are already below what\$' '$L' && grep -qE '^  S01E02 +source .*CRF 10 estimate' '$L'"
@@ -557,7 +557,7 @@ lmenu() {   # INPUT LOG CONF
         bash "$H3/compress/work/series_compress.sh" > "$2" 2>&1
 }
 L="$T/l1.log"
-lmenu "1\n2\n2\ny\n" "$L" "$LC"
+lmenu "1\n1\n2\ny\n" "$L" "$LC"
 sed -n '/^Selected/,/^Expected sizes/p' "$L" | sed 's/^/  | /'
 J=$(ls "$H3/compress/work"/series[0-9]*.sh 2>/dev/null | head -n 1)
 check "season CRF 10 from the guessed estimates" "grep -q '^Selected: CRF 10\$' '$L' && ! grep -qE '^  S01E02  ~' '$L'"
@@ -577,7 +577,7 @@ L2C=$(conf_with late2 SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SER
     SERIES_COMPACT_CRF_SEARCH_MIN=10 SERIES_COMPACT_CRF_START=10 SERIES_COMPACT_CRF_MAX=11 "SERIES_COMPACT_VIDEO_GIB_PER_HOUR=$rate")
 rm -f "$H3/compress/work"/series[0-9]*.sh; rm -rf "$H3/compress/out/Late"
 L="$T/l2.log"
-lmenu "1\n4\n2\nn\n" "$L" "$L2C"
+lmenu "1\n3\n2\nn\n" "$L" "$L2C"
 sed -n '/^Ceiling check/,/^Expected sizes/p' "$L" | sed 's/^/  | /'
 check "Compact, CRF_MAX reached: the per-episode over-ceiling prompt" \
     "grep -q 'WARNING: S01E02 cannot meet its .* GiB video ceiling (.* GiB/h)' '$L' && grep -q 'even CRF 11 (the lowest quality Compact' '$L' && grep -q '^2) Skip this episode\$' '$L'"
@@ -588,7 +588,7 @@ check "skipped: no guard prompt for it, season 10" \
 # over target (the source-quality guard still asks: encode anyway)
 rm -f "$H3/compress/work"/series[0-9]*.sh; rm -rf "$H3/compress/out/Late"
 L="$T/l3.log"
-lmenu "1\n2\n2\nn\n" "$L" "$L2C"
+lmenu "1\n1\n2\nn\n" "$L" "$L2C"
 sed -n '/^Ceiling check/,/^Start/p' "$L" | sed 's/^/  | /'
 check "High, CRF_MAX reached: no per-episode prompt" "! grep -q 'Skip this episode' '$L' && ! grep -q 'cannot meet' '$L'"
 check "High: season raised to CRF_MAX, E02 over target" \

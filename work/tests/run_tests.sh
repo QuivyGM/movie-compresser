@@ -1542,7 +1542,7 @@ if [[ -s "$MH/compress/in/Multi.mkv" ]]; then
     check "movie High: policy + analysis shown"      "grep -q 'CRF range: 19-23' '$AC/movie_High.log' && grep -q '^  CRF 19 -> estimated ' '$AC/movie_High.log' && grep -A1 '^Selected:' '$AC/movie_High.log' | grep -q 'CRF 19'"
     check "7 movie Base: CRF 25 fits, no 26+ samples" "grep -q 'sampling CRF 25 ' '$AC/movie_Base.log' && ! grep -qE 'sampling CRF (2[6-9]) ' '$AC/movie_Base.log'"
     check "18 movie Custom: exactly CRF 24"          "grep -q 'sampling CRF 24 ' '$AC/movie_Custom.log' && [[ \$(grep -c 'sampling CRF' '$AC/movie_Custom.log') == 1 ]]"
-    check "18 movie Custom: menu entry"              "grep -q '5) Custom CRF  exactly the CRF you enter' '$AC/movie_Custom.log' && grep -q 'CRF: 24 (used exactly; no size ceiling)' '$AC/movie_Custom.log'"
+    check "18 movie Custom: menu entry"              "grep -q '5) Custom CRF   exactly the CRF you enter' '$AC/movie_Custom.log' && grep -q 'CRF: 24 (used exactly; no size ceiling)' '$AC/movie_Custom.log'"
     # 14 total preview = estimated video + copied audio + other streams
     hest=$(grep -o 'est_vbytes=[0-9]*' "$AC/movie_High_job.sh" | cut -d= -f2)
     stats_load "$MH/compress/in/Multi.mkv" "" exact
@@ -1609,11 +1609,11 @@ if [[ -s "$MH/compress/in/Multi.mkv" ]]; then
     cp "$MH/compress/in/Multi.mkv" "$MH/compress/in/Show/E01.mkv"
     cp "$MH/compress/in/Multi.mkv" "$MH/compress/in/Show/E02.mkv"
     mv "$MH/compress/in/Multi.mkv" "$AC/Multi.mkv"
-    for sel in "1:Base:24" "2:High:18" "3:Custom:16" "3:Custom:17"; do
+    for sel in "1:Base:24" "2:High:18" "3:Custom:16" "3:Custom:17"; do   # k: check number only
         k="${sel%%:*}"; t="${sel#*:}"; c="${t#*:}"; t="${t%%:*}"
         log="$AC/series_$t.log"; [[ $c == 17 ]] && log="$AC/series_Custom17.log"
         rm -f "$MH/compress/work"/series[0-9]*.sh; rm -rf "$MH/compress/out/Show"*
-        in="1\n$k\ny\n"; [[ $t == Custom ]] && in="1\n3\n$c\ny\n"
+        in="1\n$( [[ $t == High ]] && echo 1 || echo 2)\ny\n"; [[ $t == Custom ]] && in="1\n5\n$c\ny\n"   # menu: 1 High, 2 Base, 5 Custom CRF
         menu "$MH/compress/work/series_compress.sh" "$in" "$log"
         job=$(ls "$MH/compress/work"/series[0-9]*.sh 2>/dev/null | head -1)
         check "acopy $((k + 4)): series $t $c job written"    "[[ -n '$job' ]]"
@@ -1627,7 +1627,7 @@ if [[ -s "$MH/compress/in/Multi.mkv" ]]; then
     check "series header: High 18-21 / 5 GiB"  "grep -q 'CRF range: 18-21' '$AC/series_Base.log' && grep -q 'video ceiling: 5 GiB/episode' '$AC/series_Base.log'"
     check "series header: Base 24-27 / 1.5 GiB" "grep -q 'CRF range: 24-27' '$AC/series_Base.log' && grep -q 'video ceiling: 1.5 GiB/episode' '$AC/series_Base.log'"
     check "series header: Custom exact user CRF"       "grep -q 'CRF: exact user CRF' '$AC/series_Base.log'"
-    check "acopy: series Custom label"                 "grep -q '3) Custom CRF  exactly the CRF you enter' '$AC/series_Custom.log'"
+    check "acopy: series Custom label"                 "grep -q '5) Custom CRF   exactly the CRF you enter' '$AC/series_Custom.log'"
     check "series Base: batch sampled at 24 only"      "grep -q 'sampling CRF 24, episode 1/2 (E01.mkv)' '$AC/series_Base.log' && grep -q 'sampling CRF 24, episode 2/2 (E02.mkv)' '$AC/series_Base.log' && ! grep -q 'sampling CRF 25' '$AC/series_Base.log'"
     check "series High: starts at 18, nothing else"    "grep -q 'sampling CRF 18, episode 1/2' '$AC/series_High.log' && ! grep -qE 'sampling CRF (19|2[0-9])' '$AC/series_High.log'"
     check "series Custom 16: sampled at 16 only"       "grep -q 'sampling CRF 16, episode 2/2' '$AC/series_Custom.log' && [[ \$(grep -oE 'sampling CRF [0-9.]+' '$AC/series_Custom.log' | sort -u) == 'sampling CRF 16' ]]"
@@ -2071,7 +2071,7 @@ sclean() { rm -f "$SH/compress/work"/series[0-9]*.sh; rm -rf "$SH/compress/out"/
 crfs_in() { grep -o -- '-crf:v:0 [0-9.]*' "$1" | sort | uniq -c | awk '{ print $3 "x" $1 }' | tr '\n' ' '; }
 
 # High, default 5 GiB ceiling: CRF 18 selected immediately; job run end to end
-run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n2\ny\n" "$T/ss_high18.log"
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n1\ny\n" "$T/ss_high18.log"
 sj=$(sjobs)
 sed -n '/^CRF analysis/,/^Season totals/p' "$T/ss_high18.log" | sed 's/^/  | /'
 check "smoke series High: CRF 18 immediately"  "grep -q '^  CRF 18 for all 3 episodes' '$T/ss_high18.log' && ! grep -qE 'sampling CRF (19|2[0-9])' '$T/ss_high18.log'"
@@ -2094,7 +2094,7 @@ eq    "smoke series High: E-AC-3 title with its rate" "$(for f in "$SH/compress/
 # (CRF_MAX 51 so that one always exists), for every episode
 sclean
 ceil=$(awk -v a="$s18" -v b="$s19" 'BEGIN { printf "%.12f", (a + b) / 2 / 1073741824 }')
-run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n2\nn\n" "$T/ss_high19.log" "$(conf_with ssh19 "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil" SERIES_HIGH_CRF_MAX=51)"
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n1\nn\n" "$T/ss_high19.log" "$(conf_with ssh19 "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil" SERIES_HIGH_CRF_MAX=51)"
 x=$(sed -n 's/^  CRF \([0-9]*\) for all 3 episodes (shared season CRF)$/\1/p' "$T/ss_high19.log")
 ok_x=0
 if [[ "$x" =~ ^[0-9]+$ ]] && (( x >= 19 )); then
@@ -2114,7 +2114,7 @@ n19=$(WORK_DIR="$SH/compress/work" whole_title_estimate "$SH/compress/in/Show/E0
 n20=$(WORK_DIR="$SH/compress/work" whole_title_estimate "$SH/compress/in/Show/E03.mkv" 20)
 check "series smoke: E03 at 20 still above E01 at 18" "(( n20 > s18 && n19 > n20 ))"
 ceil=$(awk -v a="$n19" -v b="$n20" 'BEGIN { printf "%.12f", (a + b) / 2 / 1073741824 }')
-run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n2\ny\n" "$T/ss_outlier.log" "$(conf_with ssout "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")"
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n1\ny\n" "$T/ss_outlier.log" "$(conf_with ssout "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")"
 sed -n '/^Expected sizes:/,/^  ABOVE CEILING/p' "$T/ss_outlier.log" | sed 's/^/  | /'
 check "smoke series outlier: season raised to 20 for all" "grep -q '^  CRF 20 for all 3 episodes (shared season CRF)\$' '$T/ss_outlier.log' && grep -q 'sampling CRF 19, episode 3/3' '$T/ss_outlier.log' && grep -q 'sampling CRF 20, episode 3/3 (E03.mkv)' '$T/ss_outlier.log' && ! grep -q 'sampling CRF 21' '$T/ss_outlier.log'"
 check "smoke series outlier: analysis, the outlier decides" "grep -q '^    outlier: E03.mkv (.*decides the shared season CRF)\$' '$T/ss_outlier.log'"
@@ -2124,13 +2124,13 @@ eq    "smoke series outlier: every episode at CRF 20" "$(crfs_in "$(sjobs)")" "2
 
 # Base, default 1.5 GiB ceiling: CRF 24 immediately
 sclean
-run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n1\ny\n" "$T/ss_base.log"
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n2\ny\n" "$T/ss_base.log"
 check "smoke series Base: CRF 24 immediately"  "grep -q '^  CRF 24 for all 3 episodes' '$T/ss_base.log' && ! grep -qE 'sampling CRF 2[5-9]' '$T/ss_base.log'"
 eq    "smoke series Base: one CRF 24 job x3"   "$(crfs_in "$(sjobs)")" "24x3 "
 
 # Custom CRF 16 (below the High range)
 sclean
-run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n3\n16\ny\n" "$T/ss_c16.log"
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n5\n16\ny\n" "$T/ss_c16.log"
 check "smoke series Custom 16: selected"       "grep -q '^  CRF 16 for all 3 episodes' '$T/ss_c16.log' && [[ \$(grep -oE 'sampling CRF [0-9.]+' '$T/ss_c16.log' | sort -u) == 'sampling CRF 16' ]]"
 eq    "smoke series Custom 16: job x3"         "$(crfs_in "$(sjobs)")" "16x3 "
 check "smoke series Custom 16: copies audio"   "no_audio_encoding '$(sjobs)'"
@@ -2138,18 +2138,18 @@ check "smoke series Custom 16: copies audio"   "no_audio_encoding '$(sjobs)'"
 # ceiling unreachable within the range: CRF_MAX + warning + confirmation
 sclean
 SS_TINY=$(conf_with sstiny SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=0.000000001 SERIES_BASE_VIDEO_SIZE_CEILING_GIB=0.000000001)
-run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n2\n1\nn\n" "$T/ss_over_high.log" "$SS_TINY"
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n1\n1\nn\n" "$T/ss_over_high.log" "$SS_TINY"
 eq    "series High over: 18..21 sampled, not 22" "$(grep -oE 'sampling CRF [0-9]+, episode 3/3' "$T/ss_over_high.log" | cut -d' ' -f3 | tr -d , | tr '\n' ' ')" "18 19 20 21 "
 check "series High over: warns, asks, CRF 21"   "grep -q 'cannot be met' '$T/ss_over_high.log' && grep -q 'allowed High quality range: even CRF 21' '$T/ss_over_high.log' && grep -q '1) Encode every episode at CRF 21 anyway' '$T/ss_over_high.log' && grep -q '^  CRF 21 for all 3 episodes' '$T/ss_over_high.log'"
-run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n1\n2\n" "$T/ss_over_base.log" "$SS_TINY"
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "1\n2\n2\n" "$T/ss_over_base.log" "$SS_TINY"
 check "series Base over: CRF 27 warned, cancel" "grep -q 'allowed Base quality range: even CRF 27' '$T/ss_over_base.log' && grep -q 'Compression cancelled' '$T/ss_over_base.log' && [[ -z \"\$(sjobs)\" ]]"
 
 # output resolution: 1080-class downscale vs original 4K (series samples)
 mkdir -p "$SH/compress/in/UHDShow"
 cp "$T/uhd.mkv" "$SH/compress/in/UHDShow/E01.mkv"
-run_menu "$SH" "$SH/compress/work/series_compress.sh" "2\n2\n3\n20\nn\nn\n" "$T/ss_uhd_down.log"
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "2\n2\n5\n20\nn\nn\n" "$T/ss_uhd_down.log"
 check "22 series downscale: estimate at 1920x960" "grep -q 'Estimating video size from sample encodes (1 of 1 episodes, 1920x960 output, downscaled like the final encode)' '$T/ss_uhd_down.log'"
-run_menu "$SH" "$SH/compress/work/series_compress.sh" "2\n1\n3\n20\nn\nn\n" "$T/ss_uhd_keep.log"
+run_menu "$SH" "$SH/compress/work/series_compress.sh" "2\n1\n5\n20\nn\nn\n" "$T/ss_uhd_keep.log"
 check "23 series 4K kept: estimate at 3840x1920"  "grep -q 'Estimating video size from sample encodes (1 of 1 episodes, 3840x1920 output)' '$T/ss_uhd_keep.log'"
 unset -f sjobs sclean crfs_in
 
@@ -2173,16 +2173,16 @@ name_case() {
     check "$label: menu shows the folder"                "grep -qxF \"  \$want\" '$T/name_$label.log'"
     NAME_HOME="$h"
 }
-name_case slow    "Slow-Horses"    "2\n" High
-name_case true    "True Detective" "2\n" High
-name_case tlou    "The-Last-of-Us" "1\n" Base
-name_case punct   "Mr. Robot (2015) - S1, Part [A]! & 'B'" "3\n20\n" Custom
+name_case slow    "Slow-Horses"    "1\n" High
+name_case true    "True Detective" "1\n" High
+name_case tlou    "The-Last-of-Us" "2\n" Base
+name_case punct   "Mr. Robot (2015) - S1, Part [A]! & 'B'" "5\n20\n" Custom
 
 # 4 High / Base / Custom of one series share the same preserved folder
 NH=$(new_home tiers)
 mkdir -p "$NH/compress/in/Slow-Horses"
 cp "$T/ep.mkv" "$NH/compress/in/Slow-Horses/$EP_NAME.mkv"
-for sel in "2\n:High" "1\n:Base" "3\n16\n:Custom"; do
+for sel in "1\n:High" "2\n:Base" "5\n16\n:Custom"; do
     rm -f "$NH/compress/work"/series[0-9]*.sh
     run_menu "$NH" "$NH/compress/work/series_compress.sh" "1\n${sel%%:*}y\n" "$T/name_tier_${sel##*:}.log"
     check "tiers ${sel##*:}: output in out/Slow-Horses" "grep -qF -- \"\$(printf '%q' \"$NH/compress/out/Slow-Horses/$EP_NAME HEVC ${sel##*:}.mkv\")\" '$(first_job "$NH" series)'"
@@ -2192,23 +2192,23 @@ eq    "tiers: one folder for all three tiers"    "$(cd "$NH/compress/out" && fin
 # existing outputs in the preserved folder: keep both -> " (2)"
 : > "$NH/compress/out/Slow-Horses/$EP_NAME HEVC High.mkv"
 rm -f "$NH/compress/work"/series[0-9]*.sh
-run_menu "$NH" "$NH/compress/work/series_compress.sh" "1\n2\n1\ny\n" "$T/name_exist.log"
+run_menu "$NH" "$NH/compress/work/series_compress.sh" "1\n1\n1\ny\n" "$T/name_exist.log"
 check "existing output: reported in the folder" "grep -q '1 of 1 outputs already exist in:' '$T/name_exist.log' && grep -qxF \"  $NH/compress/out/Slow-Horses\" '$T/name_exist.log'"
 check "existing output: keep both -> (2)"       "grep -qF -- \"\$(printf '%q' \"$NH/compress/out/Slow-Horses/$EP_NAME HEVC High (2).mkv\")\" '$(first_job "$NH" series)'"
 # existing output symlink in the folder: notice, never written through
 ln -s "$T/ep.mkv" "$NH/compress/out/Slow-Horses/$EP_NAME HEVC Base.mkv"
 rm -f "$NH/compress/work"/series[0-9]*.sh
-run_menu "$NH" "$NH/compress/work/series_compress.sh" "1\n1\n2\ny\n" "$T/name_link.log"
+run_menu "$NH" "$NH/compress/work/series_compress.sh" "1\n2\n2\ny\n" "$T/name_link.log"
 check "existing output symlink: notice"         "grep -q 'Existing output is a symlink:' '$T/name_link.log' && grep -q 'The target file will NOT be modified.' '$T/name_link.log'"
 # a file (or broken symlink) with the folder's name: stop before anything
 NF=$(new_home namefile)
 mkdir -p "$NF/compress/in/Slow-Horses"
 cp "$T/ep.mkv" "$NF/compress/in/Slow-Horses/E01.mkv"
 : > "$NF/compress/out/Slow-Horses"
-run_menu "$NF" "$NF/compress/work/series_compress.sh" "1\n2\ny\n" "$T/name_file.log"
+run_menu "$NF" "$NF/compress/work/series_compress.sh" "1\n1\ny\n" "$T/name_file.log"
 check "folder name taken by a file: cancelled"  "grep -q 'Output folder name is taken by something that is not a folder' '$T/name_file.log' && [[ -z \"\$(first_job '$NF' series)\" && -f '$NF/compress/out/Slow-Horses' ]]"
 rm -f "$NF/compress/out/Slow-Horses"; ln -s "$NF/nowhere" "$NF/compress/out/Slow-Horses"
-run_menu "$NF" "$NF/compress/work/series_compress.sh" "1\n2\ny\n" "$T/name_broken.log"
+run_menu "$NF" "$NF/compress/work/series_compress.sh" "1\n1\ny\n" "$T/name_broken.log"
 check "folder name is a broken symlink: cancelled" "grep -q '(broken symlink)' '$T/name_broken.log' && [[ -z \"\$(first_job '$NF' series)\" && ! -e '$NF/nowhere' ]]"
 
 # verification pairs outputs in the preserved folder with their source,
@@ -2254,7 +2254,7 @@ mkdir -p "$GH/compress/in/LowShow"
 cp "$GH/compress/in/Low.mkv" "$GH/compress/in/LowShow/E01.mkv"
 cp "$GH/compress/in/Low.mkv" "$GH/compress/in/LowShow/E02.mkv"
 mv "$GH/compress/in/Low.mkv" "$T/Low.mkv"
-run_menu "$GH" "$GH/compress/work/series_compress.sh" "1\n2\n1\ny\n" "$T/guard_series.log"
+run_menu "$GH" "$GH/compress/work/series_compress.sh" "1\n1\n1\ny\n" "$T/guard_series.log"
 sjob=$(first_job "$GH" series)
 check "guard series: episodes listed"           "grep -q 'Source-quality guard: 2 episode(s) are already below' '$T/guard_series.log'"
 check "guard series: both kept (video copy)"    "[[ \$(grep -c 'video=copy' '$sjob') == 2 ]] && ! grep -q libx265 '$sjob'"

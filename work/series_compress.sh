@@ -802,31 +802,37 @@ per_file() {
 
 echo
 echo "Compression tier:"
+# from the best quality to the smallest video, then the manual tiers;
+# display only: the tier names (output names, COMPRESSION_TIER tags,
+# compress.conf) stay Base / High / Compact / Custom / Size<GiB>G
+echo "Preset (CRF chosen to fit the size):"
 if ui_verbose; then
-    crf_tier_load series Base
-    echo "1) Base        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of each episode's runtime (audio copied unchanged)"
     crf_tier_load series High
-    echo "2) High        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of each episode's runtime (audio copied unchanged)"
-    echo "3) Custom CRF  exactly the CRF you enter, any 0-${CRF_LIMIT} (no range or ceiling; audio copied unchanged)"
+    echo "1) High         CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of each episode's runtime (audio copied unchanged)"
+    crf_tier_load series Base
+    echo "2) Base         CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of each episode's runtime (audio copied unchanged)"
     crf_tier_load series Compact
-    echo "4) Compact     CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of each episode's runtime (audio copied unchanged)"
-    echo "5) Custom size the video ceiling you enter (GiB/episode), CRF ${SERIES_CUSTOMSIZE_CRF_SEARCH_MIN}-${SERIES_CUSTOMSIZE_CRF_MAX} or the range you enter, search starts at ${SERIES_CUSTOMSIZE_CRF_START} (audio copied unchanged)"
+    echo "3) Compact      CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of each episode's runtime (audio copied unchanged)"
+    echo "Manual:"
+    echo "4) Custom size  the video ceiling you enter (GiB/episode), CRF ${SERIES_CUSTOMSIZE_CRF_SEARCH_MIN}-${SERIES_CUSTOMSIZE_CRF_MAX} or the range you enter, search starts at ${SERIES_CUSTOMSIZE_CRF_START} (audio copied unchanged)"
+    echo "5) Custom CRF   exactly the CRF you enter, any 0-${CRF_LIMIT} (no range or ceiling; audio copied unchanged)"
 else
-    crf_tier_load series Base
-    printf '1) %-7s CRF %-7s <=%s GiB/h video\n' Base "${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR"
     crf_tier_load series High
-    printf '2) %-7s CRF %-7s <=%s GiB/h video\n' High "${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR"
-    printf '3) %-7s exact CRF (0-%s)\n' Custom "$CRF_LIMIT"
+    printf '1) %-11s  CRF %-7s <=%s GiB/h video\n' High "${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR"
+    crf_tier_load series Base
+    printf '2) %-11s  CRF %-7s <=%s GiB/h video\n' Base "${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR"
     crf_tier_load series Compact
-    printf '4) %-7s CRF %-7s <=%s GiB/h\n' Compact "${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR"
-    printf '5) %-7s CRF %-7s <=entered GiB/episode\n' "Custom size" "${SERIES_CUSTOMSIZE_CRF_SEARCH_MIN}-${SERIES_CUSTOMSIZE_CRF_MAX}"
+    printf '3) %-11s  CRF %-7s <=%s GiB/h video\n' Compact "${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR"
+    echo "Manual:"
+    printf '4) %-11s  CRF %-7s <=your GiB/episode video\n' "Custom size" "${SERIES_CUSTOMSIZE_CRF_SEARCH_MIN}-${SERIES_CUSTOMSIZE_CRF_MAX}"
+    printf '5) %-11s  exact CRF 0-%s, no size limit\n' "Custom CRF" "$CRF_LIMIT"
 fi
-(( MULTI == 1 )) && echo "   (every season gets its own shared season CRF)"
+(( MULTI == 1 )) && echo "(every season gets its own shared season CRF)"
 
 CUSTOM_CRF=""
 
-# Compact is 4 (after Custom) and Custom size 5, so the existing
-# selections keep their meaning. Custom size: TIER "Size<GiB>G" (naming.sh
+# 1 High, 2 Base, 3 Compact (presets), 4 Custom size, 5 Custom CRF
+# (manual; TIER "Custom"). Custom size: TIER "Size<GiB>G" (naming.sh
 # size_tier_token; the ceiling is part of the tier, the output name and
 # the COMPRESSION_TIER tag) with the CRF range entered here
 # (policy.sh customsize_range_parse -> CUSTOMSIZE_CRF_*).
@@ -835,10 +841,10 @@ while true; do
     read -rp "Select [1-5]: " t
 
     case "$t" in
-        1) TIER="Base"; break ;;
-        2) TIER="High"; break ;;
-        4) TIER="Compact"; break ;;
-        3)
+        1) TIER="High"; break ;;
+        2) TIER="Base"; break ;;
+        3) TIER="Compact"; break ;;
+        5)
             TIER="Custom"
             while true; do
                 read -rp "Custom CRF: " CUSTOM_CRF
@@ -847,7 +853,7 @@ while true; do
             done
             break
             ;;
-        5)
+        4)
             while true; do
                 read -rp "Video ceiling (GiB/episode, e.g. 1.2): " size_in || exit 0
                 TIER=$(size_tier_token "$size_in") && break

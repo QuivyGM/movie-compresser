@@ -307,12 +307,12 @@ echo
 echo "== 5 series menu (stand-ins)"
 
 L="$T/m1.log"
-menu "1\n1\n1\n2\ny\n" "$L"
+menu "1\n1\n2\n2\ny\n" "$L"
 J1=$(job_of)
 check "5 menu line: seasons and episodes"        "hasx '$L' '1) Clash [2 seasons, 2 episodes]' && hasx '$L' '2) Columbo (1968) [4 seasons, 8 episodes]' && hasx '$L' '3) Flat [2 episodes]'"
 L="$T/m2.log"
 rm -f "$CB"/work/series[0-9]*.sh
-menu "2\n1\n1\n2\ny\n" "$L"
+menu "2\n1\n1\n1\ny\n" "$L"
 J=$(job_of)
 check "5 season prompt"                          "hasx '$L' '1) All seasons  (4 seasons, 8 episodes)' && hasx '$L' '2) Select seasons'"
 check "5 analysis: one line per season" \
@@ -355,7 +355,7 @@ check "5 exclusion: cancel stops before the tier" "has '$L' 'Compression cancell
 
 # select seasons: invalid input, then "1,4"
 L="$T/m4.log"
-menu "2\n2\n9\n1,4\n3\n20\ny\n" "$L"
+menu "2\n2\n9\n1,4\n5\n20\ny\n" "$L"
 J=$(job_of)
 check "5 numbered season list with episode counts" "grep -qE '^ 1\\) Season 00 - Specials +1 episode\$' '$L' && grep -qE '^ 3\\) Season 2 +2 episodes\$' '$L'"
 check "5 invalid selection asked again"          "has '$L' 'Invalid selection: enter season numbers 1-4 and ranges, e.g. 1,3,5-7'"
@@ -367,7 +367,7 @@ rm -f "$CB"/work/series[0-9]*.sh
 
 # labels unique across seasons
 L="$T/m5.log"
-menu "1\n1\n2\ny\n" "$L"
+menu "1\n1\n1\ny\n" "$L"
 J=$(job_of)
 check "5 clashing labels get their season"       "grep -qE '^Season 1 +CRF [0-9]+ +decisive [0-9.]+ GiB \\(S01/Episode [0-9]\\)' '$L' && grep -qE '^Season 2 +CRF [0-9]+ +decisive [0-9.]+ GiB \\(S02/Episode [0-9]\\)' '$L'"
 check "5 job labels unique"                      "grep -q 'ep_label=S01/Episode\\\\ 1' '$J' && grep -q 'ep_label=S02/Episode\\\\ 1' '$J'"
@@ -375,7 +375,7 @@ rm -f "$CB"/work/series[0-9]*.sh
 
 # flat folder: no season prompt, earlier output and job format
 L="$T/m6.log"
-menu "3\n2\ny\n" "$L"
+menu "3\n1\ny\n" "$L"
 J=$(job_of)
 check "5 flat: no season prompt, analysis line as before" \
     "! has '$L' 'Select seasons' && grep -qE '^Analyzing 2 episodes\\.\\.\\. OK    Source stats: from metadata    Compatibility: OK\$' '$L'"
@@ -392,7 +392,7 @@ for e in 1 2; do ep "$G2/Season A/Guard S01E0$e.mkv" vrate20=500000; done
 ep "$G2/Season B/Guard S02E01.mkv" vrate20=500000 vbps=2000000
 ep "$G2/Season B/Guard S02E02.mkv" vrate20=500000
 L="$T/m8.log"
-menu "4\n1\n2\n3\ny\n" "$L"
+menu "4\n1\n1\n3\ny\n" "$L"
 J=$(job_of)
 check "5 guard prompt under the season header" \
     "grep -B12 'Source-quality guard: 1 episode' '$L' | grep -qx -- '---- Season B ----' && ! grep -qx -- '---- Season A ----' '$L'"
@@ -406,7 +406,7 @@ mkdir -p "$CB/out/Guard/Season A" "$CB/out/Guard/Season B"
 : > "$CB/out/Guard/Season A/Guard S01E01 HEVC High.mkv.part"     # another encode writing it
 : > "$CB/out/Guard/Season B/Guard S02E02 HEVC High.mkv.part"
 L="$T/m9.log"
-menu "4\n1\n2\n3\n3\ny\n" "$L"
+menu "4\n1\n1\n3\n3\ny\n" "$L"
 J=$(job_of)
 eq    "5 existing outputs: one question"         "$(grep -c '^1) Keep both' "$L")" "1"
 check "5 existing outputs listed per season" \
@@ -417,7 +417,7 @@ rm -f "$CB"/work/series[0-9]*.sh "$CB/out/Guard/Season A/"*.part "$CB/out/Guard/
 # leftover CRF attempt files of any selected season: not started
 : > "$CB/out/Guard/Season B/Guard S02E02 HEVC High.mkv.retry-crf13.part"
 L="$T/m10.log"
-menu "4\n1\n2\n3\ny\n" "$L"
+menu "4\n1\n1\n3\ny\n" "$L"
 check "5 leftover CRF attempt in one season: cancelled, listed" \
     "has '$L' 'Leftover CRF attempt files' && has '$L' 'Season B/Guard S02E02 HEVC High.mkv.retry-crf13.part' && [[ -z \"\$(job_of)\" ]]"
 rm -f "$CB/out/Guard/Season B/"*.part
@@ -427,7 +427,7 @@ U="$CB/in/Mixed Res"
 for e in 1 2; do ep "$U/Season 01/Mixed S01E0$e.mkv" vrate20=900000 res=3840x2160; done
 for e in 1 2; do ep "$U/Season 02/Mixed S02E0$e.mkv" vrate20=500000; done
 L="$T/m11.log"
-menu "5\n1\n2\n2\ny\n" "$L"
+menu "5\n1\n2\n1\ny\n" "$L"
 J=$(job_of)
 eq    "5 resolution asked once"                  "$(grep -c '^Output resolution:' "$L")" "1"
 check "5 resolution prompt names the season it applies to" "has '$L' '(applies to Season 01; the other seasons are 1080p or less)'"
@@ -444,7 +444,7 @@ ep "$A/Season 01/Tracks S01E03.mkv" vrate20=500000 audio=2,2
 ep "$A/Season 02/Tracks S02E01.mkv" vrate20=500000 audio=6,2
 ep "$A/Season 02/Tracks S02E02.mkv" vrate20=500000 audio=6,2
 L="$T/m12.log"
-menu "6\n1\n2\ny\n" "$L"
+menu "6\n1\n1\ny\n" "$L"
 J=$(job_of)
 check "5 audio layout differs: OK*, not excluded" \
     "grep -qE '^Season 01 +3  1920x1080 H264  SDR +from metadata +OK\\*\$' '$L' && ! has '$L' 'MISMATCH' && ! has '$L' 'Excluded' && ! has '$L' 'Continue with the remaining'"
@@ -456,7 +456,7 @@ check "5 audio layout differs: both seasons queued" \
 check "5 audio layout differs: lines fit 120 columns" "[[ \$(awk 'length > 120' '$L' | grep -c .) == 0 ]]"
 rm -f "$CB"/work/series[0-9]*.sh
 L="$T/m13.log"
-menu "6\n2\n1\n2\nn\n" "$L" COMPRESS_VERBOSE=1
+menu "6\n2\n1\n1\nn\n" "$L" COMPRESS_VERBOSE=1
 check "5 audio layout differs, one season: header and stream notes" \
     "has '$L' 'Audio tracks:  1-2 (differs per episode)' && has '$L' 'differs: audio channels [6] vs [6, 2]' && has '$L' 'All files compatible.' && has '$L' '(tracks of Tracks S01E01.mkv; each episode'\''s own tracks are copied)'"
 
@@ -476,7 +476,7 @@ mkdir -p "$Z/Season 02"; printf '%s\n' dur=1320 vrate20=3000000 > "$Z/Season 02/
 ep "$Z/Season 02/Zover S02E02.mkv" vrate20=500000
 L="$T/m13o.log"
 rm -f "$CB"/work/series[0-9]*.sh
-menu "7\n1\n1\ny\n" "$L"
+menu "7\n1\n2\ny\n" "$L"
 J=$(job_of)
 sed -n '/^Expected sizes/,$p' "$L" | sed 's/^/  | /'
 check "5 over target: no question"             "! has '$L' 'Encode every episode' && ! has '$L' 'WARNING' && ! has '$L' 'Compression cancelled'"

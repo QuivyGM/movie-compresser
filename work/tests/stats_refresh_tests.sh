@@ -174,7 +174,7 @@ menu() {   # SCRIPT INPUT LOG
 }
 for r in 1 2 3; do
     menu movie_compress.sh "1\n2\nn\n" "$T/movie$r.log"
-    menu series_compress.sh "1\n2\nn\n" "$T/series$r.log"
+    menu series_compress.sh "1\n1\nn\n" "$T/series$r.log"
 done
 check "7 movie run 1: scanned + refreshed"   "grep -q '^Analyzing source... OK    Source stats: scanned + refreshed\$' '$T/movie1.log'"
 check "7 movie runs 2, 3: cached"            "grep -q 'Source stats: cached\$' '$T/movie2.log' && grep -q 'Source stats: cached\$' '$T/movie3.log'"

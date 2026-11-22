@@ -258,27 +258,33 @@ while true; do
 
     echo
     echo "Compression tier:"
+    # from the best quality to the smallest video, then the manual tier;
+    # display only: the tier names (output names, COMPRESSION_TIER tags,
+    # compress.conf) stay Quality / High / Base / Compact / Custom
+    echo "Preset (CRF chosen to fit the size):"
     if ui_verbose; then
-        echo "1) Quality     CRF search (start ${MOVIE_QUALITY_CRF_START}, range ${MOVIE_QUALITY_CRF_MIN}-${MOVIE_QUALITY_CRF_MAX}), video $QUALITY_MENU_TEXT"
+        echo "1) Quality      CRF search (start ${MOVIE_QUALITY_CRF_START}, range ${MOVIE_QUALITY_CRF_MIN}-${MOVIE_QUALITY_CRF_MAX}), video $QUALITY_MENU_TEXT"
         # High / Base / Compact: the ceiling scales with the runtime (GiB
         # per hour); this movie's ceiling in parentheses
         crf_tier_load movie High "" "$DURATION" 2>/dev/null || true
-        echo "2) High        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of runtime (${CRF_CEILING_GIB} GiB for this movie)"
+        echo "2) High         CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of runtime (${CRF_CEILING_GIB} GiB for this movie)"
         crf_tier_load movie Base "" "$DURATION" 2>/dev/null || true
-        echo "3) Base        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of runtime (${CRF_CEILING_GIB} GiB for this movie)"
+        echo "3) Base         CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of runtime (${CRF_CEILING_GIB} GiB for this movie)"
         crf_tier_load movie Compact "" "$DURATION" 2>/dev/null || true
-        echo "4) Compact     CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of runtime (${CRF_CEILING_GIB} GiB for this movie)"
-        echo "5) Custom CRF  exactly the CRF you enter (default $(movie_custom_crf_default)), no size target or ceiling;"
-        echo "               archival use: optional x265 film-grain tuning, or keep the source video"
+        echo "4) Compact      CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of runtime (${CRF_CEILING_GIB} GiB for this movie)"
+        echo "Manual:"
+        echo "5) Custom CRF   exactly the CRF you enter (default $(movie_custom_crf_default)), no size target or ceiling;"
+        echo "                archival use: optional x265 film-grain tuning, or keep the source video"
     else
-        printf '1) %-8s %-11s %s\n' Quality "CRF search" "$QUALITY_MENU_TEXT"
+        printf '1) %-11s  %-11s %s\n' Quality "CRF search" "$QUALITY_MENU_TEXT"
         crf_tier_load movie High "" "$DURATION" 2>/dev/null || true
-        printf '2) %-8s %-11s <=%s GiB/h  (%s GiB)\n' High "CRF ${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR" "$CRF_CEILING_GIB"
+        printf '2) %-11s  %-11s <=%s GiB/h  (%s GiB)\n' High "CRF ${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR" "$CRF_CEILING_GIB"
         crf_tier_load movie Base "" "$DURATION" 2>/dev/null || true
-        printf '3) %-8s %-11s <=%s GiB/h  (%s GiB)\n' Base "CRF ${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR" "$CRF_CEILING_GIB"
+        printf '3) %-11s  %-11s <=%s GiB/h  (%s GiB)\n' Base "CRF ${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR" "$CRF_CEILING_GIB"
         crf_tier_load movie Compact "" "$DURATION" 2>/dev/null || true
-        printf '4) %-8s %-11s <=%s GiB/h  (%s GiB)\n' Compact "CRF ${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR" "$CRF_CEILING_GIB"
-        printf '5) %-8s exact CRF (0-%s), no size limit\n' Custom "$CRF_LIMIT"
+        printf '4) %-11s  %-11s <=%s GiB/h  (%s GiB)\n' Compact "CRF ${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR" "$CRF_CEILING_GIB"
+        echo "Manual:"
+        printf '5) %-11s  exact CRF 0-%s, no size limit\n' "Custom CRF" "$CRF_LIMIT"
     fi
 
     CUSTOM_CRF=""

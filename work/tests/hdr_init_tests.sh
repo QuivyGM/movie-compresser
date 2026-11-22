@@ -152,7 +152,7 @@ if (( HAVE_H10P == 1 )) && x265_ok=$(strict "x265_hdr10plus_supported && echo ye
     check "episodes are HDR10 + HDR10+"          "[[ \"\$probe_out\" == 'HDR10 1' ]]"
 
     L="$T/series_fresh.log"
-    menu "$H/compress/work/series_compress.sh" "1\n2\nn\n" "$L"
+    menu "$H/compress/work/series_compress.sh" "1\n1\nn\n" "$L"
     sed -n '1,/^Compression tier/p' "$L" | sed 's/^/  | /'
     check "fresh: analysis by packet scan"       "grep -qE 'Source stats: scanned' '$L'"
     check "fresh: no unbound variable"           "! grep -q 'unbound variable' '$L'"
@@ -161,13 +161,13 @@ if (( HAVE_H10P == 1 )) && x265_ok=$(strict "x265_hdr10plus_supported && echo ye
 
     if command -v mkvpropedit >/dev/null; then
         L="$T/series_cached.log"
-        menu "$H/compress/work/series_compress.sh" "1\n2\nn\n" "$L"
+        menu "$H/compress/work/series_compress.sh" "1\n1\nn\n" "$L"
         check "cached: analysis from stored statistics" "grep -qE 'Source stats: cached' '$L'"
         check "cached: no unbound variable"      "! grep -q 'unbound variable' '$L'"
         check "cached: HDR10+ PRESERVED"         "grep -q '^HDR10+:         PRESERVED\$' '$L' && grep -q '^Compression tier:' '$L' && grep -q '^exit=0\$' '$L'"
 
         L="$T/series_menu.log"
-        menu "$H/compress/compress_menu.sh" "2\n1\n2\ny\n" "$L"
+        menu "$H/compress/compress_menu.sh" "2\n1\n1\ny\n" "$L"
         check "compress_menu.sh (set -euo pipefail) -> series: no unbound variable" \
             "! grep -q 'unbound variable' '$L' && grep -qE 'Source stats: cached' '$L' && grep -q '^HDR10+:         PRESERVED\$' '$L'"
         J=$(ls "$H/compress/work"/series[0-9]*.sh 2>/dev/null | head -n 1)
@@ -198,7 +198,7 @@ if (( HAVE_H10P == 1 )) && x265_ok=$(strict "x265_hdr10plus_supported && echo ye
         check "missing tool: not dropped silently (answer N cancels)" \
             "grep -q '^Compression cancelled.\$' '$L' && ! grep -q '^Compression tier:' '$L' && ! grep -q 'unbound variable' '$L'"
         L="$T/series_noh10p_y.log"
-        menu "$H/compress/work/series_compress.sh" "1\ny\n2\nn\n" "$L" "$NOPATH"
+        menu "$H/compress/work/series_compress.sh" "1\ny\n1\nn\n" "$L" "$NOPATH"
         check "missing tool: drop only by explicit choice, reported" \
             "grep -q '^Compression tier:' '$L' && grep -q 'HDR10+ DROPPED' '$L' && ! grep -q 'unbound variable' '$L'"
     fi
