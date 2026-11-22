@@ -25,7 +25,8 @@
 #   bash ~/compress/work/tests/results_tests.sh
 #
 # Needs ffmpeg with libx265 and MKVToolNix (mkvpropedit): real media
-# files, real ffprobe. Skipped (reported) without them.
+# files, real ffprobe. Without them only section 0 runs; every other check
+# is reported as SKIPPED with its count (never a silent pass).
 set -uo pipefail
 
 SRC_WORK="$(cd "$(dirname "$0")/.." && pwd)"
@@ -34,6 +35,7 @@ T=$(mktemp -d)
 if [[ "${RESULTS_TESTS_KEEP:-0}" == 1 ]]; then echo "Kept: $T"; else trap 'rm -rf -- "$T"' EXIT; fi
 PASS=0
 FAIL=0
+SKIP=0
 
 ok()    { echo "  ok    $1"; ((PASS += 1)); }
 bad()   { echo "  FAIL  $1"; ((FAIL += 1)); }
@@ -48,7 +50,7 @@ echo "== 0 over-target records and status (results.sh functions)"
     LOGS="$T/r0/logs"
     mkdir -p "$LOGS/provenance/spool/e1" "$LOGS/provenance/spool/e2"
     source "$SRC_WORK/lib/ui.sh"
-    eval "$(sed -n '/^_over_records() {/,/^}/p; /^status_text() {/,/^}/p' "$ROOT/results.sh")"
+    eval "$(sed -n '/^_over_records() {/,/^}/p; /^_over_records_timed() {/,/^}/p; /^status_text() {/,/^}/p' "$ROOT/results.sh")"
     python3 -c 'import json
 for o, fl, vb in (("/o/A.mkv", ["over_ceiling"], 123), ("/o/B.mkv", [], 5), ("/o/C.mkv", ["below_floor"], None)):
     op = {"flags": fl} if fl else {}
@@ -62,6 +64,19 @@ print(json.dumps({"entry": "source", "file": {"path": "/i/x.mkv"}}))' > "$LOGS/p
     eq "0 status: OK / issues / over target" \
         "$(status_text 0)|$(status_text 2)|$(status_text 0 2)|$(status_text 0 1 1)|$(status_text 1 3)" \
         "OK|2 issues|over target (2)|over target|1 issue, over target (3)"
+    # record times decide, not journal-then-spool: a spool event not
+    # merged yet (05:00, no flag) is older than the journal entry (06:00,
+    # over_ceiling) of the same output; equal times keep the file order
+    LOGS="$T/r0t/logs"
+    mkdir -p "$LOGS/provenance/spool/e1" "$LOGS/provenance/spool/e2"
+    python3 -c 'import json
+for t, o, fl in (("2026-11-21T06:00:00Z", "/o/E.mkv", ["over_ceiling"]), ("2026-11-21T04:00:00Z", "/o/F.mkv", []),
+                 ("2026-11-21T07:00:00Z", "/o/G.mkv", ["over_ceiling"])):
+    print(json.dumps({"entry": "output", "op": {"recorded": t, "flags": fl}, "file": {"path": o}}))' > "$LOGS/provenance/journal.jsonl"
+    printf '%s\t%s\n' recorded 2026-11-21T05:00:00Z output /o/E.mkv > "$LOGS/provenance/spool/e1/event.tsv"
+    printf '%s\t%s\n' recorded 2026-11-21T05:00:00Z output /o/F.mkv over_ceiling 1 > "$LOGS/provenance/spool/e2/event.tsv"
+    eq "0 records by time: older spool event before a later journal entry" \
+        "$(_over_records | cut -f1,3 | tr '\t\n' ' |')" "/o/F.mkv 0|/o/E.mkv 0|/o/F.mkv 1|/o/E.mkv 1|/o/G.mkv 1|"
     echo "$PASS $FAIL" > "$T/r0.counts"
 )
 read -r PASS FAIL < "$T/r0.counts"
@@ -69,11 +84,16 @@ read -r PASS FAIL < "$T/r0.counts"
 if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null ||
    [[ "$(ffmpeg -hide_banner -encoders 2>/dev/null)" != *libx265* ]] ||
    ! command -v mkvpropedit >/dev/null; then
-    echo "skipped: results_tests.sh (needs ffmpeg with libx265 and mkvpropedit)"
+    # every check / eq line below the "# gated: media tools" line
+    SKIP=$(awk 'on && /^[[:space:]]*(check|eq) / { c++ } $0 == "# gated: media tools" { on = 1 } END { print c + 0 }' "$0")
     echo
-    echo "passed: $PASS  failed: $FAIL"
-    exit 0
+    echo "  SKIPPED  $SKIP checks: sections 1-8 need ffmpeg with libx265, ffprobe and mkvpropedit"
+    echo
+    echo "passed: $PASS  failed: $FAIL  skipped: $SKIP"
+    echo "SKIPPED: $SKIP checks not run (missing tools, see above)"
+    exit $(( FAIL > 0 ))
 fi
+# gated: media tools
 
 source "$SRC_WORK/lib/inspect.sh"
 
@@ -330,7 +350,9 @@ check "7 no compression tags written"      "[[ \"\$(compression_tags '$OUT/$C/Se
 echo
 echo "== 8 over target"
 # the job kept Other S01E01 above its video ceiling at the tier's CRF
-# limit: its latest record (same video bytes) carries over_ceiling
+# limit: its latest record (same video bytes) carries over_ceiling. The
+# spool still holds an older, unflagged event of that output (series2,
+# 05:00, section 1): the record time decides, not journal-then-spool.
 python3 -c 'import json, sys
 print(json.dumps({"entry": "output", "id": "y", "op": {"time": "2026-11-21T06:00:00Z", "recorded": "2026-11-21T06:00:00Z",
       "job": {"session": "series3", "type": "series", "log_dir": sys.argv[2]},
@@ -346,5 +368,5 @@ rs "$T/over_c.log" "$C"
 check "8 other shows: no over target"      "! grep -qi 'over target' '$T/over_c.log'"
 
 echo
-echo "passed: $PASS  failed: $FAIL"
+echo "passed: $PASS  failed: $FAIL  skipped: $SKIP"
 exit $(( FAIL > 0 ))

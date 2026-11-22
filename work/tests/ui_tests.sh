@@ -23,11 +23,36 @@ T=$(mktemp -d)
 if [[ "${UI_TESTS_KEEP:-0}" == 1 ]]; then echo "Kept: $T"; else trap 'rm -rf -- "$T"' EXIT; fi
 PASS=0
 FAIL=0
+SKIP=0
 
 ok()    { echo "  ok    $1"; ((PASS += 1)); }
 bad()   { echo "  FAIL  $1"; ((FAIL += 1)); }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 eq()    { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1  (got \"$2\", want \"$3\")"; fi; }
+# checks_in MARKER [END]  ->  number of check / eq lines of this file
+# between the line "# gated: MARKER" and the next line that is exactly
+# END ("fi", "else"; none: end of file)
+checks_in() {
+    awk -v m="# gated: $1" -v e="${2:-}" '
+        on && e != "" && $0 == e { exit }
+        on && /^[[:space:]]*(check|eq) / { c++ }
+        $0 == m { on = 1 }
+        END { print c + 0 }' "$0"
+}
+# skip MARKER REASON [END]  ->  the checks of a gated part reported as
+# SKIPPED (counted, never a silent pass)
+skip() {
+    local n
+    n=$(checks_in "$1" "${3:-}")
+    echo "  SKIPPED  $n $( (( n == 1 )) && echo check || echo checks): $2"
+    ((SKIP += n))
+}
+summary() {
+    echo
+    echo "passed: $PASS  failed: $FAIL  skipped: $SKIP"
+    (( SKIP > 0 )) && echo "SKIPPED: $SKIP checks not run (missing tools, see above)"
+    exit $(( FAIL > 0 ))
+}
 
 unset COMPRESS_VERBOSE NO_COLOR
 ESC=$'\e'
@@ -67,6 +92,7 @@ check "no colour when redirected" "[[ \"\$(ui_ok OK; ui_warn W; ui_err E; ui_bol
 
 HAVE_SCRIPT=0
 command -v script >/dev/null && HAVE_SCRIPT=1
+# gated: script-colours
 if (( HAVE_SCRIPT == 1 )); then
     printf 'source %q; ui_ok OK; ui_warn W; ui_err E; ui_bold B\n' "$SRC_WORK/lib/ui.sh" > "$T/colour.sh"
     script -qec "bash $T/colour.sh" /dev/null > "$T/colour.out"
@@ -75,7 +101,7 @@ if (( HAVE_SCRIPT == 1 )); then
     NO_COLOR=1 script -qec "bash $T/colour.sh" /dev/null > "$T/colour2.out"
     check "NO_COLOR on a terminal"    "! grep -q \"\$ESC\" '$T/colour2.out'"
 else
-    echo "  (script not found: terminal colour checks skipped)"
+    skip script-colours "script(1) not found (terminal colour checks)" else
 fi
 
 # ------------------------------------------------------------
@@ -125,9 +151,14 @@ eq "HDR10 only: nothing printed"     "$(cat "$T/hdr5.out")" ""
 eq "HDR10 only: short policy"        "$(hdr_policy_short)" "HDR10"
 
 # ------------------------------------------------------------
-for t in ffmpeg ffprobe; do
-    command -v "$t" >/dev/null || { echo "$t not found: menu tests skipped"; echo; echo "passed: $PASS  failed: $FAIL"; exit $(( FAIL > 0 )); }
-done
+# everything below needs ffmpeg / ffprobe with libx265
+if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null ||
+   [[ "$(ffmpeg -hide_banner -encoders 2>/dev/null)" != *libx265* ]]; then
+    echo
+    skip ffmpeg "ffmpeg / ffprobe with libx265 not found (series and movie menu tests)"
+    summary
+fi
+# gated: ffmpeg
 
 echo
 echo "== series menu"
@@ -161,6 +192,12 @@ src 320x180 2 "$H/compress/in/Tracks/Tracks.S01E02.mkv"
 # goes down to it) of the project config
 SHSTART=$(sed -n 's/^SERIES_HIGH_CRF_START=//p' "$H/compress/work/lib/compress.conf")
 SHMIN=$(sed -n 's/^SERIES_HIGH_CRF_SEARCH_MIN=//p' "$H/compress/work/lib/compress.conf")
+# series High / Base video ceiling: each episode's exact runtime x the
+# project's SERIES_*_VIDEO_GIB_PER_HOUR (the 2 s episodes: SHCEIL bytes)
+SHRATE=$(sed -n 's/^SERIES_HIGH_VIDEO_GIB_PER_HOUR=//p' "$H/compress/work/lib/compress.conf")
+SBRATE=$(sed -n 's/^SERIES_BASE_VIDEO_GIB_PER_HOUR=//p' "$H/compress/work/lib/compress.conf")
+SDUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$H/compress/in/Show/Show.S01E01.mkv" | tr -d '\r')
+SHCEIL=$(awk -v r="$SHRATE" -v d="$SDUR" 'BEGIN { printf "%.0f", r * 1073741824 * d / 3600 }')
 
 menu() {   # SCRIPT INPUT LOG [CONF]
     printf "$2" | HOME="$H" PATH="$T/stub:$PATH" COMPRESS_CONF="${4:-$H/compress/work/lib/compress.conf}" \
@@ -176,11 +213,11 @@ check "no file names"                    "! grep -q 'Show\\.S01E0' '$L'"
 check "one analysis line"                "grep -qE '^Analyzing 3 episodes\\.\\.\\. OK    Source stats: (scanned|scanned \\+ refreshed)    Compatibility: OK\$' '$L'"
 check "header"                           "grep -qE '^Series: +Show +Episodes: 3\$' '$L' && grep -qE '^Video: +320x180 H264 8-bit\$' '$L' && grep -qE '^Dynamic range: +SDR\$' '$L' && grep -qE '^Audio: +1 track, copied unchanged\$' '$L'"
 check "avg video from stats"             "grep -qE '^Avg video: +[0-9]+\\.[0-9]{2} GiB/episode   [0-9]+\\.[0-9] Mb/s\$' '$L'"
-check "tier menu"                        "grep -qE '^1\\) Base    CRF [0-9]+-[0-9]+ +<=[0-9.]+ GiB/episode\$' '$L' && grep -qE '^2\\) High    CRF $SHMIN-21 +<=5 GiB/episode\$' '$L' && grep -q '^3) Custom  exact CRF' '$L'"
+check "tier menu"                        "grep -qE '^1\\) Base    CRF [0-9]+-[0-9]+ +<=$SBRATE GiB/h video\$' '$L' && grep -qE '^2\\) High    CRF $SHMIN-21 +<=$SHRATE GiB/h video\$' '$L' && grep -q '^3) Custom  exact CRF' '$L'"
 check "no repeated tier policy"          "! grep -q 'CRF range' '$L'"
 check "estimating line"                  "grep -q '^Estimating High at 320x180\\.\\.\\.\$' '$L'"
 check "per-episode samples"              "grep -q '^CRF $SHSTART\$' '$L' && grep -q '^CRF $SHMIN\$' '$L' && n=\$(grep -cE '^  S01E0[123]  ~[0-9]+\\.[0-9]{2} GiB\$' '$L') && (( n >= 3 && n % 3 == 0 ))"
-check "CRF result"                       "grep -qE '^Median: +[0-9.]+ GiB\$' '$L' && grep -qE '^Largest: +[0-9.]+ GiB \\(S01E0[123], sampled\\)\$' '$L' && grep -q '^Ceiling:  5.00 GiB\$' '$L' && grep -q '^Result:   fits -> trying CRF $((SHSTART - 1))\$' '$L' && grep -q '^Result:   fits (lowest High CRF allowed)\$' '$L' && grep -q '^Selected: CRF $SHMIN\$' '$L'"
+check "CRF result"                       "grep -qE '^Median: +[0-9.]+ GiB\$' '$L' && grep -qE '^Decisive: [0-9.]+ GiB / [0-9.]+ GiB \\(S01E0[123], sampled\\)\$' '$L' && ! grep -q '^Largest:' '$L' && grep -q '^Ceiling:  $SHRATE GiB/h x each episode.s runtime (0 above)\$' '$L' && grep -q '^Result:   fits -> trying CRF $((SHSTART - 1))\$' '$L' && grep -q '^Result:   fits (lowest High CRF allowed)\$' '$L' && grep -q '^Selected: CRF $SHMIN\$' '$L'"
 check "no long blocks"                   "! grep -qE '^Tier:|Video encode:|Per-episode rules|Object audio|Season totals|^-----' '$L'"
 check "table header, no extra columns"   "grep -q '^Episode   Runtime   Video   Audio   Total\$' '$L' && ! grep -qE 'Estimate|Status|^ *CRF +Video' '$L'"
 check "table rows"                       "[[ \$(grep -cE '^S01E0[123]    0:02      [0-9.]+ +[0-9.]+ +[0-9.]+\$' '$L') == 3 ]]"
@@ -198,15 +235,22 @@ check "verbose: sampling detail"         "grep -q 'sampling CRF $SHMIN, episode 
 check "verbose: long summary"            "grep -q '^Season totals' '$L' && grep -q 'Per-episode rules' '$L'"
 check "verbose: no ANSI when redirected" "! grep -q \"\$ESC\" '$L'"
 
+# gated: mkvpropedit
 if command -v mkvpropedit >/dev/null; then
     L="$T/series2.log"
     menu series_compress.sh "2\n2\nn\n" "$L"
     check "stats cached on the next run" "grep -qE '^Analyzing 3 episodes\\.\\.\\. OK    Source stats: cached    Compatibility: OK\$' '$L'"
+else
+    skip mkvpropedit "mkvpropedit not found (stats cached on the next run)" else
 fi
 
 L="$T/series_start.log"
 menu series_compress.sh "2\n2\ny\n" "$L"
-check "job: one CRF retry item per episode" "! grep -q '^job_batch_add' '$H/compress/work/series1.sh' && [[ \$(grep -c '^   item_crf_encode item_encode_' '$H/compress/work/series1.sh') == 3 ]] && [[ \$(grep -cE 'ceiling_vbytes=[0-9]+ crf_min=$SHMIN crf_max=21 down_headroom_pct=20 down_max=1 down_fit_pct=5 crf_est=$SHMIN=[0-9]' '$H/compress/work/series1.sh') == 3 ]]"
+# one shared-CRF season batch (job_batch_add + job_crf_batch, no
+# per-episode item_crf_encode); each episode's own ceiling, no
+# per-episode headroom / lower-CRF limit / fit margin (policy.sh
+# series_season_retry_spec)
+check "job: one shared-CRF season batch, own ceilings" "[[ \$(grep -c '^job_batch_add [123]\$' '$H/compress/work/series1.sh') == 3 ]] && grep -q '^job_crf_batch\$' '$H/compress/work/series1.sh' && ! grep -q 'item_crf_encode' '$H/compress/work/series1.sh' && [[ \$(grep -c \"ceiling_vbytes=$SHCEIL crf_min=$SHMIN crf_max=21 down_headroom_pct='' down_max='' batch_mode=season ep_label=S01E0[123] crf_est=$SHMIN=[0-9]\" '$H/compress/work/series1.sh') == 3 ]] && ! grep -qE 'down_fit_pct|down_mode' '$H/compress/work/series1.sh'"
 rm -rf "$H/compress/out/Show"
 
 L="$T/series_mismatch.log"
@@ -240,12 +284,15 @@ check "ceiling: Status column"           "grep -q '^Episode   Runtime   Video   
 check "ceiling: confirmation flags it"   "grep -q '^High | CRF 21 | 320x180 | SDR | audio copied | over target\$' '$L'"
 check "ceiling: compact"                 "compact '$L'"
 
+# gated: script-terminal
 if (( HAVE_SCRIPT == 1 )); then
     script -qec "printf '2\n2\nn\n' | HOME=$H PATH=$T/stub:\$PATH bash $H/compress/work/series_compress.sh" /dev/null \
         > "$T/series_tty.log" 2>&1
     check "terminal: OK green, CRF bold"  "grep -qF \$'\\e[32mOK\\e[0m' '$T/series_tty.log' && grep -qF \$'\\e[1mCRF $SHMIN\\e[0m' '$T/series_tty.log'"
     # (no prompt check: read -p shows it only when stdin is a terminal)
     check "terminal: progress counter"    "grep -qF 'Analyzing 3 episodes... 1/3' '$T/series_tty.log'"
+else
+    skip script-terminal "script(1) not found (series menu on a terminal)" else
 fi
 
 # ------------------------------------------------------------
@@ -333,6 +380,4 @@ COMPRESS_VERBOSE=1 menu movie_compress.sh "1\n1\nn\n" "$L" "$T/qtiny.conf"
 check "Quality verbose: CRF policy, no two-pass" \
     "grep -q '^Quality CRF search:$' '$L' && grep -q '^  Range: 20-45$' '$L' && grep -q '^  Start: 30 (first CRF sampled' '$L' && grep -q '^  Target: 0.00012 GiB$' '$L' && grep -q '^  Band: 0.00001-0.0002 GiB' '$L' && grep -q '^1) Quality     CRF search (start 30, range 20-45), video ~0.00012 GiB (0.00001-0.0002)$' '$L' && grep -q 'Video encode: *x265 CRF' '$L' && ! grep -qi 'two-pass' '$L'"
 
-echo
-echo "passed: $PASS  failed: $FAIL"
-exit $(( FAIL > 0 ))
+summary

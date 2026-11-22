@@ -220,10 +220,20 @@ with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
 }
 
 # _over_records  ->  "OUTPUT<TAB>VIDEO_BYTES<TAB>OVER" per recorded output,
-# oldest first (journal, then the spool): OVER 1 when the job kept that
-# output above its video ceiling at the tier's CRF limit ("over target",
-# provenance flag over_ceiling); VIDEO_BYTES "-" when not recorded
+# oldest first by record time (UTC "recorded" / "time" of the journal
+# entry or spool event; records without one first, equal times: journal,
+# then the spool, each in file order). A spool event not merged yet can
+# be OLDER than a journal entry: file order alone would let it override a
+# later record. OVER 1 when the job kept that output above its video
+# ceiling at the tier's CRF limit ("over target", provenance flag
+# over_ceiling); VIDEO_BYTES "-" when not recorded
 _over_records() {
+    _over_records_timed | LC_ALL=C sort -s -t $'\t' -k1,1 | cut -f2-
+}
+
+# _over_records_timed  ->  "TIME<TAB>OUTPUT<TAB>VIDEO_BYTES<TAB>OVER"
+# (journal, then the spool, in file order; TIME "" when not recorded)
+_over_records_timed() {
     local pdir="$LOGS/provenance" py ev
 
     if [[ -s "$pdir/journal.jsonl" ]] && py=$(command -v python3); then
@@ -246,7 +256,7 @@ with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
             continue
         fl = op.get("flags") if isinstance(op.get("flags"), list) else []
         vb = op.get("output_video_bytes")
-        print("\t".join((out, str(vb) if isinstance(vb, int) and vb > 0 else "-",
+        print("\t".join((clean(op.get("recorded") or op.get("time")), out, str(vb) if isinstance(vb, int) and vb > 0 else "-",
                          "1" if "over_ceiling" in fl else "0")))
 ' "$pdir/journal.jsonl" 2>/dev/null
     fi
@@ -257,7 +267,7 @@ with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
             { v[$1] = substr($0, length($1) + 2) }
             END {
                 if (v["output"] != "")
-                    printf "%s\t%s\t%s\n", v["output"], (v["final_video_bytes"] ~ /^[1-9][0-9]*$/ ? v["final_video_bytes"] : "-"),
+                    printf "%s\t%s\t%s\t%s\n", (v["recorded"] != "" ? v["recorded"] : v["time"]), v["output"], (v["final_video_bytes"] ~ /^[1-9][0-9]*$/ ? v["final_video_bytes"] : "-"),
                         (v["over_ceiling"] == "1" ? 1 : 0)
             }' "$ev" 2>/dev/null
     done
