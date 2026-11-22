@@ -123,9 +123,14 @@ for i in 1 2 3 4; do
 done > "$W/series9.sh"
 touch -d '@1' "$W/series9.sh"
 state series9 type=series item=3 items=4 name=E03.mkv "input=${S[3]}" tier=High crf=18 duration=60 \
-    "started=$sstart" "updated=$now"
+    "started=$sstart" "updated=$now" over=1
 sed -i 's/^type=movie$//' "$W/series9.state"
 printf 'out_time_us=30000000\nspeed=0.1x\nprogress=continue\n' > "$W/series9.progress"
+
+# ---- series8: finished, 2 episodes kept above their ceiling (over target)
+state series8 type=series item=3 items=3 status=finished ok=3 over=2 name=X.mkv tier=Base \
+    "started=$((now - 600))" "updated=$((now - 60))"
+sed -i 's/^status=running$//; s/^type=movie$//' "$W/series8.state"
 
 # ---- c4: finished, the session waits for Enter
 state c4 item=2 items=2 status=finished ok=2 name=X.mkv tier=Base "started=$((now - 600))" "updated=$((now - 60))"
@@ -133,7 +138,7 @@ sed -i 's/^status=running$//' "$W/c4.state"
 
 cat > "$T/stub/tmux" <<EOF
 #!/usr/bin/env bash
-[[ "\$1" == list-sessions ]] && printf 'c1 %s\nc2 %s\nc3 %s\nc4 %s\nc5 %s\nseries9 %s\n' $now $now $now $now $now $sstart
+[[ "\$1" == list-sessions ]] && printf 'c1 %s\nc2 %s\nc3 %s\nc4 %s\nc5 %s\nseries9 %s\nseries8 %s\n' $now $now $now $now $now $sstart $now
 exit 0
 EOF
 chmod +x "$T/stub/tmux"
@@ -196,7 +201,7 @@ check "octal escapes decoded for display" "grep -qE '^  \\[NEXT\\] 2\\. Dash –
 echo "== series: ETA from completed episodes (calculation unchanged)"
 B9=$(job_block series9)
 check "series queue and CURRENT" \
-    "hasx \"\$B9\" 'series9 — Series' && hasx \"\$B9\" '  High | CRF 19 | Encoding' && grep -qE '^  \\[DONE\\] 1\\. E01\\.mkv +High \\| CRF 18\$' <<< \"\$B9\" && grep -qE '^  \\[NOW\\]  3\\. E03\\.mkv +High \\| CRF 19 \\| Encoding\$' <<< \"\$B9\" && grep -qE '^  \\[NEXT\\] 4\\. E04\\.mkv +High\$' <<< \"\$B9\" && hasx \"\$B9\" '  Completed: 2' && hasx \"\$B9\" '  Remaining: 1 queued'"
+    "hasx \"\$B9\" 'series9 — Series' && hasx \"\$B9\" '  High | CRF 19 | Encoding' && grep -qE '^  \\[DONE\\] 1\\. E01\\.mkv +High \\| CRF 18\$' <<< \"\$B9\" && grep -qE '^  \\[NOW\\]  3\\. E03\\.mkv +High \\| CRF 19 \\| Encoding\$' <<< \"\$B9\" && grep -qE '^  \\[NEXT\\] 4\\. E04\\.mkv +High\$' <<< \"\$B9\" && hasx \"\$B9\" '  Completed: 2 (1 over target)' && hasx \"\$B9\" '  Remaining: 1 queued'"
 # item: 30 s left at 0.1x = 300 s; episode 4: 60 s at 0.1x = 600 s
 check "item ETA / elapsed, job ETA / elapsed" \
     "hasre \"\$B9\" '  ETA:       00:05:00    Elapsed: 00:0[5-9]:[0-5][0-9]' && hasre \"\$B9\" '  ETA:       00:15:00    Elapsed: 00:2[5-9]:[0-5][0-9]'"
@@ -207,6 +212,10 @@ check "finished: status and elapsed, no CURRENT / queue" \
     "hasx \"\$B4\" 'Finished: 2 ok' && hasx \"\$B4\" '  Elapsed:   00:09:00' && ! grep -q 'CURRENT\\|JOB QUEUE' <<< \"\$B4\""
 
 echo "== read-only"
+B8=$(job_block series8)
+check "finished job with over-target outputs" \
+    "hasx \"\$B8\" 'Finished: 3 ok' && hasx \"\$B8\" '  Over target: 2 kept above the video ceiling at the tier'\\''s CRF limit'"
+check "no over-target note without any"     "! grep -qi 'over target' <<< \"\$B4\" && ! grep -qi 'over target' <<< \"\$B3\""
 check "nothing written to the work dir" "[[ -z \$(find '$W' -maxdepth 1 -newer '$W/c4.state' -type f) ]]"
 
 echo

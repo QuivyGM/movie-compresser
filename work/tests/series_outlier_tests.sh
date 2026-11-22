@@ -54,7 +54,11 @@ conf_with() {
 }
 
 # fixed tier values, independent of the project's current numbers
-COMPRESS_CONF=$(conf_with base SERIES_HIGH_CRF_SEARCH_MIN=18 SERIES_HIGH_CRF_START=18 SERIES_HIGH_CRF_MAX=21 SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=5 \
+# (the library selection below runs with ONE 5 GiB ceiling for every
+# episode: series Custom size "Size5G" with CRF 18-21; High / Base scale
+# their ceilings with each episode's runtime, series_shared_crf_tests.sh)
+COMPRESS_CONF=$(conf_with base SERIES_HIGH_CRF_SEARCH_MIN=18 SERIES_HIGH_CRF_START=18 SERIES_HIGH_CRF_MAX=21 \
+    SERIES_CUSTOMSIZE_CRF_SEARCH_MIN=18 SERIES_CUSTOMSIZE_CRF_START=18 SERIES_CUSTOMSIZE_CRF_MAX=21 \
     SERIES_CRF_OUTLIER_PCT=25 SERIES_CRF_DOWN_RETRY_MAX=1 CRF_DOWN_RETRY_FIT_MARGIN_PCT=5 SERIES_CRF_SAMPLE_EPISODES=4)
 export COMPRESS_CONF
 load_policy > /dev/null
@@ -155,7 +159,7 @@ sel() {
     CRF_SERIES_FILTER=""
     declare -gA CRF_SERIES_EP_BYTES=() CRF_SERIES_EP_FROM=() CRF_SERIES_RATES=() CRF_EP_EST=()
     : > "$T/calls"
-    crf_tier_load series High
+    crf_tier_load series Size5G
     crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate "" series_crf_certify_over > "$T/sel.out"
     SEL="$CRF_SELECTED/${CRF_TRIED[*]}/$CRF_OVER_CEILING"
     read -ra eb <<< "${CRF_SERIES_EP_BYTES[$CRF_SELECTED]}"
@@ -371,6 +375,13 @@ menu() {   # INPUT LOG CONF
         bash "$H/compress/work/series_compress.sh" > "$2" 2>&1
 }
 
+# rate_for GIB FILE  ->  the GiB per hour that gives FILE (its runtime) a
+# video ceiling of GIB (series High / Base / Compact: runtime x rate)
+rate_for() {
+    awk -v g="$1" -v d="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$2")" \
+        'BEGIN { printf "%.12f", g * 3600 / d }'
+}
+
 # whole-episode estimates (2 s episodes are sampled whole), counted
 est() {   # FILE CRF
     WORK_DIR="$H/compress/work" CRF_SAMPLE_CACHE=0 crf_sample_title "$1" 0 "" "$2" 2 3 && echo "$CRF_SAMPLE_BYTES"
@@ -385,7 +396,8 @@ check "noisy E03 is an outlier at CRF 10, still larger at 12" "(( n10 * 4 > s10 
 # episode must fit the shared season CRF -> the outlier raises the
 # season to 12 for every episode (no CRF of its own)
 ceil=$(awk -v a="$n11" -v b="$n12" 'BEGIN { printf "%.12f", (a + b) / 2 / 1073741824 }')
-C1=$(conf_with m1 SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=14 "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")
+rate=$(rate_for "$ceil" "$H/compress/in/Show/Show.S01E03.mkv")
+C1=$(conf_with m1 SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=14 "SERIES_HIGH_VIDEO_GIB_PER_HOUR=$rate")
 L="$T/m1.log"
 menu "1\n2\ny\n" "$L" "$C1"
 sed -n '/^Estimating/,$p' "$L" | sed 's/^/  | /'
@@ -410,24 +422,34 @@ check "verbose: analysis: the outlier decides" "grep -q '^    outlier: Show.S01E
 check "verbose: table and season totals"    "grep -qE '^  Show.S01E03.mkv +0:02 +12 .* OK\$' '$L' && grep -q '^  Shared CRF: *12 (every episode)\$' '$L' && grep -q 'Above ceiling: *0 of 3 episode(s)' '$L' && ! grep -q 'OWN CRF' '$L'"
 
 # CRF_MAX 11: E03 still above at 11 -> the season cannot meet the
-# ceiling: every episode at CRF 11 or cancel (no per-episode skip)
+# ceiling. Compact asks: every episode at CRF 11 or cancel (no
+# per-episode skip)
 rm -f "$H/compress/work"/series[0-9]*.sh; rm -rf "$H/compress/out/Show"
-C2=$(conf_with m2 SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=11 "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")
+C2=$(conf_with m2 SERIES_COMPACT_CRF_SEARCH_MIN=10 SERIES_COMPACT_CRF_START=10 SERIES_COMPACT_CRF_MAX=11 "SERIES_COMPACT_VIDEO_GIB_PER_HOUR=$rate" \
+    SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=11 "SERIES_HIGH_VIDEO_GIB_PER_HOUR=$rate")
 L="$T/m2.log"
-menu "1\n2\n2\n" "$L" "$C2"
+menu "1\n4\n2\n" "$L" "$C2"
 sed -n '/^------/,/^Select/p' "$L" | sed 's/^/  | /'
 J=$(ls "$H/compress/work"/series[0-9]*.sh 2>/dev/null | head -n 1)
-check "outlier above at CRF_MAX: season warning + prompt" \
-    "grep -q 'WARNING: the .* GiB per-episode video ceiling cannot be met' '$L' && grep -q 'even CRF 11 (the lowest quality High' '$L' && grep -q '^1) Encode every episode at CRF 11 anyway\$' '$L' && ! grep -q 'Skip this episode' '$L'"
+check "Compact: outlier above at CRF_MAX: season warning + prompt" \
+    "grep -q 'WARNING: the .* GiB/h per-episode video ceilings cannot be met' '$L' && grep -q 'even CRF 11 (the lowest quality Compact' '$L' && grep -q '^1) Encode every episode at CRF 11 anyway\$' '$L' && ! grep -q 'Skip this episode' '$L'"
 check "cancelled: no job"                    "[[ -z '$J' ]] && grep -q '^Compression cancelled.\$' '$L'"
 
-# encode anyway: every episode at CRF 11 (the season batch keeps CRF_MAX)
+# High: no question; every episode at CRF_MAX 11, the season marked over
+# target (expected sizes, the episode vs its ceiling, again before the
+# confirmation)
 rm -f "$H/compress/work"/series[0-9]*.sh; rm -rf "$H/compress/out/Show"
 L="$T/m3.log"
-menu "1\n2\n1\ny\n" "$L" "$C2"
+menu "1\n2\ny\n" "$L" "$C2"
+sed -n '/^Expected sizes/,/^Start/p' "$L" | sed 's/^/  | /'
 J=$(ls "$H/compress/work"/series[0-9]*.sh 2>/dev/null | head -n 1)
-check "encode anyway: every episode at 11, one season batch" \
-    "[[ -n '$J' ]] && [[ \$(grep -c -- '-crf:v:0 11 ' '$J') == 3 && \$(grep -c 'crf=11 .*crf_max=11 .* batch_mode=season ' '$J') == 3 ]] && grep -q 'ceiling not met' '$L'"
+check "High over target: no prompt"          "! grep -q 'Select \[1-2\]' '$L' && ! grep -q 'WARNING: the' '$L' && ! grep -q 'Compression cancelled' '$L'"
+check "High over target: every episode at 11, one season batch" \
+    "[[ -n '$J' ]] && [[ \$(grep -c -- '-crf:v:0 11 ' '$J') == 3 && \$(grep -c 'crf=11 .*crf_max=11 .* batch_mode=season ' '$J') == 3 ]]"
+check "High over target: expected sizes mark E03" \
+    "grep -qE '^S01E03 .*OVER TARGET' '$L' && ! grep -qE '^S01E01 .*OVER TARGET' '$L'"
+check "High over target: estimate vs ceiling listed, shown again before the confirmation" \
+    "[[ \$(grep -cE '^  S01E03 +~[0-9.]+ GiB video / [0-9.]+ GiB ceiling \(\+[0-9.]+, sampled\)\$' '$L') == 2 ]] && grep -B3 '^High | CRF 11 | 320x180 | SDR | audio copied | over target\$' '$L' | grep -qE '^  S01E03 +~'"
 
 # sample cache: a second run encodes no sample again
 rm -f "$H/compress/work"/series[0-9]*.sh; rm -rf "$H/compress/out/Show"
@@ -470,7 +492,8 @@ e2_src=$(vbytes "$G2/Guard.S01E02.mkv")
 e2_own=$(est "$G2/Guard.S01E02.mkv" 10)
 check "setup: own estimate < E02 source < conservative estimate" "(( e2_own < e2_src && e2_src < n_fill ))"
 
-GC=$(conf_with guard SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=14 SERIES_CRF_SAMPLE_EPISODES=2)
+GC=$(conf_with guard SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=14 SERIES_CRF_SAMPLE_EPISODES=2 \
+    SERIES_HIGH_VIDEO_GIB_PER_HOUR=1000)
 gmenu() {   # INPUT LOG
     printf "$1" | HOME="$H2" PATH="$T/stub:$PATH" COMPRESS_CONF="$GC" \
         bash "$H2/compress/work/series_compress.sh" > "$2" 2>&1
@@ -527,7 +550,8 @@ check "setup: E02 source <= guess, own CRF 12 sample > 1.6 x guess" "(( e2_src <
 
 # ceiling between E02's own CRF 11 and 12 estimates -> the season to 12
 ceil=$(awk -v a="$r11" -v b="$r12" 'BEGIN { printf "%.12f", (a + b) / 2 / 1073741824 }')
-LC=$(conf_with late SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=14 SERIES_CRF_SAMPLE_EPISODES=2 "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")
+rate=$(rate_for "$ceil" "$G3/Late.S01E02.mkv")
+LC=$(conf_with late SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=14 SERIES_CRF_SAMPLE_EPISODES=2 "SERIES_HIGH_VIDEO_GIB_PER_HOUR=$rate")
 lmenu() {   # INPUT LOG CONF
     printf "$1" | HOME="$H3" PATH="$T/stub:$PATH" COMPRESS_CONF="$3" \
         bash "$H3/compress/work/series_compress.sh" > "$2" 2>&1
@@ -547,15 +571,28 @@ check "guard decided at CRF 12"              "grep -qE '^  S01E02 +source .*CRF 
 check "job: every episode at 12, one shared-CRF season batch" \
     "[[ -n '$J' ]] && [[ \$(grep -c -- '-crf:v:0 12 ' '$J') == 4 && \$(grep -c -- '-crf:v:0 ' '$J') == 4 && \$(grep -c 'crf=12 .*crf_min=10 crf_max=14 .* batch_mode=season ' '$J') == 4 ]]"
 
-# CRF_MAX 11: E02 still above at 11 -> the per-episode prompt; skip it
+# CRF_MAX 11: E02 still above at 11. Compact: the per-episode prompt;
+# skip it
+L2C=$(conf_with late2 SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=11 SERIES_CRF_SAMPLE_EPISODES=2 "SERIES_HIGH_VIDEO_GIB_PER_HOUR=$rate" \
+    SERIES_COMPACT_CRF_SEARCH_MIN=10 SERIES_COMPACT_CRF_START=10 SERIES_COMPACT_CRF_MAX=11 "SERIES_COMPACT_VIDEO_GIB_PER_HOUR=$rate")
 rm -f "$H3/compress/work"/series[0-9]*.sh; rm -rf "$H3/compress/out/Late"
 L="$T/l2.log"
-lmenu "1\n2\n2\nn\n" "$L" "$(conf_with late2 SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=11 SERIES_CRF_SAMPLE_EPISODES=2 "SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=$ceil")"
+lmenu "1\n4\n2\nn\n" "$L" "$L2C"
 sed -n '/^Ceiling check/,/^Expected sizes/p' "$L" | sed 's/^/  | /'
-check "CRF_MAX reached: the per-episode over-ceiling prompt" \
-    "grep -q 'WARNING: S01E02 cannot meet the .* GiB per-episode video ceiling' '$L' && grep -q 'even CRF 11 (the lowest quality High' '$L' && grep -q '^2) Skip this episode\$' '$L'"
+check "Compact, CRF_MAX reached: the per-episode over-ceiling prompt" \
+    "grep -q 'WARNING: S01E02 cannot meet its .* GiB video ceiling (.* GiB/h)' '$L' && grep -q 'even CRF 11 (the lowest quality Compact' '$L' && grep -q '^2) Skip this episode\$' '$L'"
 check "skipped: no guard prompt for it, season 10" \
     "! grep -q 'Source-quality guard' '$L' && grep -q 'SKIPPED (above ceiling)' '$L' && grep -q '^Selected: CRF 10\$' '$L' && ! grep -qE '^  S01E02  CRF 12' '$L'"
+
+# High: no prompt; the season rises to CRF_MAX 11 for every episode, E02
+# over target (the source-quality guard still asks: encode anyway)
+rm -f "$H3/compress/work"/series[0-9]*.sh; rm -rf "$H3/compress/out/Late"
+L="$T/l3.log"
+lmenu "1\n2\n2\nn\n" "$L" "$L2C"
+sed -n '/^Ceiling check/,/^Start/p' "$L" | sed 's/^/  | /'
+check "High, CRF_MAX reached: no per-episode prompt" "! grep -q 'Skip this episode' '$L' && ! grep -q 'cannot meet' '$L'"
+check "High: season raised to CRF_MAX, E02 over target" \
+    "grep -q '^Season:   S01E02 own sample above the ceiling at CRF 10 -> season CRF 11 for every episode\$' '$L' && grep -qE '^S01E02 .*OVER TARGET' '$L' && grep -q '^High | CRF 11 | 320x180 | SDR | audio copied | over target\$' '$L'"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

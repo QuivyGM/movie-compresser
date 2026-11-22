@@ -206,7 +206,7 @@ fi
 
 L="$T/series_start.log"
 menu series_compress.sh "2\n2\ny\n" "$L"
-check "job: one CRF retry item per episode" "! grep -q '^job_batch_add' '$H/compress/work/series1.sh' && [[ \$(grep -c '^   item_crf_encode item_encode_' '$H/compress/work/series1.sh') == 3 ]] && [[ \$(grep -c 'ceiling_vbytes=5368709120 crf_min=$SHMIN crf_max=21 down_headroom_pct=20 down_max=1 down_fit_pct=5 crf_est=$SHMIN=[0-9]' '$H/compress/work/series1.sh') == 3 ]]"
+check "job: one CRF retry item per episode" "! grep -q '^job_batch_add' '$H/compress/work/series1.sh' && [[ \$(grep -c '^   item_crf_encode item_encode_' '$H/compress/work/series1.sh') == 3 ]] && [[ \$(grep -cE 'ceiling_vbytes=[0-9]+ crf_min=$SHMIN crf_max=21 down_headroom_pct=20 down_max=1 down_fit_pct=5 crf_est=$SHMIN=[0-9]' '$H/compress/work/series1.sh') == 3 ]]"
 rm -rf "$H/compress/out/Show"
 
 L="$T/series_mismatch.log"
@@ -224,19 +224,20 @@ check "audio layout differs: compact"    "compact '$L'"
 check "audio layout differs: header"     "grep -qE '^Audio: +1-2 tracks per episode, copied unchanged\$' '$L'"
 
 cp "$H/compress/work/lib/compress.conf" "$T/tiny.conf"
-sed -i 's/^SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=.*/SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=0.000001/' "$T/tiny.conf"
+sed -i 's/^SERIES_HIGH_VIDEO_GIB_PER_HOUR=.*/SERIES_HIGH_VIDEO_GIB_PER_HOUR=0.000001/' "$T/tiny.conf"
 L="$T/series_ceiling.log"
-menu series_compress.sh "2\n2\n1\nn\n" "$L" "$T/tiny.conf"
+# High: not reachable -> CRF_MAX without a question (over target)
+menu series_compress.sh "2\n2\nn\n" "$L" "$T/tiny.conf"
 sed -n '/^Estimating/,$p' "$L" | sed 's/^/  | /'
 # far above the ceiling: the adaptive search jumps 2 CRFs at a time,
 # CRF_MAX (21) is the last step
 check "ceiling: too large -> jumping 2 CRFs" "grep -q '^Result:   too large -> jumping to CRF $((SHSTART + 2))\$' '$L' && ! grep -q '^CRF $((SHSTART + 1))\$' '$L'"
 check "ceiling: last step clamped to 21"     "grep -qE '^Result:   too large -> (trying|jumping to) CRF 21\$' '$L' && grep -q '^CRF 21\$' '$L' && ! grep -q '^CRF 22\$' '$L'"
-check "ceiling: limit reached"           "grep -q '^Result:   too large (CRF 21 is the High limit)\$' '$L' && ! grep -q '^Selected:' '$L'"
-check "ceiling: warning kept"            "grep -q '^WARNING: the 0.000001 GiB per-episode video ceiling cannot be met' '$L' && grep -q 'gives a largest episode of' '$L'"
-check "ceiling: outliers listed"         "grep -q 'Warning: 3 episodes are estimated above' '$L' && grep -qE '^  S01E01 +~[0-9.]+ GiB video, \+' '$L'"
-check "ceiling: Status column"           "grep -q '^Episode   Runtime   Video   Audio   Total   Status\$' '$L' && [[ \$(grep -c ' ABOVE CEILING\$' '$L') == 3 ]]"
-check "ceiling: confirmation flags it"   "grep -q '^High | CRF 21 | 320x180 | SDR | audio copied | ceiling not met\$' '$L'"
+check "ceiling: limit reached, over target" "grep -q '^Result:   too large (CRF 21 is the High limit)\$' '$L' && grep -q '^Selected: CRF 21 (ceilings not reachable within CRF $SHMIN-21: over target)\$' '$L'"
+check "ceiling: no question"              "! grep -q 'WARNING: the' '$L' && ! grep -q 'Encode every episode' '$L'"
+check "ceiling: over-target episodes listed" "grep -q '^Over target: the High ceilings' '$L' && grep -qE '^  S01E01 +~[0-9.]+ GiB video / [0-9.]+ GiB ceiling \(\+' '$L'"
+check "ceiling: Status column"           "grep -q '^Episode   Runtime   Video   Audio   Total   Status\$' '$L' && [[ \$(grep -c ' OVER TARGET\$' '$L') == 3 ]]"
+check "ceiling: confirmation flags it"   "grep -q '^High | CRF 21 | 320x180 | SDR | audio copied | over target\$' '$L'"
 check "ceiling: compact"                 "compact '$L'"
 
 if (( HAVE_SCRIPT == 1 )); then

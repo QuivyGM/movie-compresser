@@ -19,7 +19,10 @@
 # only (verify.sh's pairing: naming.sh find_source_for_output); an
 # unpaired output counts for its size, its saved % is "-".
 #
-# Status "OK" / "N issues"; the "Issues:" list names only real problems:
+# Status "OK" / "N issues", plus "over target (N)" for outputs the job
+# kept above their video ceiling at the tier's CRF limit (series High /
+# Base over target; provenance flag over_ceiling of the latest job record
+# of the output; not an issue). The "Issues:" list names only real problems:
 #   - verification mismatch: stored MKV statistics missing or rejected,
 #     a compression tag stored with different values, compression tags
 #     that differ from the job record of the encode, an encode kept as
@@ -213,6 +216,51 @@ with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
     [[ -s "$LOGS/compression_tags.tsv" ]] &&
         awk -F'\t' 'NR > 1 && $1 != "" && $2 != "" { printf "%s\tledger\t%s\t-\t%s\n", $1, ($6 != "" ? $6 : "-"), $2 }' \
             "$LOGS/compression_tags.tsv" 2>/dev/null
+    return 0
+}
+
+# _over_records  ->  "OUTPUT<TAB>VIDEO_BYTES<TAB>OVER" per recorded output,
+# oldest first (journal, then the spool): OVER 1 when the job kept that
+# output above its video ceiling at the tier's CRF limit ("over target",
+# provenance flag over_ceiling); VIDEO_BYTES "-" when not recorded
+_over_records() {
+    local pdir="$LOGS/provenance" py ev
+
+    if [[ -s "$pdir/journal.jsonl" ]] && py=$(command -v python3); then
+        "$py" -I -c '
+import json, sys
+def clean(v):
+    return v.replace("\t", " ").replace("\n", " ").replace("\r", " ") if isinstance(v, str) else ""
+with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+    for line in f:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(e, dict) or e.get("entry") != "output":
+            continue
+        op = e.get("op") if isinstance(e.get("op"), dict) else {}
+        fi = e.get("file") if isinstance(e.get("file"), dict) else {}
+        out = clean(fi.get("path"))
+        if not out:
+            continue
+        fl = op.get("flags") if isinstance(op.get("flags"), list) else []
+        vb = op.get("output_video_bytes")
+        print("\t".join((out, str(vb) if isinstance(vb, int) and vb > 0 else "-",
+                         "1" if "over_ceiling" in fl else "0")))
+' "$pdir/journal.jsonl" 2>/dev/null
+    fi
+
+    for ev in "$pdir"/spool/*/event.tsv; do
+        [[ -f "$ev" ]] || continue
+        awk -F'\t' '
+            { v[$1] = substr($0, length($1) + 2) }
+            END {
+                if (v["output"] != "")
+                    printf "%s\t%s\t%s\n", v["output"], (v["final_video_bytes"] ~ /^[1-9][0-9]*$/ ? v["final_video_bytes"] : "-"),
+                        (v["over_ceiling"] == "1" ? 1 : 0)
+            }' "$ev" 2>/dev/null
+    done
     return 0
 }
 
@@ -434,7 +482,14 @@ group_of() {
 # Per file (read-only inspection)
 # ------------------------------------------------------------
 
-declare -A F_SIZE=() F_SRC=() F_CRF=() F_TIER=() F_ISSUES=() F_TITLES=()
+declare -A F_SIZE=() F_SRC=() F_CRF=() F_TIER=() F_ISSUES=() F_TITLES=() F_OVER=()
+
+# REC_OVER[OUTPUT] = "VIDEO_BYTES OVER" of the latest job record of that
+# output (_over_records)
+declare -A REC_OVER=()
+while IFS=$'\t' read -r _o _vb _ov; do
+    [[ -n "$_o" ]] && REC_OVER[$_o]="$_vb $_ov"
+done < <(_over_records)
 declare -A G_EXTRA=()       # key -> issues not tied to one output (kept failed encodes)
 
 CRF_TIERS_RE="$COMPRESSION_TIER_RE"   # encode_common.sh: the menu CRF tiers, Custom size included
@@ -467,6 +522,17 @@ summarize_file() {
     F_CRF[$file]="$crf"
     F_TIER[$file]="$tier"
     F_TITLES[$file]="${FILE_TITLE_FIXES:-0}"
+    # over target: the latest job record of this output kept it above its
+    # video ceiling (not an issue; shown in the status). A record whose
+    # video bytes differ from this file's is of another encode.
+    F_OVER[$file]=0
+    if [[ -n "${REC_OVER[$file]+x}" ]]; then
+        local rvb rov
+        read -r rvb rov <<< "${REC_OVER[$file]}"
+        if [[ "$rov" == 1 ]] && [[ "$rvb" == "-" || ! "${FILE_VBYTES:-}" =~ ^[1-9][0-9]*$ || "$rvb" == "$FILE_VBYTES" ]]; then
+            F_OVER[$file]=1
+        fi
+    fi
     F_SRC[$file]=""
     [[ "$FILE_SRC_KIND" == OK && "$FILE_SRC_BYTES" =~ ^[0-9]+$ ]] && F_SRC[$file]="$FILE_SRC_BYTES"
 
@@ -562,7 +628,21 @@ tier_set() {
     printf '%s' "${s:--}"
 }
 
+# status_text ISSUES [OVER [ONE]]  ->  "OK" / "2 issues"; with OVER > 0
+# outputs kept above their video ceiling: "over target (2)" ("over
+# target" for ONE file) after it
 status_text() {
+    local over="${2:-0}" ot
+    if (( over > 0 )); then
+        ot="over target"
+        [[ -n "${3:-}" ]] || ot+=" ($over)"
+        if (( $1 == 0 )); then
+            ui_warn "$ot"
+        else
+            printf '%s, %s' "$(ui_err "$(ui_plural "$1" issue)")" "$(ui_warn "$ot")"
+        fi
+        return 0
+    fi
     if (( $1 == 0 )); then
         ui_ok OK
     else
@@ -587,7 +667,7 @@ fit() {
 # AGG_* of a list of files: agg FILE...
 agg() {
     local f
-    AGG_N=0 AGG_OUT=0 AGG_SRC=0 AGG_POUT=0 AGG_ISSUES=0 AGG_TITLES=0
+    AGG_N=0 AGG_OUT=0 AGG_SRC=0 AGG_POUT=0 AGG_ISSUES=0 AGG_TITLES=0 AGG_OVER=0
     AGG_CRFS=() AGG_TIERS=()
     for f in "$@"; do
         [[ -n "$f" ]] || continue
@@ -599,6 +679,7 @@ agg() {
         fi
         AGG_ISSUES=$(( AGG_ISSUES + $(count_lines "${F_ISSUES[$f]}") ))
         (( ${F_TITLES[$f]} > 0 )) && ((AGG_TITLES += 1))
+        (( ${F_OVER[$f]:-0} == 1 )) && ((AGG_OVER += 1))
         AGG_CRFS+=("${F_CRF[$f]}")
         AGG_TIERS+=("${F_TIER[$f]}")
     done
@@ -644,7 +725,7 @@ file_row() {     # FILE  (season table, verbose)
         "$([[ -n "${F_SRC[$f]}" ]] && echo "$(gib "${F_SRC[$f]}") GiB" || echo -)" \
         "$(saved_pct "${F_SRC[$f]}" "${F_SIZE[$f]}")" "" \
         "$( (( ${F_TITLES[$f]} > 0 )) && echo "$(ui_plural "${F_TITLES[$f]}" fix)" || echo OK)" \
-        "$(status_text "$ni")"
+        "$(status_text "$ni" "${F_OVER[$f]:-0}" 1)"
 }
 
 ALL_FILES=()
@@ -712,7 +793,7 @@ for show in "${SHOW_ORDER[@]+"${SHOW_ORDER[@]}"}"; do
             "$( (( AGG_SRC > 0 )) && echo "$(gib "$AGG_SRC") GiB" || echo -)" \
             "$(saved_pct "$AGG_SRC" "$AGG_POUT")" \
             "$( (( AGG_N > 0 )) && gib $(( AGG_OUT / AGG_N )) || echo -)" \
-            "$(titles_text "$AGG_TITLES" "$AGG_N")" "$(status_text $(( AGG_ISSUES + extra )))"
+            "$(titles_text "$AGG_TITLES" "$AGG_N")" "$(status_text $(( AGG_ISSUES + extra )) "$AGG_OVER")"
         if ui_verbose; then
             for f in "${GF[@]+"${GF[@]}"}"; do file_row "$f"; done
         fi
@@ -725,7 +806,7 @@ for show in "${SHOW_ORDER[@]+"${SHOW_ORDER[@]}"}"; do
         "$( (( AGG_SRC > 0 )) && echo "$(gib "$AGG_SRC") GiB" || echo -)" \
         "$(saved_pct "$AGG_SRC" "$AGG_POUT")" \
         "$( (( AGG_N > 0 )) && gib $(( AGG_OUT / AGG_N )) || echo -)" \
-        "$(titles_text "$AGG_TITLES" "$AGG_N")" "$(status_text $(( AGG_ISSUES + SHOW_EXTRA )))"
+        "$(titles_text "$AGG_TITLES" "$AGG_N")" "$(status_text $(( AGG_ISSUES + SHOW_EXTRA )) "$AGG_OVER")"
 
     print_issues "${KEYS[@]}"
     ALL_FILES+=("${SHOW_FILES[@]+"${SHOW_FILES[@]}"}")
@@ -750,7 +831,7 @@ if (( ${#MOVIES[@]} )) || [[ -n "${G_EXTRA[$MKEY]:-}" ]]; then
         printf "$MOVIE_FMT" "$LW" "$(fit "$(basename "$f")")" "${F_TIER[$f]:--}" "${F_CRF[$f]:--}" \
             "$(gib "${F_SIZE[$f]}") GiB" \
             "$([[ -n "${F_SRC[$f]}" ]] && echo "$(gib "${F_SRC[$f]}") GiB" || echo -)" \
-            "$(saved_pct "${F_SRC[$f]}" "${F_SIZE[$f]}")" "$(status_text "$(count_lines "${F_ISSUES[$f]}")")"
+            "$(saved_pct "${F_SRC[$f]}" "${F_SIZE[$f]}")" "$(status_text "$(count_lines "${F_ISSUES[$f]}")" "${F_OVER[$f]:-0}" 1)"
     done
     extra=$(count_lines "${G_EXTRA[$MKEY]:-}")
     agg "${MOVIES[@]+"${MOVIES[@]}"}"
@@ -758,7 +839,7 @@ if (( ${#MOVIES[@]} )) || [[ -n "${G_EXTRA[$MKEY]:-}" ]]; then
         printf "$MOVIE_FMT" "$LW" "Total ($AGG_N)" "$(tier_set "${AGG_TIERS[@]+"${AGG_TIERS[@]}"}")" \
             "$(crf_range "${AGG_CRFS[@]+"${AGG_CRFS[@]}"}")" "$(gib "$AGG_OUT") GiB" \
             "$( (( AGG_SRC > 0 )) && echo "$(gib "$AGG_SRC") GiB" || echo -)" \
-            "$(saved_pct "$AGG_SRC" "$AGG_POUT")" "$(status_text $(( AGG_ISSUES + extra )))"
+            "$(saved_pct "$AGG_SRC" "$AGG_POUT")" "$(status_text $(( AGG_ISSUES + extra )) "$AGG_OVER")"
     fi
     (( AGG_TITLES > 0 )) &&
         echo "  Titles: $AGG_TITLES of $AGG_N with missing or non-standard track titles"
@@ -775,7 +856,9 @@ printf 'Outputs: %s, %s GiB' "$AGG_N" "$(gib "$AGG_OUT")"
 if (( AGG_SRC > 0 )); then
     printf ' (paired sources %s GiB, saved %s)' "$(gib "$AGG_SRC")" "$(saved_pct "$AGG_SRC" "$AGG_POUT")"
 fi
-printf '; %s\n' "$(status_text $(( AGG_ISSUES + ALL_EXTRA )))"
+printf '; %s\n' "$(status_text $(( AGG_ISSUES + ALL_EXTRA )) "$AGG_OVER")"
+(( AGG_OVER > 0 )) &&
+    echo "Over target: $AGG_OVER of $AGG_N outputs kept above their video ceiling at the tier's CRF limit (job summary)"
 (( AGG_TITLES > 0 )) &&
     echo "Track titles: $AGG_TITLES of $AGG_N outputs with missing or non-standard titles (verify.sh Validate + update corrects them)"
 exit 0

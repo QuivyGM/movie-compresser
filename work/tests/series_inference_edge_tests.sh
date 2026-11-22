@@ -36,7 +36,10 @@ for l in ui media_probe media_stats bitrate encode_common hdr_dovi policy; do
 done
 COMPRESS_CONF="$T/c.conf"
 cp "$SRC_WORK/lib/compress.conf" "$COMPRESS_CONF"
-sed -i 's/^SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=.*/SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=5/; s/^SERIES_CRF_OUTLIER_PCT=.*/SERIES_CRF_OUTLIER_PCT=25/' "$COMPRESS_CONF"
+# High 5 GiB/h: the reference ceiling of one hour is 5 GiB; no
+# series_ep_ceilings below, so every episode is checked against it (one
+# ceiling for the season, as in the original cases)
+sed -i 's/^SERIES_HIGH_VIDEO_GIB_PER_HOUR=.*/SERIES_HIGH_VIDEO_GIB_PER_HOUR=5/; s/^SERIES_CRF_OUTLIER_PCT=.*/SERIES_CRF_OUTLIER_PCT=25/' "$COMPRESS_CONF"
 export COMPRESS_CONF
 load_policy > /dev/null
 crf_tier_load series High

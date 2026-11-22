@@ -66,8 +66,8 @@ conf_with() {   # NAME KEY=VALUE...  ->  modified copy of the project config
 COMPRESS_CONF=$(conf_with base \
     MOVIE_HIGH_CRF_SEARCH_MIN=10 MOVIE_HIGH_CRF_START=12 MOVIE_HIGH_CRF_MAX=23 MOVIE_HIGH_VIDEO_GIB_PER_HOUR=3.5 \
     MOVIE_BASE_CRF_SEARCH_MIN=18 MOVIE_BASE_CRF_START=20 MOVIE_BASE_CRF_MAX=29 MOVIE_BASE_VIDEO_GIB_PER_HOUR=1.0 MOVIE_BASE_VIDEO_FLOOR_MBPS=0 \
-    SERIES_HIGH_CRF_SEARCH_MIN=8 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=21 SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=5 \
-    SERIES_BASE_CRF_SEARCH_MIN=11 SERIES_BASE_CRF_START=13 SERIES_BASE_CRF_MAX=27 SERIES_BASE_VIDEO_SIZE_CEILING_GIB=1.5 \
+    SERIES_HIGH_CRF_SEARCH_MIN=8 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=21 SERIES_HIGH_VIDEO_GIB_PER_HOUR=2.5 \
+    SERIES_BASE_CRF_SEARCH_MIN=11 SERIES_BASE_CRF_START=13 SERIES_BASE_CRF_MAX=27 SERIES_BASE_VIDEO_GIB_PER_HOUR=1.0 \
     SERIES_CRF_OUTLIER_PCT=25 CRF_ADAPTIVE_STEP_THRESHOLD_PCT=150)
 export COMPRESS_CONF
 load_policy > /dev/null
@@ -286,6 +286,9 @@ season() {   # K DUR...  ->  a batch of episodes E1.. with these runtimes, K sam
     declare -gA CRF_SERIES_EP_BYTES=() CRF_SERIES_EP_FROM=() CRF_SERIES_RATES=() CRF_EP_EST=()
     : > "$T/calls"
 }
+# The search with ONE ceiling for every episode (5 / 1.5 GiB): series
+# Custom size ("Size5G"), the tier that keeps a fixed per-episode ceiling
+# (High / Base scale it with each episode's runtime: series_shared_crf_tests.sh)
 pick() {   # TIER START MIN MAX  ->  the season search of the series menu
     crf_tier_load series "$1"
     crf_select_boundary "$2" "$3" "$4" "$CRF_CEILING_BYTES" crf_series_estimate rec series_crf_certify_over > "$T/sel.out"
@@ -296,19 +299,19 @@ EPG=()
 epg 1 10 4.6 4.9 5.35; epg 2 10 4.4 4.7 5.0; epg 3 10 4.2 4.5 4.8
 season 3 2700 2700 2700
 STEPS=()
-pick High 10 8 21
+pick Size5G 10 8 21
 eq "series High: request's example (10 / 9 fit, 8 over) -> 9" "$CRF_SELECTED/$CRF_BOUNDARY_LOW/${CRF_TRIED[*]}" "9/8/10 9 8"
 eq "... report"                            "$(steps)" "down 10 9|down 9 8|down-over 8|boundary 8 9"
 EPG=()
 epg 1 13 1.0 1.1 1.2; epg 2 13 0.9 1.0 1.1; epg 3 13 1.1 1.2 1.3
 season 3 2700 2700 2700
-pick Base 13 11 27
+pick Size1.5G 13 11 27
 eq "series Base: room left -> SEARCH_MIN 11, flagged" "$CRF_SELECTED/$CRF_AT_FLOOR/${CRF_TRIED[*]}" "11/1/13 12 11"
 EPG=()
 epg 1 13 1.6; epg 2 13 1.4; epg 3 13 1.3
 epg 1 14 1.45; epg 2 14 1.3; epg 3 14 1.2
 season 3 2700 2700 2700
-pick Base 13 11 27
+pick Size1.5G 13 11 27
 eq "series Base: START over -> upward"     "$CRF_SELECTED/$CRF_SEARCH_DIR/${CRF_TRIED[*]}" "14/up/13 14"
 
 # ------------------------------------------------------------
@@ -327,7 +330,7 @@ base_a() {
 }
 base_a; epg 2 10 4.2; epg 2 11 3.9
 eq "sampled E1 / E4, E2 / E3 inferred"     "${CRF_SERIES_SAMPLED[*]}" "0 3"
-pick High 10 10 21
+pick Size5G 10 10 21
 eq "inferred E2 largest + over: sampled before the season CRF rises; real 4.2 fits -> 10 stays" \
     "$CRF_SELECTED/${CRF_TRIED[*]}/$(ncalls 10 2)" "10/10/1"
 eq "... E2 promoted, E3 still inferred"    "${CRF_SERIES_EP_FROM[10]}" "sample promoted highest sample"
@@ -335,7 +338,7 @@ eq "... E2 estimate replaced by its own sample" \
     "$(read -ra eb <<< "${CRF_SERIES_EP_BYTES[10]}"; bytes_to_gib "${eb[1]}")" "4.20"
 eq "... decisive figure recomputed (largest regular E1 / E3: 4.6)" "$(bytes_to_gib "${CRF_EST[10]}")" "4.60"
 eq "without the rule the inferred estimate alone would have raised it" \
-    "$( series_decisive_inferred() { SD_INDEX=""; return 1; }; base_a; epg 2 10 4.2; epg 2 11 3.9; pick High 10 10 21; echo "$CRF_SELECTED" )" "11"
+    "$( series_decisive_inferred() { SD_INDEX=""; return 1; }; base_a; epg 2 10 4.2; epg 2 11 3.9; pick Size5G 10 10 21; echo "$CRF_SELECTED" )" "11"
 eq "... own sample stored for later steps (CRF_EP_EST)" "$(bytes_to_gib "${CRF_EP_EST[1:10]:-}")" "4.20"
 
 # cache reuse: crf_episode_estimate (guard / outlier) at the same CRF
@@ -351,7 +354,7 @@ eq "source guard: a promoted episode counts as sampled (not sampled again)" "$(n
 # an own sample already known (e.g. from an earlier step) is reused for the promotion
 base_a; epg 2 10 4.2
 CRF_EP_EST[1:10]=$(gib 4.2)
-crf_tier_load series High
+crf_tier_load series Size5G
 crf_series_estimate 10 > "$T/pre.out"
 eq "promotion reuses a known own sample"   "$(ncalls 10 2)/${CRF_SERIES_EP_FROM[10]}" "0/sample promoted highest sample"
 check "... shown as already sampled"       "grep -q '^  E2  ~4.20 GiB  sampled after inference (already sampled)\$' '$T/pre.out'"
@@ -359,7 +362,7 @@ check "... shown as already sampled"       "grep -q '^  E2  ~4.20 GiB  sampled a
 # the real sample still too large: the season CRF rises (E2 not sampled
 # again at 11, where its inferred estimate fits)
 base_a; epg 2 10 5.3; epg 2 11 4.8
-pick High 10 10 21
+pick Size5G 10 10 21
 eq "real sample still above: season rises to 11" "$CRF_SELECTED/${CRF_TRIED[*]}" "11/10 11"
 eq "... E2 sampled once at 10, not at 11 (not decisive there)" "$(ncalls 10 2)/$(ncalls 11 2)" "1/0"
 # E2 alone above by its own sample could still be the isolated outlier:
@@ -370,7 +373,7 @@ eq "... at 10 E2 and E3 sampled after inference" "${CRF_SERIES_EP_FROM[10]}" "sa
 # regular episodes decide (fit at 10); its own CRF from 10 reuses the sample
 base_a; epg 2 10 8.0
 EPG[2:11]=7.0; EPG[2:12]=6.0; EPG[2:13]=5.2; EPG[2:14]=4.6
-pick High 10 10 21
+pick Size5G 10 10 21
 read -ra eb <<< "${CRF_SERIES_EP_BYTES[10]}"
 series_batch_stats "$CRF_CEILING_BYTES" "${eb[@]}"
 eq "sampled E2 becomes the isolated outlier: season 10" "$CRF_SELECTED/$SB_ISOLATED/$SB_FITS" "10/1/1"
@@ -379,7 +382,7 @@ eq "... own CRF 14, the season-CRF sample reused" "$EPC_CRF/$(ncalls 10 2)/${EPC
 
 # downward with promotions: the request's example on the season
 base_a; epg 1 9 4.9 5.35; epg 2 10 4.2 4.5 4.8; epg 3 9 4.3 4.7; epg 4 9 3.2 3.4
-pick High 10 8 21
+pick Size5G 10 8 21
 eq "down: 10, 9 fit (E2 promoted at both), 8 over by own samples -> 9" "$CRF_SELECTED/$CRF_BOUNDARY_LOW/${CRF_TRIED[*]}" "9/8/10 9 8"
 eq "... at 8 the inferred E2 / E3 were sampled before 8 counted as too large" "${CRF_SERIES_EP_FROM[8]}" "sample promoted promoted sample"
 
@@ -387,7 +390,7 @@ eq "... at 8 the inferred E2 / E3 were sampled before 8 counted as too large" "$
 #   6 episodes, E1 / E6 sampled; E2..E5 inferred
 six() { EPG=(); season 2 2700 2900 2800 2760 2700 3300; }
 six; epg 1 10 5.5; epg 6 10 6.2
-crf_tier_load series High
+crf_tier_load series Size5G
 crf_series_estimate 10 > /dev/null
 eq "two sampled episodes above: proven, no inferred one sampled" \
     "$(wc -l < "$T/calls" | tr -d ' ')/${CRF_SERIES_EP_FROM[10]}" "2/sample highest highest highest highest sample"
@@ -448,7 +451,7 @@ check "series_from_sampled: sample / promoted yes, highest no" \
 eval "$(sed -n '/^crf_series_estimate_shown() {/,/^}/p; /^crf_series_step_report() {/,/^}/p' "$SRC_WORK/series_compress.sh")"
 TIER=High
 base_a; epg 2 10 4.2; epg 2 11 3.9
-crf_tier_load series High
+crf_tier_load series Size5G
 crf_select_boundary 10 10 21 "$CRF_CEILING_BYTES" crf_series_estimate_shown crf_series_step_report series_crf_certify_over > "$T/ui.out"
 sed 's/^/  | /' "$T/ui.out"
 eq "UI: inferred largest, promotion line, sampled largest" \
@@ -603,7 +606,7 @@ crf_sample_title() {
 FILES=(/s/E1.mkv /s/E2.mkv /s/E3.mkv /s/E4.mkv); EP_VIDX=(0 0 0 0); EP_DUR=(2700 3000 2700 3300)
 CRF_SERIES_LABELS=(E1 E2 E3 E4); CRF_SERIES_SAMPLED=(0 3); CRF_SERIES_FILTER=""
 declare -A CRF_SERIES_EP_BYTES=() CRF_SERIES_EP_FROM=() CRF_SERIES_RATES=() CRF_EP_EST=()
-crf_tier_load series High
+crf_tier_load series Size5G
 crf_select_boundary 10 8 21 "\$CRF_CEILING_BYTES" crf_series_estimate crf_episode_step_report series_crf_certify_over > /dev/null
 [[ "\$CRF_SELECTED" == 9 ]]
 COMPRESS_VERBOSE=1 crf_series_estimate 10 > /dev/null

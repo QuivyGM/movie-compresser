@@ -16,7 +16,7 @@
 POLICY_KEYS_POSITIVE=(
     MOVIE_QUALITY_TARGET_VIDEO_GIB MOVIE_QUALITY_ACCEPT_MIN_GIB MOVIE_QUALITY_ACCEPT_MAX_GIB
     MOVIE_HIGH_VIDEO_GIB_PER_HOUR MOVIE_BASE_VIDEO_GIB_PER_HOUR MOVIE_COMPACT_VIDEO_GIB_PER_HOUR
-    SERIES_HIGH_VIDEO_SIZE_CEILING_GIB SERIES_BASE_VIDEO_SIZE_CEILING_GIB SERIES_COMPACT_VIDEO_GIB_PER_HOUR
+    SERIES_HIGH_VIDEO_GIB_PER_HOUR SERIES_BASE_VIDEO_GIB_PER_HOUR SERIES_COMPACT_VIDEO_GIB_PER_HOUR
     SERIES_CRF_OUTLIER_PCT
     CRF_SAMPLE_SECONDS
     AUDIO_HIGH_TRIGGER_KBPS AUDIO_COMPACT_TRIGGER_GIB AUDIO_COMPACT_LIMIT_GIB
@@ -86,9 +86,10 @@ POLICY_KEYS_RETIRED_QUALITY=(
 
 # Settings of the former High / Base size-target (GiB/hour, two-pass)
 # video policy, replaced by the CRF tiers; a config that still sets
-# them gets a note. (MOVIE_HIGH / MOVIE_BASE_VIDEO_GIB_PER_HOUR are not
-# among them: they are active again, as the rate of the movie High /
-# Base video ceiling, POLICY_KEYS_POSITIVE. MOVIE_BASE_VIDEO_FLOOR_MBPS
+# them gets a note. (MOVIE_* / SERIES_HIGH / SERIES_BASE_VIDEO_GIB_PER_HOUR
+# are not among them: they are active again, as the rate of the movie
+# and series High / Base video ceilings, POLICY_KEYS_POSITIVE.
+# MOVIE_BASE_VIDEO_FLOOR_MBPS
 # is active again too, as the movie Base minimum video bitrate of the
 # CRF search; MOVIE_BASE_VIDEO_MAX_MBPS stays retired: the runtime-scaled
 # ceiling, ~2.98 Mb/s at 1.25 GiB/hour, is already below the former
@@ -96,15 +97,22 @@ POLICY_KEYS_RETIRED_QUALITY=(
 POLICY_KEYS_RETIRED_VIDEO=(
     MOVIE_HIGH_VIDEO_FLOOR_MBPS MOVIE_HIGH_VIDEO_MAX_MBPS
     MOVIE_BASE_VIDEO_MAX_MBPS
-    SERIES_HIGH_VIDEO_GIB_PER_HOUR SERIES_HIGH_VIDEO_FLOOR_MBPS SERIES_HIGH_VIDEO_MAX_MBPS
-    SERIES_BASE_VIDEO_GIB_PER_HOUR SERIES_BASE_VIDEO_FLOOR_MBPS SERIES_BASE_VIDEO_MAX_MBPS
+    SERIES_HIGH_VIDEO_FLOOR_MBPS SERIES_HIGH_VIDEO_MAX_MBPS
+    SERIES_BASE_VIDEO_FLOOR_MBPS SERIES_BASE_VIDEO_MAX_MBPS
 )
 
 # Former fixed per-movie High / Base video ceilings, replaced by the
 # runtime-scaled MOVIE_*_VIDEO_GIB_PER_HOUR; a config that still sets
-# them gets a note (series keep their fixed SERIES_*_VIDEO_SIZE_CEILING_GIB).
+# them gets a note.
 POLICY_KEYS_RETIRED_MOVIE_CEILING=(
     MOVIE_HIGH_VIDEO_SIZE_CEILING_GIB MOVIE_BASE_VIDEO_SIZE_CEILING_GIB
+)
+
+# Former fixed per-episode series High / Base video ceilings, replaced by
+# the runtime-scaled SERIES_HIGH / SERIES_BASE_VIDEO_GIB_PER_HOUR (every
+# episode its own ceiling); a config that still sets them gets a note.
+POLICY_KEYS_RETIRED_SERIES_CEILING=(
+    SERIES_HIGH_VIDEO_SIZE_CEILING_GIB SERIES_BASE_VIDEO_SIZE_CEILING_GIB
 )
 
 policy_conf_path() {
@@ -307,7 +315,7 @@ load_policy() {
         "${POLICY_KEYS_CRF[@]}" "${POLICY_KEYS_COUNT[@]}" \
         "${POLICY_KEYS_RETIRED[@]}" "${POLICY_KEYS_RETIRED_VIDEO[@]}" \
         "${POLICY_KEYS_RETIRED_QUALITY[@]}" "${POLICY_KEYS_LEGACY_CRF_MIN[@]}" \
-        "${POLICY_KEYS_RETIRED_MOVIE_CEILING[@]}" \
+        "${POLICY_KEYS_RETIRED_MOVIE_CEILING[@]}" "${POLICY_KEYS_RETIRED_SERIES_CEILING[@]}" \
         MOVIE_BASE_VIDEO_FLOOR_MBPS \
         SERIES_CONTAINER_RESERVE_PCT CRF_DOWN_RETRY_HEADROOM_PCT CRF_DOWN_RETRY_MAX \
         CRF_DOWN_RETRY_FIT_MARGIN_PCT SERIES_CRF_DOWN_RETRY_MAX \
@@ -431,7 +439,7 @@ policy_retired_note() {
         echo "Note: $(policy_conf_path) still sets former High/Base size-target" >&2
         echo "      settings, which are ignored (High and Base are CRF tiers now:" >&2
         echo "      *_CRF_START / *_CRF_SEARCH_MIN / *_CRF_MAX, MOVIE_*_VIDEO_GIB_PER_HOUR," >&2
-        echo "      SERIES_*_VIDEO_SIZE_CEILING_GIB):" >&2
+        echo "      SERIES_*_VIDEO_GIB_PER_HOUR):" >&2
         printf '        %s\n' "${set[@]}" >&2
     fi
 
@@ -444,6 +452,18 @@ policy_retired_note() {
         echo "Note: $(policy_conf_path) still sets former fixed movie High/Base video" >&2
         echo "      ceilings, which are ignored (the movie ceiling is the runtime x" >&2
         echo "      MOVIE_HIGH_VIDEO_GIB_PER_HOUR / MOVIE_BASE_VIDEO_GIB_PER_HOUR):" >&2
+        printf '        %s\n' "${set[@]}" >&2
+    fi
+
+    set=()
+    for k in "${POLICY_KEYS_RETIRED_SERIES_CEILING[@]}"; do
+        [[ -n "${!k+x}" ]] && set+=("$k")
+    done
+
+    if (( ${#set[@]} )); then
+        echo "Note: $(policy_conf_path) still sets former fixed series High/Base video" >&2
+        echo "      ceilings per episode, which are ignored (each episode's ceiling is its" >&2
+        echo "      runtime x SERIES_HIGH_VIDEO_GIB_PER_HOUR / SERIES_BASE_VIDEO_GIB_PER_HOUR):" >&2
         printf '        %s\n' "${set[@]}" >&2
     fi
 
@@ -543,9 +563,9 @@ movie_video_policy_lines() {
 #   CRF_MAX    the lowest quality allowed; never exceeded automatically
 # The VIDEO size ceiling: movie High / Base the movie's exact runtime x
 # MOVIE_*_VIDEO_GIB_PER_HOUR (movie_ceiling_bytes, computed once the
-# runtime is known); series High / Base a fixed SERIES_*_VIDEO_SIZE_CEILING_GIB
-# per episode. Either way it is one number of bytes for the search and
-# the post-encode retry. Per title the adjacent boundary around it is
+# runtime is known); series High / Base / Compact every episode's exact
+# runtime x SERIES_*_VIDEO_GIB_PER_HOUR (series_ep_ceilings). Either way
+# the search and the post-encode retry compare against exact bytes. Per title the adjacent boundary around it is
 # found (crf_search_boundary):
 #
 #   CRF N over the ceiling, CRF N + 1 fits  ->  N + 1
@@ -556,8 +576,8 @@ movie_video_policy_lines() {
 # The result is the lowest CRF of CRF_MIN..CRF_MAX that fits (for one
 # title, whose estimates shrink as the CRF rises: the CRF the sequential
 # CRF_MIN, CRF_MIN + 1, ... search chooses), never above CRF_MAX
-# (CRF_OVER_CEILING=1 when CRF_MAX still does not fit: the menu warns
-# and asks). Audio is copied and never part of the decision.
+# (CRF_OVER_CEILING=1 when CRF_MAX still does not fit: the movie menu
+# warns and asks; series High / Base encode at CRF_MAX, "over target"). Audio is copied and never part of the decision.
 #
 # Estimates come from sample encodes of the actual source (encode_common.sh
 # crf_sample_title); the math on them lives here.
@@ -679,11 +699,10 @@ movie_floor_source_exempt() {
 # movie's runtime in seconds), CRF_CEILING_BYTES = movie_ceiling_bytes
 # and CRF_CEILING_GIB its GiB ("7.00"). Without DURATION (menu text)
 # both ceiling values are empty; an unusable DURATION returns 1.
-# Series High / Base: the fixed SERIES_*_VIDEO_SIZE_CEILING_GIB per
-# episode (CRF_GIB_PER_HOUR empty). Series Compact: CRF_GIB_PER_HOUR =
-# SERIES_COMPACT_VIDEO_GIB_PER_HOUR, CRF_CEILING_BYTES the ceiling of one
-# hour of runtime, CRF_CEILING_GIB the rate; the episodes' own ceilings
-# come from series_ep_ceilings.
+# Series High / Base / Compact: CRF_GIB_PER_HOUR =
+# SERIES_*_VIDEO_GIB_PER_HOUR, CRF_CEILING_BYTES the ceiling of one hour
+# of runtime, CRF_CEILING_GIB the rate; the episodes' own ceilings come
+# from series_ep_ceilings.
 # Movie Base also: CRF_FLOOR_MBPS (MOVIE_BASE_VIDEO_FLOOR_MBPS) and
 # CRF_FLOOR_CRF_MIN (MOVIE_BASE_FLOOR_CRF_MIN), and with DURATION
 # CRF_FLOOR_BYTES (movie_floor_bytes; 0 = no floor). Every other tier
@@ -731,8 +750,8 @@ crf_tier_load() {
                         CRF_FLOOR_BYTES=$(movie_floor_bytes "$CRF_FLOOR_MBPS" "$4") || CRF_FLOOR_BYTES=0
                     fi
                 fi
-            elif series_rate_tier "$tier"; then
-                # series Compact: every episode's ceiling is its runtime x
+            else
+                # series High / Base / Compact: every episode's ceiling is its runtime x
                 # the rate (series_ep_ceilings -> SERIES_EP_CEIL);
                 # CRF_CEILING_BYTES is the ceiling of one hour, the
                 # reference the season search compares against
@@ -741,10 +760,6 @@ crf_tier_load() {
                 CRF_GIB_PER_HOUR="${!r}"
                 CRF_CEILING_GIB="$CRF_GIB_PER_HOUR"
                 CRF_CEILING_BYTES=$(movie_ceiling_bytes "$CRF_GIB_PER_HOUR" 3600)
-            else
-                local c="${scope}_${u}_VIDEO_SIZE_CEILING_GIB"
-                CRF_CEILING_GIB="${!c}"
-                CRF_CEILING_BYTES=$(_gib_bytes "$CRF_CEILING_GIB")
             fi
             ;;
         Custom)
@@ -834,7 +849,9 @@ crf_policy_lines() (
     elif [[ "$scope" == series ]]; then
         echo "  CRF range: ${CRF_MIN}-${CRF_MAX}, search starts at ${CRF_START} (lowest CRF at which every episode fits)"
         if series_rate_tier "$tier"; then
-            echo "  video ceiling: ${CRF_GIB_PER_HOUR} GiB per hour of each episode's runtime (every episode its own ceiling)"
+            echo "  video ceiling: ${CRF_GIB_PER_HOUR} GiB per hour of runtime (each episode: its exact runtime x ${CRF_GIB_PER_HOUR} GiB; the tightest fit decides)"
+            series_auto_max_tier "$tier" &&
+                echo "  ceilings not reachable within CRF ${CRF_MIN}-${CRF_MAX}: the season is encoded at CRF ${CRF_MAX} without asking (over target)"
         elif [[ "$label" == "Custom size" ]]; then
             echo "  video ceiling: ${CRF_CEILING_GIB} GiB/episode (entered in the menu)"
         else
@@ -1560,12 +1577,12 @@ series_crf_shared() {
 }
 
 # ------------------------------------------------------------
-# Runtime-scaled series ceilings (series Compact)
+# Runtime-scaled series ceilings (series High / Base / Compact)
 #
-# High / Base have one fixed ceiling for every episode. Compact gives
-# every episode its own: exact runtime (EP_DUR) x CRF_GIB_PER_HOUR, in
-# SERIES_EP_CEIL (EP_DUR order; empty for High / Base, so everything
-# below behaves exactly as with one ceiling). The season search still
+# Every episode gets its own ceiling: exact runtime (EP_DUR) x
+# CRF_GIB_PER_HOUR (no minimum, the runtime not rounded), in
+# SERIES_EP_CEIL (EP_DUR order; empty for Custom and Custom size, whose
+# one fixed ceiling is the same for every episode). The season search still
 # compares ONE number per CRF with CRF_CEILING_BYTES (one hour of
 # runtime): series_batch_stats scales each episode's estimate by
 # CRF_CEILING_BYTES / its own ceiling, so the season fits only when every
@@ -1574,9 +1591,20 @@ series_crf_shared() {
 SERIES_EP_CEIL=()
 
 # series_rate_tier TIER  ->  0 for a series tier whose per-episode
-# ceiling scales with the runtime (Compact)
+# ceiling scales with the runtime (High / Base / Compact)
 series_rate_tier() {
-    [[ "${1:-}" == Compact ]]
+    case "${1:-}" in
+        High|Base|Compact) return 0 ;;
+    esac
+    return 1
+}
+
+# series_auto_max_tier TIER  ->  0 for the series tiers that encode a
+# season whose ceilings cannot be met within the CRF range at CRF_MAX
+# without asking ("over target": High / Base); Compact and Custom size
+# ask
+series_auto_max_tier() {
+    [[ "${1:-}" == High || "${1:-}" == Base ]]
 }
 
 # series_ep_ceilings TIER  ->  SERIES_EP_CEIL from EP_DUR and
@@ -1613,7 +1641,8 @@ series_ep_ceil() {
     _series_ceil_of "$1" "${CRF_CEILING_BYTES:-0}"
 }
 
-# series_ceiling_text  ->  "1.5 GiB/episode" | "0.40 GiB/h" (menu text)
+# series_ceiling_text  ->  "1.2 GiB/episode" (Custom size) | "1.0 GiB/h"
+# (menu text)
 series_ceiling_text() {
     if [[ -n "${CRF_GIB_PER_HOUR:-}" ]]; then
         printf '%s GiB/h' "$CRF_GIB_PER_HOUR"
@@ -1645,7 +1674,7 @@ series_ceiling_text() {
 #   SB_ABOVE      indexes of the episodes above the ceiling
 #   SB_FITS       1 when SB_DECIDE fits the ceiling (always 1 without one)
 #   SB_DECIDE_BYTES  video bytes of the SB_DECIDE_IDX episode
-# With per-episode ceilings (SERIES_EP_CEIL, series Compact; CEILING_BYTES
+# With per-episode ceilings (SERIES_EP_CEIL, series High / Base / Compact; CEILING_BYTES
 # is then the reference of one hour): SB_ABOVE uses each episode's own
 # ceiling, and the decision is made on each estimate scaled to the
 # reference (bytes x CEILING_BYTES / own ceiling, kept at or below
@@ -1874,8 +1903,9 @@ series_est_map() {
 }
 
 # series_season_retry_spec TIER CEILING_BYTES CRF_MAX CRF_MIN  ->  RETRY
-# field of emit_encode_item for a series episode: High / Base
-# "CEILING:CRF_MAX:CRF_MIN:::season", the shared-CRF season batch
+# field of emit_encode_item for a series episode: High / Base / Compact /
+# Custom size "CEILING:CRF_MAX:CRF_MIN:::season" (CEILING: that episode's
+# own ceiling, series_ep_ceil), the shared-CRF season batch
 # (job_runtime.sh job_crf_batch: every episode must fit, the season
 # moves up together, one whole-season CRF - 1 test, never below CRF_MIN
 # = the tier's SERIES_*_CRF_SEARCH_MIN). No per-episode headroom, lower-

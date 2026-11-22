@@ -140,6 +140,8 @@ job_init() {
     JOB_SEASON_ITEMS=""
     JOB_SEASON_STATE=""
     declare -gA JOB_SEASON_FINAL=()
+    # multi-season jobs: episodes kept over target per season number
+    declare -gA JOB_SEASON_OVER=()
     JOB_OVER_NAMES=()
     JOB_FLOOR_NAMES=()
     declare -gA JOB_DONE_PARTS=()   # completed attempt files: never deleted on interruption
@@ -179,6 +181,9 @@ job_write_state() {
         printf 'progress=%s\n' "$JOB_PROGRESS"
         printf 'log_dir=%s\n' "$JOB_LOG_DIR"
         printf 'compresser_version=%s\n' "$JOB_COMPRESSER_VERSION"
+        # outputs kept above their video ceiling at the tier's CRF_MAX
+        # (over target; progress-check.sh)
+        printf 'over=%s\n' "$( [[ -n "${JOB_OVER_NAMES[*]+x}" ]] && echo "${#JOB_OVER_NAMES[@]}" || echo 0)"
         if [[ -n "${JOB_SEASON_NAME:-}" ]]; then
             local n
             printf 'season=%s\n' "${JOB_SEASON_NAME//$'\n'/ }"
@@ -190,6 +195,9 @@ job_write_state() {
             printf 'label=%s\n' "${ITEM_EXP[ep_label]:-}"
             for n in "${!JOB_SEASON_FINAL[@]}"; do
                 printf 'season_final_%s=%s\n' "$n" "${JOB_SEASON_FINAL[$n]}"
+            done
+            for n in "${!JOB_SEASON_OVER[@]}"; do
+                printf 'season_over_%s=%s\n' "$n" "${JOB_SEASON_OVER[$n]}"
             done
         fi
     } > "$tmp" 2>/dev/null &&
@@ -829,7 +837,6 @@ item_succeeded() {
     unset 'JOB_DONE_PARTS[$ITEM_PART]'
     ITEM_PART=""
     ITEM_FINAL="$final"
-    (( ITEM_OVER_CEILING == 1 )) && JOB_OVER_NAMES+=("$ITEM_NAME")
     (( ${ITEM_BELOW_FLOOR:-0} == 1 )) && JOB_FLOOR_NAMES+=("$ITEM_NAME")
 
     if [[ -n "$ITEM_PASSLOG" ]]; then
@@ -847,6 +854,18 @@ item_succeeded() {
 
     ITEM_FINAL_VBYTES=""
     report_output_stats "$final"
+
+    # kept above its own video ceiling at the tier's CRF_MAX ("over
+    # target"): listed in the job summary with its actual video vs ceiling
+    if (( ITEM_OVER_CEILING == 1 )); then
+        local oc="${ITEM_EXP[ceiling_vbytes]:-}" od=""
+        if [[ "$oc" =~ ^[1-9][0-9]*$ && "${ITEM_FINAL_VBYTES:-}" =~ ^[0-9]+$ ]]; then
+            od=" (CRF ${ITEM_EXP[crf]:-?}: $(_gib "$ITEM_FINAL_VBYTES") GiB video / $(_gib "$oc") GiB ceiling)"
+        fi
+        JOB_OVER_NAMES+=("$ITEM_NAME$od")
+        [[ -n "${JOB_SEASON_NO:-}" ]] &&
+            JOB_SEASON_OVER[$JOB_SEASON_NO]=$(( ${JOB_SEASON_OVER[$JOB_SEASON_NO]:-0} + 1 ))
+    fi
 
     # retained record of the final CRF (Validate + update backfill)
     if [[ "${ITEM_EXP[mode]:-}" == crf ]]; then
@@ -2341,7 +2360,7 @@ job_finish() {
 
     if (( ${#JOB_OVER_NAMES[@]} )); then
         echo
-        echo "Above the video ceiling (kept: the ceiling cannot be met within the tier's CRF range):"
+        echo "Above the video ceiling - over target (kept: the ceiling cannot be met within the tier's CRF range):"
         for n in "${JOB_OVER_NAMES[@]}"; do
             echo "  $n"
         done

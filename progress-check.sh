@@ -494,6 +494,18 @@ season_state_text() {
     esac
 }
 
+# over_eps_text N  ->  "1 episode" / "3 episodes"
+over_eps_text() {
+    if [[ "$1" == 1 ]]; then printf '1 episode'; else printf '%s episodes' "$1"; fi
+}
+
+# over_target_note  ->  " (2 over target)" when the job kept outputs above
+# their video ceiling at the tier's CRF_MAX (state "over"), else nothing
+over_target_note() {
+    [[ "${ST[over]:-0}" =~ ^[1-9][0-9]*$ ]] && printf ' (%s over target)' "${ST[over]}"
+    return 0
+}
+
 # print_season_queue CURRENT ITEMS  ->  the JOB QUEUE of a multi-season
 # series job: one row per season (SEASON_NAMES / ITEM_SEASON from the
 # job script, ST from the state file)
@@ -554,13 +566,16 @@ print_season_queue() {
             tag="[WAIT]"
             cnt="0/${total[$s]:-0}"
         fi
+        # episodes kept above their video ceiling at CRF_MAX (job state)
+        [[ "${ST[season_over_$((n + 1))]:-0}" =~ ^[1-9][0-9]*$ ]] &&
+            extra+="   over target ($(over_eps_text "${ST[season_over_$((n + 1))]}"))"
         printf '  %-7s %-*s  %7s   %s%s\n' "$tag" "$namew" "$s" "$cnt" "${crf:+CRF $crf}" "$extra"
     done
 
     echo
     done_items=$(( cur - 1 ))
     (( done_items < 0 )) && done_items=0
-    printf '  Completed: %s%s\n' "$done_items" "$( (( ${ST[failed]:-0} > 0 )) && echo " (${ST[failed]} failed)")"
+    printf '  Completed: %s%s%s\n' "$done_items" "$( (( ${ST[failed]:-0} > 0 )) && echo " (${ST[failed]} failed)")" "$(over_target_note)"
     printf '  Remaining: %s queued\n' "$(( items - cur > 0 ? items - cur : 0 ))"
     printf '  Seasons:   %s (one shared CRF per season; -v lists every episode)\n' "${#SEASON_NAMES[@]}"
     [[ -n "${R[note_crf]:-}" ]] && echo "  Note: CRF retries/tests not yet started are excluded"
@@ -653,7 +668,7 @@ print_queue() {
     echo
     done=$(( cur - 1 ))
     (( done < 0 )) && done=0
-    printf '  Completed: %s%s\n' "$done" "$( (( ${ST[failed]:-0} > 0 )) && echo " (${ST[failed]} failed)")"
+    printf '  Completed: %s%s%s\n' "$done" "$( (( ${ST[failed]:-0} > 0 )) && echo " (${ST[failed]} failed)")" "$(over_target_note)"
     printf '  Remaining: %s queued\n' "$(( items - cur > 0 ? items - cur : 0 ))"
     [[ -n "${R[note_crf]:-}" ]] && echo "  Note: CRF retries/tests not yet started are excluded"
     return 0
@@ -683,6 +698,8 @@ print_job() {
 print_ended() {
     print_header
     echo "${R[status]:-?}"
+    [[ "${ST[over]:-0}" =~ ^[1-9][0-9]*$ ]] &&
+        printf '  Over target: %s kept above the video ceiling at the tier'"'"'s CRF limit\n' "${ST[over]}"
     [[ -n "${R[logs]:-}" ]] && printf '  %-11s%s\n' "Logs:" "${R[logs]}"
     printf '  %-11s%s\n' "Elapsed:" "${R[total_elapsed]:-Unknown}"
     echo

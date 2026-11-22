@@ -328,9 +328,9 @@ crf_tier_load movie Custom 21.5
 eq "Custom exact, no ceiling" "$CRF_MIN $CRF_MAX $CRF_CEILING_BYTES" "21.5 21.5 0"
 eq "Custom policy line"       "$(movie_policy_line Custom)" "CRF entered in the menu, used exactly; audio copied"
 crf_tier_load series High
-eq "series High from config"  "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB" "$SERIES_HIGH_CRF_SEARCH_MIN $SERIES_HIGH_CRF_MAX $SERIES_HIGH_VIDEO_SIZE_CEILING_GIB"
+eq "series High from config"  "$CRF_MIN $CRF_MAX $CRF_GIB_PER_HOUR" "$SERIES_HIGH_CRF_SEARCH_MIN $SERIES_HIGH_CRF_MAX $SERIES_HIGH_VIDEO_GIB_PER_HOUR"
 crf_tier_load series Base
-eq "series Base from config"  "$CRF_MIN $CRF_MAX $CRF_CEILING_GIB" "$SERIES_BASE_CRF_SEARCH_MIN $SERIES_BASE_CRF_MAX $SERIES_BASE_VIDEO_SIZE_CEILING_GIB"
+eq "series Base from config"  "$CRF_MIN $CRF_MAX $CRF_GIB_PER_HOUR" "$SERIES_BASE_CRF_SEARCH_MIN $SERIES_BASE_CRF_MAX $SERIES_BASE_VIDEO_GIB_PER_HOUR"
 est 19=9 20=7.5 21=6.9 22=5
 EST_CALLS=()
 crf_select 19 23 "$(gib_bytes 7)" fake_est

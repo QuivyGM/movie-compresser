@@ -66,8 +66,8 @@ check "no fixed movie High / Base ceiling in the config" \
     "! grep -qE '^MOVIE_(HIGH|BASE)_VIDEO_SIZE_CEILING_GIB=' '$SRC_WORK/lib/compress.conf'"
 check "movie GiB/hour keys are active (validated), not retired" \
     "[[ ' ${POLICY_KEYS_POSITIVE[*]} ' == *' MOVIE_HIGH_VIDEO_GIB_PER_HOUR '* && ' ${POLICY_KEYS_POSITIVE[*]} ' == *' MOVIE_BASE_VIDEO_GIB_PER_HOUR '* ]] && [[ ' ${POLICY_KEYS_RETIRED_VIDEO[*]} ${POLICY_KEYS_RETIRED[*]} ${POLICY_KEYS_RETIRED_QUALITY[*]} ' != *' MOVIE_HIGH_VIDEO_GIB_PER_HOUR '* && ' ${POLICY_KEYS_RETIRED_VIDEO[*]} ${POLICY_KEYS_RETIRED[*]} ${POLICY_KEYS_RETIRED_QUALITY[*]} ' != *' MOVIE_BASE_VIDEO_GIB_PER_HOUR '* ]]"
-check "series GiB/hour keys still retired" \
-    "[[ ' ${POLICY_KEYS_RETIRED_VIDEO[*]} ' == *' SERIES_HIGH_VIDEO_GIB_PER_HOUR '* && ' ${POLICY_KEYS_RETIRED_VIDEO[*]} ' == *' SERIES_BASE_VIDEO_GIB_PER_HOUR '* ]]"
+check "series High / Base GiB/hour keys active again; fixed series ceilings retired" \
+    "[[ ' ${POLICY_KEYS_POSITIVE[*]} ' == *' SERIES_HIGH_VIDEO_GIB_PER_HOUR '* && ' ${POLICY_KEYS_POSITIVE[*]} ' == *' SERIES_BASE_VIDEO_GIB_PER_HOUR '* && ' ${POLICY_KEYS_RETIRED_VIDEO[*]} ' != *' SERIES_HIGH_VIDEO_GIB_PER_HOUR '* && ' ${POLICY_KEYS_RETIRED_SERIES_CEILING[*]} ' == *' SERIES_HIGH_VIDEO_SIZE_CEILING_GIB '* && ' ${POLICY_KEYS_RETIRED_SERIES_CEILING[*]} ' == *' SERIES_BASE_VIDEO_SIZE_CEILING_GIB '* ]]"
 
 f=$(conf_with rate MOVIE_HIGH_VIDEO_GIB_PER_HOUR=4.25 MOVIE_BASE_VIDEO_GIB_PER_HOUR=0.8 MOVIE_BASE_VIDEO_FLOOR_MBPS=1.5)
 check "edited GiB/hour: loads without a note"   "( COMPRESS_CONF='$f' load_policy ) 2>'$T/rate.err' && [[ ! -s '$T/rate.err' ]]"
@@ -470,18 +470,20 @@ load_policy 2>/dev/null
 
 # ------------------------------------------------------------
 echo
-echo "== 4. series and Quality unchanged"
+echo "== 4. series (per hour of each episode's runtime) and Quality unchanged"
 eq "series values in the config" \
-    "$SERIES_HIGH_CRF_SEARCH_MIN $SERIES_HIGH_CRF_START $SERIES_HIGH_CRF_MAX $SERIES_HIGH_VIDEO_SIZE_CEILING_GIB / $SERIES_BASE_CRF_SEARCH_MIN $SERIES_BASE_CRF_START $SERIES_BASE_CRF_MAX $SERIES_BASE_VIDEO_SIZE_CEILING_GIB" \
-    "8 15 21 5 / 11 18 27 1.5"
+    "$SERIES_HIGH_CRF_SEARCH_MIN $SERIES_HIGH_CRF_START $SERIES_HIGH_CRF_MAX $SERIES_HIGH_VIDEO_GIB_PER_HOUR / $SERIES_BASE_CRF_SEARCH_MIN $SERIES_BASE_CRF_START $SERIES_BASE_CRF_MAX $SERIES_BASE_VIDEO_GIB_PER_HOUR" \
+    "8 15 21 2.5 / 11 18 27 1.0"
+# the tier gives the rate (reference: one hour); each episode's own
+# ceiling comes from series_ep_ceilings, never from a DURATION argument
 for d in "" 1200 5400; do
-    eq "series High fixed 5 GiB/episode (runtime \"$d\" ignored)" \
-        "$(crf_tier_load series High "" "$d"; echo "$CRF_CEILING_GIB $CRF_CEILING_BYTES [$CRF_GIB_PER_HOUR]")" "5 5368709120 []"
-    eq "series Base fixed 1.5 GiB/episode (runtime \"$d\" ignored)" \
-        "$(crf_tier_load series Base "" "$d"; echo "$CRF_CEILING_GIB $CRF_CEILING_BYTES [$CRF_GIB_PER_HOUR]")" "1.5 1610612736 []"
+    eq "series High 2.5 GiB/h (runtime \"$d\" not used here)" \
+        "$(crf_tier_load series High "" "$d"; echo "$CRF_CEILING_GIB $CRF_CEILING_BYTES [$CRF_GIB_PER_HOUR]")" "2.5 2684354560 [2.5]"
+    eq "series Base 1.0 GiB/h (runtime \"$d\" not used here)" \
+        "$(crf_tier_load series Base "" "$d"; echo "$CRF_CEILING_GIB $CRF_CEILING_BYTES [$CRF_GIB_PER_HOUR]")" "1.0 1073741824 [1.0]"
 done
-check "series policy lines: fixed per-episode ceiling, no GiB/hour" \
-    "crf_policy_lines series High | grep -q '^  video ceiling: 5 GiB/episode\$' && ! { crf_policy_lines series High; crf_policy_lines series Base; } | grep -qi 'per hour'"
+check "series policy lines: per hour of runtime, no GiB/episode" \
+    "crf_policy_lines series High | grep -q '^  video ceiling: 2.5 GiB per hour of runtime' && ! { crf_policy_lines series High; crf_policy_lines series Base; } | grep -q 'GiB/episode'"
 check "series menu does not pass a runtime to crf_tier_load" \
     "! grep -E 'crf_tier_load series' '$SRC_WORK/series_compress.sh' | grep -q DUR"
 eq "Quality band / CRF in the config" \

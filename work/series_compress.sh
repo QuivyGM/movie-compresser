@@ -41,21 +41,25 @@ source "$WORK_DIR/lib/series_seasons.sh"
 # Base / High: x265 CRF, ONE shared season CRF for every encoded
 #              episode of a season: the lowest CRF of
 #              SERIES_*_CRF_SEARCH_MIN..MAX at which every episode's video
-#              estimate fits the per-episode
-#              SERIES_*_VIDEO_SIZE_CEILING_GIB, searched from
+#              estimate fits its own ceiling (its exact runtime x
+#              SERIES_*_VIDEO_GIB_PER_HOUR; the tightest fit decides),
+#              searched from
 #              SERIES_*_CRF_START up or down (the adjacent boundary:
 #              CRF N too large, N + 1 fits). Strictly shared
 #              (SERIES_CRF_SHARED=1): an outlier (an episode above
 #              median + SERIES_CRF_OUTLIER_PCT) is reported but never
 #              gets a CRF of its own; a harder episode raises the season
-#              CRF for every episode of that season.
+#              CRF for every episode of that season. A season whose
+#              ceilings cannot be met even at CRF_MAX is encoded at
+#              CRF_MAX without asking and marked "over target" (expected
+#              sizes, season summary, confirmation, job summary).
 # Custom:      user-entered CRF, used exactly for every episode (no
 #              High/Base range or ceiling)
 #
 # After the encode (job_runtime.sh job_crf_batch, batch_mode=season, one
-# batch per season) every episode's ACTUAL video must fit the
-# per-episode ceiling: one above it moves the WHOLE season to CRF + 1 (up
-# to CRF_MAX); once the season fits, CRF - 1 is tested once for the
+# batch per season) every episode's ACTUAL video must fit its own
+# ceiling: one above it moves the WHOLE season to CRF + 1 (up to CRF_MAX;
+# at CRF_MAX still above: accepted, reported as over target); once the season fits, CRF - 1 is tested once for the
 # whole season and kept only when every episode fits there. The final
 # season is one CRF for every encoded episode. An episode whose estimate
 # is not below its source video is only re-encoded when the user chooses
@@ -800,18 +804,18 @@ echo
 echo "Compression tier:"
 if ui_verbose; then
     crf_tier_load series Base
-    echo "1) Base        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_CEILING_GIB} GiB/episode (audio copied unchanged)"
+    echo "1) Base        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of each episode's runtime (audio copied unchanged)"
     crf_tier_load series High
-    echo "2) High        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_CEILING_GIB} GiB/episode (audio copied unchanged)"
+    echo "2) High        CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of each episode's runtime (audio copied unchanged)"
     echo "3) Custom CRF  exactly the CRF you enter, any 0-${CRF_LIMIT} (no range or ceiling; audio copied unchanged)"
     crf_tier_load series Compact
     echo "4) Compact     CRF ${CRF_MIN}-${CRF_MAX}, video ceiling ${CRF_GIB_PER_HOUR} GiB/hour of each episode's runtime (audio copied unchanged)"
     echo "5) Custom size the video ceiling you enter (GiB/episode), CRF ${SERIES_CUSTOMSIZE_CRF_SEARCH_MIN}-${SERIES_CUSTOMSIZE_CRF_MAX} or the range you enter, search starts at ${SERIES_CUSTOMSIZE_CRF_START} (audio copied unchanged)"
 else
     crf_tier_load series Base
-    printf '1) %-7s CRF %-7s <=%s GiB/episode\n' Base "${CRF_MIN}-${CRF_MAX}" "$CRF_CEILING_GIB"
+    printf '1) %-7s CRF %-7s <=%s GiB/h video\n' Base "${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR"
     crf_tier_load series High
-    printf '2) %-7s CRF %-7s <=%s GiB/episode\n' High "${CRF_MIN}-${CRF_MAX}" "$CRF_CEILING_GIB"
+    printf '2) %-7s CRF %-7s <=%s GiB/h video\n' High "${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR"
     printf '3) %-7s exact CRF (0-%s)\n' Custom "$CRF_LIMIT"
     crf_tier_load series Compact
     printf '4) %-7s CRF %-7s <=%s GiB/h\n' Compact "${CRF_MIN}-${CRF_MAX}" "$CRF_GIB_PER_HOUR"
@@ -898,7 +902,7 @@ else
     continue_or_cancel "$EXCL_BEFORE"
 fi
 
-# ceil_phrase  ->  "the 5 GiB ceiling" | "the 0.40 GiB/h ceiling" (warnings)
+# ceil_phrase  ->  "the 1.2 GiB ceiling" | "the 1.0 GiB/h ceiling" (warnings)
 ceil_phrase() {
     if (( ${#SERIES_EP_CEIL[@]} )); then
         printf 'the %s GiB/h ceiling' "$CRF_GIB_PER_HOUR"
@@ -911,6 +915,61 @@ if ui_verbose; then
     echo
     crf_policy_lines series "$TIER" "$CUSTOM_CRF"
 fi
+
+# ---- over target (series High / Base, policy.sh series_auto_max_tier):
+# a season whose ceilings cannot be met within the CRF range is encoded
+# at CRF_MAX without asking; the episodes still estimated above their own
+# ceiling are listed (expected sizes, season summary, confirmation)
+
+# over_target_tier  ->  0 for High / Base
+over_target_tier() {
+    series_auto_max_tier "$TIER"
+}
+
+# season_over_eps  ->  OVER_EPS: the encoded episodes of the loaded season
+# estimated above their own ceiling (ABOVE, without the skipped ones and
+# the ones whose source video is kept)
+season_over_eps() {
+    local i
+    local -A above=()
+
+    OVER_EPS=()
+    for i in "${ABOVE[@]+"${ABOVE[@]}"}"; do above[$i]=1; done
+    for i in "${!FILES[@]}"; do
+        [[ -n "${above[$i]:-}" ]] || continue
+        (( ${EP_CEIL_SKIP[i]:-0} == 1 || ${EP_GUARD_SKIP[i]:-0} == 1 )) && continue
+        [[ "${EP_VIDEO[$i]:-}" == copy ]] && continue
+        OVER_EPS+=("$i")
+    done
+}
+
+# over_target_text INDEX  ->  "~1.20 GiB video / 1.00 GiB ceiling (+0.20, sampled)"
+over_target_text() {
+    local i="$1"
+    printf '~%s GiB video / %s GiB ceiling (+%s, %s)' "$(bytes_to_gib "${EP_EST[$i]}")" \
+        "$(bytes_to_gib "$(series_ep_ceil "$i")")" \
+        "$(crf_oversize_gib "${EP_EST[$i]}" "$(series_ep_ceil "$i")")" \
+        "$(series_from_text "${EP_FROM[$i]}")"
+}
+
+# season_over_target_lines [INDENT]  ->  the over-target episodes of the
+# loaded season, one per line (label, estimate vs its ceiling)
+season_over_target_lines() {
+    local i
+    season_over_eps
+    for i in "${OVER_EPS[@]+"${OVER_EPS[@]}"}"; do
+        printf '%s%-*s  %s\n' "${1:-}" "$LABEL_W" "${EP_LABEL[$i]}" "$(over_target_text "$i")"
+    done
+}
+
+# over_target_block  ->  the over-target note of the loaded season and its
+# episodes (nothing when it is not over target)
+over_target_block() {
+    (( ${SEASON_OVER_TARGET:-0} == 1 )) || return 0
+    echo "$(ui_warn "Over target"): the ${TIER_LABEL} ceilings ($(series_ceiling_text) of each episode's runtime)"
+    echo "cannot be met within CRF ${CRF_MIN}-${CRF_MAX}; encoded at CRF ${CRF} without asking:"
+    season_over_target_lines "  "
+}
 
 # ============================================================
 # CRF ANALYSIS  (policy.sh: crf_select, series_crf_spread,
@@ -1190,8 +1249,13 @@ season_crf() {
         done
     fi
 
-    # ---- season CRF_MAX still above the ceiling (every episode decides)
-    if (( CRF_OVER_CEILING == 1 )); then
+    # ---- season CRF_MAX still above the ceiling (every episode decides).
+    # High / Base: no question, the season is encoded at CRF_MAX and
+    # marked over target (SEASON_OVER_TARGET, set below once the source-
+    # quality guard has decided); Compact / Custom size ask.
+    if (( CRF_OVER_CEILING == 1 )) && over_target_tier; then
+        hidden printf '%-10s%s\n' "Selected:" "$(ui_bold "CRF ${CRF_MAX}") (ceilings not reachable within CRF ${CRF_MIN}-${CRF_MAX}: over target)"
+    elif (( CRF_OVER_CEILING == 1 )); then
         season_prompt_header "$k"
         echo
         echo "------------------------------------------------------------"
@@ -1239,8 +1303,9 @@ season_crf() {
     # Episodes still estimated above the ceiling at their CRF (the ceiling
     # cannot be met within the tier's range and encoding anyway was chosen).
     # Custom has no ceiling. Compact multi-season output lists them with
-    # the expected sizes.
-    if (( ${#ABOVE[@]} && SUMMARY == 0 )); then
+    # the expected sizes. High / Base: the over-target list comes with the
+    # expected sizes (after the source-quality guard).
+    if (( ${#ABOVE[@]} && SUMMARY == 0 )) && ! over_target_tier; then
         echo
         if (( ${#ABOVE[@]} == 1 )); then
             echo "$(ui_warn Warning): 1 episode is estimated above $(ceil_phrase) at CRF ${CRF_MAX}."
@@ -1301,7 +1366,8 @@ season_crf() {
         RAISE="$CRF"
         RAISED_BY=""
         for i in "${LATE[@]}"; do
-            if (( EP_OVER[i] == 1 && CRF_OVER_CEILING == 0 )); then
+            # High / Base: no question (over target, encoded at CRF_MAX)
+            if (( EP_OVER[i] == 1 && CRF_OVER_CEILING == 0 )) && ! over_target_tier; then
                 season_prompt_header "$k"
                 episode_over_ceiling_prompt "$i"
                 # a skipped episode is not encoded: it does not raise the season
@@ -1399,6 +1465,14 @@ season_crf() {
         fi
     done
     series_crf_plan "${PLAN_VIDEO[@]}"
+
+    # High / Base: over target when an encoded episode is still estimated
+    # above its own ceiling (at CRF_MAX)
+    SEASON_OVER_TARGET=0
+    if over_target_tier; then
+        season_over_eps
+        (( ${#OVER_EPS[@]} )) && SEASON_OVER_TARGET=1
+    fi
     return 0
 }
 
@@ -1420,7 +1494,11 @@ season_crf_line() {
     if [[ -n "$SEASON_RAISED" ]]; then
         extra+="   raised from CRF ${SEASON_RAISED%%:*} (${EP_LABEL[${SEASON_RAISED#*:}]})"
     fi
-    (( CRF_OVER_CEILING == 1 || ${#ABOVE[@]} > 0 )) && extra+="   $(ui_warn "ceiling not met")"
+    if (( SEASON_OVER_TARGET == 1 )); then
+        extra+="   $(ui_warn "over target")"
+    elif (( CRF_OVER_CEILING == 1 || ${#ABOVE[@]} > 0 )); then
+        extra+="   $(ui_warn "ceiling not met")"
+    fi
     printf '%-*s  CRF %-3s  %s%s%s\n' "$w" "$(season_name "$k")" "$CRF" "$what" "$ceil" "$extra"
 }
 
@@ -1466,7 +1544,7 @@ season_preview() {
             echo "Video encode:         x265 CRF ${CRF}, single pass, every episode (entered CRF)"
         else
             echo "Video encode:         x265 CRF ${CRF}, single pass, every episode"
-            echo "                      (${TIER_LABEL}: CRF ${CRF_MIN}-${CRF_MAX}, $(series_ceiling_text) video ceiling$( (( CRF_OVER_CEILING == 1 || ${#ABOVE[@]} > 0 )) && echo "; ceiling NOT met"))"
+            echo "                      (${TIER_LABEL}: CRF ${CRF_MIN}-${CRF_MAX}, $(series_ceiling_text) video ceiling$( if (( SEASON_OVER_TARGET == 1 )); then echo "; OVER TARGET"; elif (( CRF_OVER_CEILING == 1 || ${#ABOVE[@]} > 0 )); then echo "; ceiling NOT met"; fi))"
         fi
         echo "Resolution:           ${WIDTH}x${HEIGHT} -> ${OUT_WIDTH}x${OUT_HEIGHT}"
         echo "Dynamic range:        $(hdr_description)"
@@ -1512,8 +1590,10 @@ season_preview() {
         echo
         echo "Expected sizes:"
         echo
-        printf "  %-32s %7s %5s %7s %7s %7s  %-8s %s\n" \
-            "Episode" "Runtime" "CRF" "Video" "Audio" "Total" "Estimate" "Status"
+        # Ceiling: each episode's own video ceiling (runtime x the rate;
+        # Custom size: the entered GiB; Custom: none)
+        printf "  %-32s %7s %5s %7s %7s %7s %7s  %-8s %s\n" \
+            "Episode" "Runtime" "CRF" "Video" "Ceiling" "Audio" "Total" "Estimate" "Status"
 
         for i in "${!FILES[@]}"; do
             ccol="${EP_CRF[$i]}"
@@ -1529,7 +1609,9 @@ season_preview() {
                     promoted) ecol="promoted" ;;
                     *)        ecol="highest" ;;
                 esac
-                if [[ -n "${IS_ABOVE[$i]:-}" ]]; then
+                if [[ -n "${IS_ABOVE[$i]:-}" ]] && over_target_tier; then
+                    status="OVER TARGET"
+                elif [[ -n "${IS_ABOVE[$i]:-}" ]]; then
                     status="ABOVE CEILING"
                 else
                     status="OK"
@@ -1537,19 +1619,29 @@ season_preview() {
                 [[ -n "${IS_GUARD[$i]:-}" ]] && status+=" (not below source; encode anyway)"
             fi
 
-            printf "  %-32.32s %7s %5s %7s %7s %7s  %-8s %s\n" \
+            printf "  %-32.32s %7s %5s %7s %7s %7s %7s  %-8s %s\n" \
                 "$(basename "${FILES[$i]}")" \
                 "$(awk -v d="${EP_DUR[$i]}" 'BEGIN { printf "%d:%02d", int(d / 60), int(d % 60) }')" \
-                "$ccol" "${P_EP_VGIB[$i]}" "${P_EP_AGIB[$i]}" "${P_EP_GIB[$i]}" "$ecol" "$status"
+                "$ccol" "${P_EP_VGIB[$i]}" \
+                "$( [[ "$TIER" == Custom ]] && echo - || bytes_to_gib "$(series_ep_ceil "$i")")" \
+                "${P_EP_AGIB[$i]}" "${P_EP_GIB[$i]}" "$ecol" "$status"
         done
         echo "  (runtime m:ss; sizes in GiB; video = estimate from sample encodes;"
+        [[ "$TIER" != Custom ]] &&
+            echo "   ceiling = the episode's own video ceiling$(series_rate_tier "$TIER" && echo " (runtime x ${CRF_GIB_PER_HOUR} GiB/h)");"
         echo "   audio = actual size of all copied source audio tracks;"
         echo "   total = video + audio + ~${SERIES_CONTAINER_RESERVE_PCT}% container/subtitles)"
         echo "  sampled = this episode was sample-encoded"
         echo "  highest = not sampled (inferred); highest sampled video bitrate x its runtime"
         echo "  promoted = not in the sample set; sampled itself because it decided the season CRF"
-        if [[ "$TIER" != "Custom" ]]; then
+        if over_target_tier; then
+            echo "  OVER TARGET = video estimate above its own ceiling even at CRF ${CRF_MAX} (encoded at CRF ${CRF_MAX})"
+        elif [[ "$TIER" != "Custom" ]]; then
             echo "  ABOVE CEILING = video estimate above $(ceil_phrase | sed 's/^the //; s/ ceiling$//') even at CRF ${CRF_MAX}"
+        fi
+        if (( SEASON_OVER_TARGET == 1 )); then
+            echo
+            over_target_block
         fi
 
         # Stream / title / chapter handling, shown for the first episode (the
@@ -1580,8 +1672,9 @@ season_preview() {
         if [[ "$TIER" == "Custom" ]]; then
             printf "  Above ceiling:              n/a (Custom has no ceiling)\n"
         else
-            printf "  Above ceiling:              %d of %d episode(s) (%s)\n" \
-                "${#ABOVE[@]}" "$FILE_COUNT" "$(series_ceiling_text)"
+            printf "  Above ceiling:              %d of %d episode(s) (%s)%s\n" \
+                "${#ABOVE[@]}" "$FILE_COUNT" "$(series_ceiling_text)" \
+                "$( (( SEASON_OVER_TARGET == 1 )) && echo "; over target")"
         fi
         printf "  Expected total video size:  ~%s GiB\n" "$P_VIDEO_GIB"
         printf "  Copied source audio size:   ~%s GiB\n" "$P_AUDIO_GIB"
@@ -1617,6 +1710,8 @@ season_preview() {
                 STATUS[$i]=$(ui_warn "SKIPPED (source-quality guard)")
             elif [[ "${EP_VIDEO[$i]}" == "copy" ]]; then
                 STATUS[$i]="SOURCE VIDEO KEPT"
+            elif [[ -n "${IS_ABOVE[$i]:-}" ]] && over_target_tier; then
+                STATUS[$i]=$(ui_warn "OVER TARGET")
             elif [[ -n "${IS_ABOVE[$i]:-}" ]]; then
                 STATUS[$i]=$(ui_warn "ABOVE CEILING")
             else
@@ -1672,6 +1767,10 @@ season_preview() {
             echo "  (totals include the $GUARD_SKIPPED episode(s) skipped by the source-quality guard)"
         (( CEIL_SKIPPED > 0 )) &&
             echo "  (totals include the $CEIL_SKIPPED episode(s) skipped above the ceiling)"
+        if (( SEASON_OVER_TARGET == 1 )); then
+            echo
+            over_target_block
+        fi
         echo
     fi
 }
@@ -1713,6 +1812,10 @@ season_problem_lines() {
         elif [[ "${EP_VIDEO[$i]}" == copy ]]; then
             printf '%-*s  SOURCE VIDEO KEPT (source %s, CRF %s estimate ~%s)\n' "$LABEL_W" "${EP_LABEL[$i]}" \
                 "$(size_text "${EP_VBYTES[$i]}")" "$CRF" "$(size_text "${EP_EST[$i]}")"
+        elif [[ -n "${above[$i]:-}" ]] && over_target_tier; then
+            printf '%-*s  %s %s%s\n' "$LABEL_W" "${EP_LABEL[$i]}" "$(ui_warn "OVER TARGET")" \
+                "$(over_target_text "$i")" \
+                "$( [[ -n "${guard[$i]:-}" ]] && echo "; not below source, encoded anyway")"
         elif [[ -n "${above[$i]:-}" ]]; then
             printf '%-*s  %s ~%s GiB video, +%s GiB (%s)%s\n' "$LABEL_W" "${EP_LABEL[$i]}" "$(ui_warn "ABOVE CEILING")" \
                 "$(bytes_to_gib "${EP_EST[$i]}")" "$(crf_oversize_gib "${EP_EST[$i]}" "$(series_ep_ceil "$i")")" \
@@ -1745,7 +1848,12 @@ summary_sizes_table() {
     for k in "${ACTIVE[@]}"; do
         season_state_load "$k"
         season_counts
-        st=$(season_status_text "$SC_ABOVE" "$SC_COPY" "$SC_SKIP")
+        if (( SEASON_OVER_TARGET == 1 )); then
+            # High / Base: "over target (2 eps)" instead of "2 above ceiling"
+            st=$(season_status_text 0 "$SC_COPY" "$SC_SKIP" "over target ($SC_ABOVE ep)")
+        else
+            st=$(season_status_text "$SC_ABOVE" "$SC_COPY" "$SC_SKIP")
+        fi
         [[ "$st" == OK ]] && st=$(ui_ok OK) || st=$(ui_warn "$st")
         printf '%-*s  %4s  %3s  %7s  %7s  %7s  %6s  %s\n' "$w" "$(season_name "$k")" "$FILE_COUNT" "$CRF" \
             "$P_VIDEO_GIB" "$P_AUDIO_GIB" "$P_TOTAL_GIB" "$(per_file "$P_TOTAL_GIB")" "$st"
@@ -1999,8 +2107,24 @@ fi
 season_confirm_text() {
     printf '%s | %s | %sx%s | %s | audio copied%s' "$TIER_LABEL" "$(ui_bold "CRF $CRF")" \
         "$OUT_WIDTH" "$OUT_HEIGHT" "$(hdr_policy_short)" \
-        "$( (( CRF_OVER_CEILING == 1 || ${#ABOVE[@]} > 0 )) && echo " | $(ui_warn "ceiling not met")")"
+        "$( if (( SEASON_OVER_TARGET == 1 )); then echo " | $(ui_warn "over target")"
+            elif (( CRF_OVER_CEILING == 1 || ${#ABOVE[@]} > 0 )); then echo " | $(ui_warn "ceiling not met")"; fi)"
 }
+
+# over target again right before the confirmation (High / Base): every
+# season encoded at CRF_MAX above its ceilings, with its episodes
+OVER_SHOWN=0
+for k in "${JOB_KEYS[@]}"; do
+    season_state_load "$k"
+    (( SEASON_OVER_TARGET == 1 )) || continue
+    if (( OVER_SHOWN == 0 )); then
+        echo "$(ui_warn "Over target") (${TIER_LABEL} ceilings cannot be met within CRF ${CRF_MIN}-${CRF_MAX}; encoded at CRF ${CRF_MAX}):"
+        OVER_SHOWN=1
+    fi
+    (( MULTI == 1 )) && echo "  $(season_name "$k") (CRF $CRF):"
+    season_over_target_lines "$( (( MULTI == 1 )) && echo "    " || echo "  ")"
+done
+(( OVER_SHOWN == 1 )) && echo
 
 if (( MULTI == 0 )); then
     season_state_load "${JOB_KEYS[0]}"

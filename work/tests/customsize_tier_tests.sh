@@ -106,9 +106,9 @@ eq    "2 crf_select_boundary against the ceiling" "$(
         crf_select_boundary "$CRF_START" "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" probe > /dev/null 2>&1; echo "$CRF_SELECTED")" "22"
 crf_policy_lines series Size1.2G > "$T/pol.txt"
 check "2 full policy (COMPRESS_VERBOSE)" "grep -qx 'Custom size video policy:' '$T/pol.txt' && grep -q 'CRF range: 11-30, search starts at 18' '$T/pol.txt' && grep -q 'video ceiling: 1.2 GiB/episode (entered in the menu)' '$T/pol.txt' && grep -q 'one shared season CRF' '$T/pol.txt'"
-eq    "2 tiers 1-4 unchanged" \
-      "$(for t in Base High Compact; do crf_tier_load series $t; printf '%s ' "$CRF_MIN/$CRF_START/$CRF_MAX/$CRF_CEILING_GIB"; done; crf_tier_load series Custom 21; printf '%s' "$CRF_MIN/$CRF_START/$CRF_MAX/$CRF_CEILING_BYTES")" \
-      "$SERIES_BASE_CRF_SEARCH_MIN/$SERIES_BASE_CRF_START/$SERIES_BASE_CRF_MAX/$SERIES_BASE_VIDEO_SIZE_CEILING_GIB $SERIES_HIGH_CRF_SEARCH_MIN/$SERIES_HIGH_CRF_START/$SERIES_HIGH_CRF_MAX/$SERIES_HIGH_VIDEO_SIZE_CEILING_GIB $SERIES_COMPACT_CRF_SEARCH_MIN/$SERIES_COMPACT_CRF_START/$SERIES_COMPACT_CRF_MAX/$SERIES_COMPACT_VIDEO_GIB_PER_HOUR 21/21/21/0"
+eq    "2 tiers 1-4: CRF ranges unchanged, High / Base / Compact per hour of runtime" \
+      "$(for t in Base High Compact; do crf_tier_load series $t; printf '%s ' "$CRF_MIN/$CRF_START/$CRF_MAX/$CRF_GIB_PER_HOUR"; done; crf_tier_load series Custom 21; printf '%s' "$CRF_MIN/$CRF_START/$CRF_MAX/$CRF_CEILING_BYTES")" \
+      "$SERIES_BASE_CRF_SEARCH_MIN/$SERIES_BASE_CRF_START/$SERIES_BASE_CRF_MAX/$SERIES_BASE_VIDEO_GIB_PER_HOUR $SERIES_HIGH_CRF_SEARCH_MIN/$SERIES_HIGH_CRF_START/$SERIES_HIGH_CRF_MAX/$SERIES_HIGH_VIDEO_GIB_PER_HOUR $SERIES_COMPACT_CRF_SEARCH_MIN/$SERIES_COMPACT_CRF_START/$SERIES_COMPACT_CRF_MAX/$SERIES_COMPACT_VIDEO_GIB_PER_HOUR 21/21/21/0"
 
 # ------------------------------------------------------------
 echo
@@ -219,8 +219,8 @@ menu() {   # INPUT LOG
 }
 
 menu "1\n5\nabc\n0\n-1\n1,2\n1.20\n30-11\nx\n\ny\n" "$T/m1.log"
-check "4 menu option 5, options 1-4 unchanged" \
-    "grep -qE '^1\\) Base +CRF $SERIES_BASE_CRF_SEARCH_MIN-$SERIES_BASE_CRF_MAX +<=$SERIES_BASE_VIDEO_SIZE_CEILING_GIB GiB/episode\$' '$T/m1.log' && grep -qE '^2\\) High +CRF ' '$T/m1.log' && grep -qE '^3\\) Custom +exact CRF' '$T/m1.log' && grep -qE '^4\\) Compact +CRF ' '$T/m1.log' && grep -qE '^5\\) Custom size +CRF 11-30 +<=entered GiB/episode\$' '$T/m1.log'"
+check "4 menu option 5; Base / High per hour of runtime" \
+    "grep -qx '1) Base    CRF 11-27   <=1.0 GiB/h video' '$T/m1.log' && grep -qx '2) High    CRF 8-21    <=2.5 GiB/h video' '$T/m1.log' && grep -qE '^3\\) Custom +exact CRF' '$T/m1.log' && grep -qE '^4\\) Compact +CRF ' '$T/m1.log' && grep -qE '^5\\) Custom size +CRF 11-30 +<=entered GiB/episode\$' '$T/m1.log'"
 eq    "4 invalid ceilings re-asked"     "$(grep -c '^Enter a positive number of GiB per episode' "$T/m1.log")" 4
 eq    "4 invalid CRF ranges re-asked"   "$(grep -c '^Invalid CRF range: ' "$T/m1.log")" 2
 check "4 tier line (default range)"     "grep -qx 'Custom size 1.2 GiB/episode: CRF 11-30, search starts at 18' '$T/m1.log'"
@@ -240,18 +240,63 @@ check "4 CRF chosen against 0.75 GiB (CRF $C2)" "grep -qx 'Selected: CRF $C2' '$
 eq    "4 job: HEVC Size0.75G, ceiling 0.75 GiB, range 14-26" \
       "$(grep -c "HEVC\\\\ Size0.75G.mkv Size0.75G .*" "$JOB")/$(grep -c "crf=$C2 .*ceiling_vbytes=$(_gib_bytes 0.75) crf_min=14 crf_max=26 .*batch_mode=season" "$JOB")" "3/3"
 
-# a range whose CRF_MAX cannot reach the ceiling: the over-ceiling prompt
+# a range whose CRF_MAX cannot reach the ceiling: Custom size still asks
+# (High / Base do not: over target, section 5)
 menu "1\n5\n0.75\n14-18\n2\n" "$T/m3.log"
 check "4 ceiling not reachable within the range: asked at CRF_MAX" \
-    "grep -q 'within the allowed Custom size 0.75 GiB/episode quality range: even CRF 18' '$T/m3.log'"
+    "grep -q 'within the allowed Custom size 0.75 GiB/episode quality range: even CRF 18' '$T/m3.log' && grep -qx '1) Encode every episode at CRF 18 anyway' '$T/m3.log' && grep -qx 'Compression cancelled.' '$T/m3.log' && [[ -z '$JOB' ]] && ! grep -qi 'over target' '$T/m3.log'"
 
 COMPRESS_VERBOSE=1 menu "1\n5\n1.2\n\nn\n" "$T/m4.log"
 check "4 COMPRESS_VERBOSE: full policy"  "grep -qx 'Custom size video policy:' '$T/m4.log' && grep -q 'video ceiling: 1.2 GiB/episode (entered in the menu)' '$T/m4.log' && grep -qE '^5\\) Custom size +the video ceiling you enter' '$T/m4.log'"
 
 menu "1\n2\ny\n" "$T/m5.log"
-check "4 tier 2 (High) unchanged: HEVC High, its ceiling" \
-    "grep -q 'HEVC\\\\ High.mkv High ' '$JOB' && grep -q 'ceiling_vbytes=$(_gib_bytes "$SERIES_HIGH_VIDEO_SIZE_CEILING_GIB") crf_min=$SERIES_HIGH_CRF_SEARCH_MIN crf_max=$SERIES_HIGH_CRF_MAX' '$JOB' && ! grep -q Size '$JOB'"
+check "4 tier 2 (High): HEVC High, 45 min x 2.5 GiB/h ceiling" \
+    "grep -q 'HEVC\\\\ High.mkv High ' '$JOB' && grep -q 'ceiling_vbytes=$(movie_ceiling_bytes 2.5 2700) crf_min=$SERIES_HIGH_CRF_SEARCH_MIN crf_max=$SERIES_HIGH_CRF_MAX' '$JOB' && ! grep -q Size '$JOB'"
 check "4 no errors"                      "! cat '$T'/m[1-5].log | grep -qiE 'unbound variable|command not found|syntax error'"
+
+# ------------------------------------------------------------
+echo
+echo "== 5 series High / Base: per-episode ceilings from the runtime (stand-ins)"
+
+# Mixed: 22 / 45 / 95 min. The ceiling is runtime x 2.5 GiB/h, so an
+# episode fits when its bytes per second do: the dense 22 min E01 (the
+# smallest file) decides, not the 95 min E03 (the largest):
+#   E01 700000 B/s at CRF 20 -> fits from CRF 20 (ceiling 745654 B/s)
+#   E02 600000                -> from 19;  E03 500000 -> from 17
+printf '%s\n' dur=1320 vrate20=700000 > "$CB/in/Mixed/Mixed S01E01.mkv" 2>/dev/null ||
+    { mkdir -p "$CB/in/Mixed"; printf '%s\n' dur=1320 vrate20=700000 > "$CB/in/Mixed/Mixed S01E01.mkv"; }
+printf '%s\n' dur=2700 vrate20=600000 > "$CB/in/Mixed/Mixed S01E02.mkv"
+printf '%s\n' dur=5700 vrate20=500000 > "$CB/in/Mixed/Mixed S01E03.mkv"
+# Over: Base 1.0 GiB/h; the dense 22 min E01 cannot fit even at CRF 27
+mkdir -p "$CB/in/Over"
+printf '%s\n' dur=1320 vrate20=3000000 > "$CB/in/Over/Over S01E01.mkv"
+printf '%s\n' dur=2700 vrate20=500000 > "$CB/in/Over/Over S01E02.mkv"
+
+menu "2\n2\ny\n" "$T/m6.log"
+check "5 series list: Flat, Mixed, Over"   "grep -qE '^2\\) Mixed' '$T/m6.log' && grep -qE '^3\\) Over' '$T/m6.log'"
+check "5 mixed lengths: the 22 min episode decides (CRF 20)" \
+    "grep -qx 'Selected: CRF 20' '$T/m6.log' && grep -qE '^Decisive: [0-9.]+ GiB / 0\\.92 GiB \\(S01E01, sampled\\)' '$T/m6.log'"
+check "5 job: every episode at CRF 20, each its own ceiling" \
+    "[[ \$(grep -c 'mode=crf crf=20 .*batch_mode=season' '$JOB') == 3 ]] && grep -q 'ceiling_vbytes=984263339 crf_min=8 crf_max=21' '$JOB' && grep -q 'ceiling_vbytes=2013265920 crf_min=8 crf_max=21' '$JOB' && grep -q 'ceiling_vbytes=4250228053 crf_min=8 crf_max=21' '$JOB'"
+check "5 not over target"                  "! grep -qi 'over target' '$T/m6.log'"
+
+COMPRESS_VERBOSE=1 menu "2\n2\nn\n" "$T/m7.log"
+check "5 verbose: menu + policy per hour of runtime" \
+    "grep -q '^2) High        CRF 8-21, video ceiling 2.5 GiB/hour of each episode.s runtime' '$T/m7.log' && grep -q 'video ceiling: 2.5 GiB per hour of runtime (each episode: its exact runtime x 2.5 GiB' '$T/m7.log'"
+check "5 verbose: expected sizes show each episode's ceiling" \
+    "grep -qE '^  Episode +Runtime +CRF +Video +Ceiling ' '$T/m7.log' && grep -qE '^  Mixed S01E01.mkv +22:00 +20 +[0-9.]+ +0\\.92 ' '$T/m7.log' && grep -qE '^  Mixed S01E03.mkv +95:00 +20 +[0-9.]+ +3\\.96 ' '$T/m7.log'"
+
+menu "3\n1\ny\n" "$T/m8.log"
+sed -n '/^Expected sizes/,/^Start/p' "$T/m8.log" | sed 's/^/  | /'
+check "5 Base unreachable: no prompt, CRF_MAX 27" \
+    "! grep -q 'Encode every episode at CRF' '$T/m8.log' && ! grep -q 'WARNING' '$T/m8.log' && ! grep -q 'Compression cancelled' '$T/m8.log' && grep -qx 'Selected: CRF 27 (ceilings not reachable within CRF 11-27: over target)' '$T/m8.log'"
+check "5 marked over target in the expected sizes" \
+    "grep -qE '^S01E01 .*OVER TARGET' '$T/m8.log' && ! grep -qE '^S01E02 .*OVER TARGET' '$T/m8.log' && grep -q '^Over target: the Base ceilings (1.0 GiB/h of each episode.s runtime)' '$T/m8.log'"
+check "5 the episode with estimate vs ceiling, again before the confirmation" \
+    "[[ \$(grep -cE '^  S01E01 +~[0-9.]+ GiB video / 0\\.37 GiB ceiling \\(\\+[0-9.]+, sampled\\)\$' '$T/m8.log') == 2 ]] && grep -B3 '^Base | CRF 27 | 1920x1080 | SDR | audio copied | over target\$' '$T/m8.log' | grep -qE '^Over target \\(Base ceilings cannot be met within CRF 11-27; encoded at CRF 27\\):|^  S01E01 +~'"
+check "5 job: every episode at CRF 27, each its own ceiling" \
+    "[[ \$(grep -c 'mode=crf crf=27 .*batch_mode=season' '$JOB') == 2 ]] && grep -q 'ceiling_vbytes=393705335 crf_min=11 crf_max=27' '$JOB' && grep -q 'ceiling_vbytes=805306368 crf_min=11 crf_max=27' '$JOB'"
+check "5 no errors"                        "! cat '$T'/m[6-8].log | grep -qiE 'unbound variable|command not found|syntax error'"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

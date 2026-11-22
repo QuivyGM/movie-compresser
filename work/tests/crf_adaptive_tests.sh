@@ -71,8 +71,8 @@ COMPRESS_CONF=$(conf_with base \
     MOVIE_QUALITY_CRF_MIN=0 MOVIE_QUALITY_CRF_START=8 MOVIE_QUALITY_CRF_MAX=23 \
     MOVIE_HIGH_CRF_SEARCH_MIN=12 MOVIE_HIGH_CRF_START=12 MOVIE_HIGH_CRF_MAX=23 MOVIE_HIGH_VIDEO_GIB_PER_HOUR=3.5 \
     MOVIE_BASE_CRF_SEARCH_MIN=20 MOVIE_BASE_CRF_START=20 MOVIE_BASE_CRF_MAX=29 MOVIE_BASE_VIDEO_GIB_PER_HOUR=1.0 MOVIE_BASE_VIDEO_FLOOR_MBPS=0 \
-    SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=21 SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=5 \
-    SERIES_BASE_CRF_SEARCH_MIN=13 SERIES_BASE_CRF_START=13 SERIES_BASE_CRF_MAX=27 SERIES_BASE_VIDEO_SIZE_CEILING_GIB=1.5 \
+    SERIES_HIGH_CRF_SEARCH_MIN=10 SERIES_HIGH_CRF_START=10 SERIES_HIGH_CRF_MAX=21 SERIES_HIGH_VIDEO_GIB_PER_HOUR=2.5 \
+    SERIES_BASE_CRF_SEARCH_MIN=13 SERIES_BASE_CRF_START=13 SERIES_BASE_CRF_MAX=27 SERIES_BASE_VIDEO_GIB_PER_HOUR=1.0 \
     SERIES_CRF_OUTLIER_PCT=25 SERIES_CRF_SAMPLE_EPISODES=4 CRF_ADAPTIVE_STEP_THRESHOLD_PCT=150)
 export COMPRESS_CONF
 load_policy > /dev/null
@@ -452,6 +452,18 @@ echo "  (Quality randomized: $qn titles, $((SECONDS - t0)) s)"
 echo
 echo "== 6. series High / Base (library, earlier rules: SERIES_CRF_SHARED unset)"
 
+# The search with ONE ceiling for every episode (5 GiB with the High CRF
+# range, 1.5 GiB with the Base range), as series Custom size has it:
+# High / Base now scale the ceiling with each episode's runtime
+# (series_shared_crf_tests.sh)
+fixed_tier() {   # High | Base
+    crf_tier_load series "$1"
+    CRF_GIB_PER_HOUR=""
+    SERIES_EP_CEIL=()
+    if [[ "$1" == High ]]; then CRF_CEILING_GIB=5; else CRF_CEILING_GIB=1.5; fi
+    CRF_CEILING_BYTES=$(_gib_bytes "$CRF_CEILING_GIB")
+}
+
 # Stand-in sample encodes: episode En has SEP[n] GiB video at the tier's
 # CRF_MIN, x F[crf] (default 0.88 per CRF step), or exactly EPG[n:crf]
 # GiB when set. Records "CRF EPISODE".
@@ -484,7 +496,7 @@ sel() {
     CRF_SERIES_FILTER=""
     declare -gA CRF_SERIES_EP_BYTES=() CRF_SERIES_EP_FROM=() CRF_SERIES_RATES=() CRF_EP_EST=()
     : > "$T/calls"
-    crf_tier_load series "$tier"
+    fixed_tier "$tier"
     STEPS=()
     crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate rec "$CERT" > "$T/sel.out"
     SEL="$CRF_SELECTED/${CRF_TRIED[*]}/$CRF_OVER_CEILING"
@@ -656,7 +668,7 @@ both High 8.0 7.9 8.0
 eq "series: skipped 11 fits -> 11"         "$SEL/$CRF_BOUNDARY_LOW" "11/10 12 11/0/10"
 eq "... = sequential"                      "$RES" "$RES0"
 F=()
-crf_tier_load series Base
+fixed_tier Base
 F=([13]=1 [14]=0.8 [15]=0.55)
 both Base 2.6 2.5 2.6
 eq "series Base boundary: 14 over, 15 fits" "$SEL/$CRF_BOUNDARY_LOW" "15/13 15 14/0/14"
@@ -787,7 +799,7 @@ show() {   # the request's example through the menu output
     SEP=([1]=13.05 [2]=13.05 [3]=13.05); CRF_SERIES_SAMPLED=(0 1 2)
     CRF_SERIES_LABELS=(E1 E2 E3); EP_LABEL=(E1 E2 E3)
     declare -gA CRF_SERIES_EP_BYTES=() CRF_SERIES_EP_FROM=() CRF_SERIES_RATES=() CRF_EP_EST=()
-    crf_tier_load series High
+    fixed_tier High
     crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate_shown \
         crf_series_step_report series_crf_certify_over
 }

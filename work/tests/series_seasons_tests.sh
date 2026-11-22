@@ -321,7 +321,7 @@ check "5 only the problem episodes listed"       "has '$L' 'MISMATCH  Columbo S0
 check "5 incompatible season excluded, rest offered" \
     "has '$L' 'Excluded: resolution or dynamic range differ' && hasx '$L' '1) Continue with the remaining 3 seasons (Season 00 - Specials, Season 01, Season 10)'"
 check "5 one CRF line per season, no CRF step lines" \
-    "grep -qE '^Season 00 - Specials +CRF [0-9]+ +largest [0-9.]+ GiB \\(S00E01\\) / ceiling 5\\.00\$' '$L' && grep -qE '^Season 01 +CRF [0-9]+ +largest' '$L' && ! grep -qE '^(CRF [0-9]+|Result:|Boundary:)' '$L' && ! grep -qE '^  S01E0[0-9]  ~' '$L'"
+    "grep -qE '^Season 00 - Specials +CRF [0-9]+ +decisive [0-9.]+ GiB \\(S00E01\\) / ceiling 1\\.88\$' '$L' && grep -qE '^Season 01 +CRF [0-9]+ +decisive' '$L' && ! grep -qE '^(CRF [0-9]+|Result:|Boundary:)' '$L' && ! grep -qE '^  S01E0[0-9]  ~' '$L'"
 CRF_S00=$(sed -nE 's/^Season 00 - Specials +CRF ([0-9]+) .*/\1/p' "$L")
 CRF_S01=$(sed -nE 's/^Season 01 +CRF ([0-9]+) .*/\1/p' "$L")
 CRF_S10=$(sed -nE 's/^Season 10 +CRF ([0-9]+) .*/\1/p' "$L")
@@ -369,7 +369,7 @@ rm -f "$CB"/work/series[0-9]*.sh
 L="$T/m5.log"
 menu "1\n1\n2\ny\n" "$L"
 J=$(job_of)
-check "5 clashing labels get their season"       "grep -qE '^Season 1 +CRF [0-9]+ +largest [0-9.]+ GiB \\(S01/Episode 1\\)' '$L' && grep -qE '^Season 2 +CRF [0-9]+ +largest [0-9.]+ GiB \\(S02/Episode 1\\)' '$L'"
+check "5 clashing labels get their season"       "grep -qE '^Season 1 +CRF [0-9]+ +decisive [0-9.]+ GiB \\(S01/Episode [0-9]\\)' '$L' && grep -qE '^Season 2 +CRF [0-9]+ +decisive [0-9.]+ GiB \\(S02/Episode [0-9]\\)' '$L'"
 check "5 job labels unique"                      "grep -q 'ep_label=S01/Episode\\\\ 1' '$J' && grep -q 'ep_label=S02/Episode\\\\ 1' '$J'"
 rm -f "$CB"/work/series[0-9]*.sh
 
@@ -465,6 +465,28 @@ L="$T/m7.log"
 menu "2\n2\n1,3\n2\nn\n" "$L" COMPRESS_VERBOSE=1
 check "5 verbose: season headers, per-episode detail" \
     "has '$L' '---- Season 00 - Specials ----' && has '$L' '---- Season 2 ----' && has '$L' 'Verifying 2 files against Columbo S02E01.mkv...' && has '$L' 'Season 2 is excluded.'"
+
+# over target (Base 1.0 GiB/h): Season 02's dense 22 min S02E01 cannot fit
+# its 0.37 GiB ceiling even at CRF 27; no question, the season encoded at
+# CRF 27, marked in the season line, the summary and before the
+# confirmation; Season 01 unaffected
+Z="$CB/in/Zover"
+for e in 1 2; do ep "$Z/Season 01/Zover S01E0$e.mkv" vrate20=500000; done
+mkdir -p "$Z/Season 02"; printf '%s\n' dur=1320 vrate20=3000000 > "$Z/Season 02/Zover S02E01.mkv"
+ep "$Z/Season 02/Zover S02E02.mkv" vrate20=500000
+L="$T/m13o.log"
+rm -f "$CB"/work/series[0-9]*.sh
+menu "7\n1\n1\ny\n" "$L"
+J=$(job_of)
+sed -n '/^Expected sizes/,$p' "$L" | sed 's/^/  | /'
+check "5 over target: no question"             "! has '$L' 'Encode every episode' && ! has '$L' 'WARNING' && ! has '$L' 'Compression cancelled'"
+check "5 over target: season line"             "grep -qE '^Season 02 +CRF 27 +decisive [0-9.]+ GiB \\(S02E01\\) / ceiling 0\\.37 +over target\$' '$L' && grep -qE '^Season 01 +CRF [0-9]+ ' '$L' && ! grep -qE '^Season 01 .*over target' '$L'"
+check "5 over target: summary status + episode vs ceiling" \
+    "grep -qE '^Season 02 +2 +27 .*over target \\(1 ep\\)\$' '$L' && grep -qE '^Season 01 +2 .*  OK\$' '$L' && grep -qE '^  S02E01 +OVER TARGET ~[0-9.]+ GiB video / 0\\.37 GiB ceiling \\(\\+[0-9.]+, sampled\\)\$' '$L'"
+check "5 over target: shown again before the confirmation" \
+    "hasx '$L' 'Over target (Base ceilings cannot be met within CRF 11-27; encoded at CRF 27):' && hasx '$L' '  Season 02 (CRF 27):' && grep -qE '^    S02E01 +~[0-9.]+ GiB video / 0\\.37 GiB ceiling' '$L' && grep -qE '^Season 02 +Base \\| CRF 27 \\| .*\\| over target  \\(2 episodes\\)\$' '$L'"
+check "5 over target: Season 02 at CRF 27, its own ceilings" \
+    "[[ -n '$J' ]] && [[ \$(grep -c 'crf=27 .*ceiling_vbytes=[0-9]* crf_min=11 crf_max=27 .*batch_mode=season' '$J') == 2 ]] && grep -q 'ceiling_vbytes=393705335 crf_min=11 crf_max=27' '$J' && grep -q 'ceiling_vbytes=805306368 crf_min=11 crf_max=27' '$J'"
 
 # ------------------------------------------------------------
 echo

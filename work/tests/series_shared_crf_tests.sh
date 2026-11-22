@@ -43,13 +43,49 @@ for e in 1 2 3 4 5 6; do echo "episode $e" > "$T/in/Show/Show.S01E0$e.mkv"; done
 echo "== tier ceilings (project config)"
 
 COMPRESS_CONF="$SRC_WORK/lib/compress.conf" load_policy > /dev/null
+eq    "project rates: High / Base GiB per hour"  "$SERIES_HIGH_VIDEO_GIB_PER_HOUR $SERIES_BASE_VIDEO_GIB_PER_HOUR" "2.5 1.0"
 crf_tier_load series High
-eq    "High: 5 GiB video per episode"           "$CRF_CEILING_BYTES" "$(gib 5)"
-HIGH_SPEC=$(series_season_retry_spec High "$CRF_CEILING_BYTES" "$CRF_MAX" "$CRF_MIN")
-eq    "High retry spec: season batch, floor = SEARCH_MIN" "$HIGH_SPEC" "$(gib 5):$SERIES_HIGH_CRF_MAX:$SERIES_HIGH_CRF_SEARCH_MIN:::season"
+eq    "High: 2.5 GiB/h, reference = one hour"   "$CRF_GIB_PER_HOUR $CRF_CEILING_BYTES" "2.5 $(gib 2.5)"
+# each episode its own ceiling: exact runtime x rate, exact bytes, no
+# minimum, the runtime not rounded (22 / 45 / 75 / 95 min)
+EP_DUR=(1320 2700 4500 5700)
+series_ep_ceilings High
+eq    "High per-episode ceilings 22/45/75/95 min" "${SERIES_EP_CEIL[*]}" "984263339 2013265920 3355443200 4250228053"
+eq    "... series_ep_ceil of each"              "$(series_ep_ceil 0) $(series_ep_ceil 3)" "984263339 4250228053"
+HIGH_SPEC=$(series_season_retry_spec High "$(series_ep_ceil 0)" "$CRF_MAX" "$CRF_MIN")
+eq    "High retry spec: the episode's own ceiling, season batch, floor = SEARCH_MIN" "$HIGH_SPEC" "984263339:$SERIES_HIGH_CRF_MAX:$SERIES_HIGH_CRF_SEARCH_MIN:::season"
 crf_tier_load series Base
-eq    "Base: 1.5 GiB video per episode"         "$CRF_CEILING_BYTES" "$(gib 1.5)"
+series_ep_ceilings Base
+eq    "Base per-episode ceilings 22/45/75/95 min" "${SERIES_EP_CEIL[*]}" "393705335 805306368 1342177280 1700091221"
+EP_DUR=(1320.5)
+series_ep_ceilings Base
+eq    "runtime not rounded (1320.5 s)"          "${SERIES_EP_CEIL[*]}" "$(awk -v G=$G 'BEGIN { printf "%.0f", G * 1320.5 / 3600 }')"
+EP_DUR=(1320 N/A)
+check "unknown runtime: no ceiling (returns 1)" "! series_ep_ceilings Base && (( \${#SERIES_EP_CEIL[@]} == 0 ))"
+EP_DUR=()
+SERIES_EP_CEIL=()
+check "High / Base / Compact scale with the runtime; Custom size does not" \
+    "series_rate_tier High && series_rate_tier Base && series_rate_tier Compact && ! series_rate_tier Size1.2G && ! series_rate_tier Custom"
+check "over target without asking: High / Base only" \
+    "series_auto_max_tier High && series_auto_max_tier Base && ! series_auto_max_tier Compact && ! series_auto_max_tier Size1.2G && ! series_auto_max_tier Custom"
 eq    "Custom: no retry"                        "$(series_season_retry_spec Custom 0 '' '')" ""
+
+# retired fixed per-episode ceilings: still load, named as ignored
+RC="$T/retired.conf"
+cp "$SRC_WORK/lib/compress.conf" "$RC"
+printf '%s\n' SERIES_HIGH_VIDEO_SIZE_CEILING_GIB=5 SERIES_BASE_VIDEO_SIZE_CEILING_GIB=1.5 >> "$RC"
+check "retired SERIES_*_VIDEO_SIZE_CEILING_GIB: loads with a note" \
+    "COMPRESS_CONF='$RC' load_policy 2> '$T/retired.err' && grep -q 'former fixed series High/Base video' '$T/retired.err' && grep -q 'which are ignored' '$T/retired.err' && grep -qx '        SERIES_HIGH_VIDEO_SIZE_CEILING_GIB' '$T/retired.err' && grep -qx '        SERIES_BASE_VIDEO_SIZE_CEILING_GIB' '$T/retired.err'"
+eq    "... ignored: the ceiling is still runtime x GiB/h" \
+    "$( COMPRESS_CONF="$RC" load_policy 2>/dev/null; crf_tier_load series High; EP_DUR=(2700); series_ep_ceilings High; echo "${SERIES_EP_CEIL[0]}" )" "2013265920"
+check "project config: no fixed series ceilings" \
+    "! grep -qE '^SERIES_(HIGH|BASE)_VIDEO_SIZE_CEILING_GIB=' '$SRC_WORK/lib/compress.conf'"
+grep -v '^SERIES_BASE_VIDEO_GIB_PER_HOUR=' "$SRC_WORK/lib/compress.conf" > "$T/norate.conf"
+check "SERIES_BASE_VIDEO_GIB_PER_HOUR missing: named, menu stops" \
+    "! COMPRESS_CONF='$T/norate.conf' load_policy 2> '$T/norate.err' && grep -q 'SERIES_BASE_VIDEO_GIB_PER_HOUR is not set' '$T/norate.err'"
+check "SERIES_HIGH_VIDEO_GIB_PER_HOUR=0 rejected" \
+    "! COMPRESS_CONF='$(sed 's/^SERIES_HIGH_VIDEO_GIB_PER_HOUR=.*/SERIES_HIGH_VIDEO_GIB_PER_HOUR=0/' "$SRC_WORK/lib/compress.conf" > "$T/zero.conf"; echo "$T/zero.conf")' load_policy 2>/dev/null"
+COMPRESS_CONF="$SRC_WORK/lib/compress.conf" load_policy > /dev/null
 
 # ------------------------------------------------------------
 # Generator stand-ins (no ffprobe): one video stream, SDR, no covers
@@ -90,17 +126,20 @@ item_run() {
 '
 
 # season SESSION CRF CRF_MIN CRF_MAX N SIZES...  ->  a series job as
-# series_compress.sh generates it (High, 5 GiB ceiling, every episode at
-# CRF, retry field from series_season_retry_spec), run with SIZES
+# series_compress.sh generates it (High, every episode at CRF, retry
+# field from series_season_retry_spec with the episode's own ceiling:
+# EP_CEILS[EPISODE] bytes, 5 GiB when unset), run with SIZES
+declare -A EP_CEILS=()
 season() {
     local s="$1" crf="$2" min="$3" max="$4" n="$5" e spec
     shift 5
     rm -f "$T"/out/Show/* "$T/$s.encoded" "$T/$s.verified"
-    spec=$(series_season_retry_spec High "$(gib 5)" "$max" "$min")
     {
         emit_job_header "$s" series "$n"
         printf '%s\n' "$STUBS" "declare -A SIZES=($*)"
         for ((e = 1; e <= n; e++)); do
+            # each episode's own ceiling (EP_CEILS[e] bytes; default 5 GiB)
+            spec=$(series_season_retry_spec High "${EP_CEILS[$e]:-$(gib 5)}" "$max" "$min")
             emit_encode_item "$e" "$T/in/Show/Show.S01E0$e.mkv" "$T/out/Show/E0$e.mkv" High "crf:$crf" "" "" 0 \
                 "$(gib 4.5)" "$spec" "" "$((crf - 1))=$(gib 5):$crf=$(gib 4.5)"
         done
@@ -182,6 +221,36 @@ eq    "6 CRF_MAX: one CRF, never above it"      "$(final_crfs)/$(encoded s6)" "1
 check "6 warning + only the over episode listed" \
     "grep -q 'per-episode video ceiling cannot be met within the' '$T/s6.log' && [[ \$(sed -n '/^Above the video ceiling/,/^CRF attempts/p' '$T/s6.log' | grep -c 'Show.S01E0') == 1 ]] && sed -n '/^Above the video ceiling/,/^CRF attempts/p' '$T/s6.log' | grep -q 'Show.S01E02.mkv'"
 check "6 no N-1 test after CRF_MAX over"        "! grep -q 'Testing season CRF' '$T/s6.log'"
+
+# 6b: per-episode ceilings (High 2.5 GiB/h: 22 / 45 / 95 min -> 0.92 /
+#     1.88 / 3.96 GiB): the short E1 is over its own ceiling at CRF 20
+#     and still at CRF_MAX 21 -> accepted at 21 (no retry above CRF_MAX),
+#     reported as over target with actual vs ceiling; E3 at 3.5 GiB would
+#     be far above E1's ceiling but fits its own
+EP_CEILS=([1]=984263339 [2]=2013265920 [3]=4250228053)
+season s6b 20 15 21 3 "$(sz 1:20 1.0) $(sz 2:20 1.5) $(sz 3:20 3.5) $(sz 1:21 0.95) $(sz 2:21 1.4) $(sz 3:21 3.3)"
+EP_CEILS=()
+check "6b job items carry each episode's own ceiling" \
+    "grep -q 'ceiling_vbytes=984263339 crf_min=15 crf_max=21' '$T/s6b.job' && grep -q 'ceiling_vbytes=2013265920 crf_min=15 crf_max=21' '$T/s6b.job' && grep -q 'ceiling_vbytes=4250228053 crf_min=15 crf_max=21' '$T/s6b.job'"
+eq    "6b over its own ceiling at CRF_MAX: accepted, never above CRF_MAX" "$(final_crfs)/$(encoded s6b)" "21 21 21 /1:20 2:20 3:20 1:21 2:21 3:21 "
+check "6b season check against each episode's own ceiling" \
+    "logged s6b '  S01E01 1.00 GiB / 0.92 GiB -> over ceiling' && logged s6b '  S01E03 3.50 GiB / 3.96 GiB -> fits' && grep -q 'per-episode video ceilings (runtime-scaled) cannot be met' '$T/s6b.log'"
+check "6b job summary: over target, only E01, actual vs ceiling" \
+    "grep -q '^Above the video ceiling - over target' '$T/s6b.log' && [[ \$(sed -n '/^Above the video ceiling/,/^CRF attempts/p' '$T/s6b.log' | grep -c 'Show.S01E0') == 1 ]] && sed -n '/^Above the video ceiling/,/^CRF attempts/p' '$T/s6b.log' | grep -q 'Show.S01E01.mkv (CRF 21: 0.95 GiB video / 0.92 GiB ceiling)'"
+# the job state counts them (progress-check.sh); per season in a
+# multi-season job
+st_vars() {
+    JOB_SESSION=t JOB_TYPE=series JOB_STATUS=running ITEM_INDEX=1 JOB_ITEMS=1 JOB_OK=0 JOB_FAILED=0
+    ITEM_NAME=x ITEM_INPUT=x ITEM_OUTPUT=x ITEM_TIER=High ITEM_PASS="" ITEM_DURATION=1 JOB_STARTED=1
+    JOB_PROGRESS=x JOB_LOG_DIR=x JOB_COMPRESSER_VERSION=x JOB_SEASONS=1 JOB_SEASON_CRF=21
+    JOB_SEASON_ITEMS=1 JOB_SEASON_STATE=done JOB_SEASON_NAME="" JOB_SEASON_NO=""
+    declare -gA ITEM_EXP=() JOB_SEASON_FINAL=() JOB_SEASON_OVER=()
+}
+eq    "6b job state: over / season_over_N (progress-check)" \
+    "$( st_vars; JOB_STATE="$T/st.state"; JOB_OVER_NAMES=(a b); JOB_SEASON_NAME="Season 01"; JOB_SEASON_NO=1
+        JOB_SEASON_OVER[1]=2; job_write_state
+        grep -E '^(over|season_over_1)=' "$T/st.state" | tr '\n' ' ' )" "over=2 season_over_1=2 "
+eq    "6b job state: over=0 without any"        "$( st_vars; JOB_STATE="$T/st0.state"; JOB_OVER_NAMES=(); job_write_state; grep '^over=' "$T/st0.state" )" "over=0"
 
 # safety: the N-1 season fails half way -> accepted N season intact
 season s7 16 15 18 3 "$(sz 1:16 4) $(sz 2:16 4) $(sz 3:16 4) $(sz 1:15 4.2) [2:15]=fail"
@@ -290,9 +359,11 @@ crf_sample_title() {   # FILE VIDX FILTER CRF DURATION POINTS
     CRF_SAMPLE_SECS=100
     CRF_SAMPLE_BYTES=$(awk -v g="${SEP[$n]}" -v c="$4" 'BEGIN { printf "%.0f", g * 1073741824 * 0.88 ^ (c - 18) / 27 }')
 }
+# 45 min episodes, High 6.6667 GiB/h: every episode's own ceiling ~5 GiB
 COMPRESS_CONF=$(mktemp -p "$T")
 sed -e 's/^SERIES_HIGH_CRF_SEARCH_MIN=.*/SERIES_HIGH_CRF_SEARCH_MIN=18/' -e 's/^SERIES_HIGH_CRF_START=.*/SERIES_HIGH_CRF_START=18/' \
-    -e 's/^SERIES_HIGH_CRF_MAX=.*/SERIES_HIGH_CRF_MAX=21/' "$SRC_WORK/lib/compress.conf" > "$COMPRESS_CONF"
+    -e 's/^SERIES_HIGH_CRF_MAX=.*/SERIES_HIGH_CRF_MAX=21/' -e 's/^SERIES_HIGH_VIDEO_GIB_PER_HOUR=.*/SERIES_HIGH_VIDEO_GIB_PER_HOUR=6.6667/' \
+    "$SRC_WORK/lib/compress.conf" > "$COMPRESS_CONF"
 export COMPRESS_CONF
 check "test policy loads (High CRF 18-21)"      "load_policy > /dev/null"
 
@@ -306,6 +377,7 @@ select_season() {   # GIB...  ->  SEL "CRF/OUTLIER"
     CRF_SERIES_FILTER=""
     declare -gA CRF_SERIES_EP_BYTES=() CRF_SERIES_EP_FROM=() CRF_SERIES_RATES=() CRF_EP_EST=()
     crf_tier_load series High
+    series_ep_ceilings High
     crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate "" series_crf_certify_over > /dev/null
     read -ra eb <<< "${CRF_SERIES_EP_BYTES[$CRF_SELECTED]}"
     series_batch_stats "$CRF_CEILING_BYTES" "${eb[@]}"
@@ -317,6 +389,47 @@ SERIES_CRF_SHARED=1 select_season 3.7 4.2 6.0 3.9 4.0 4.1
 eq    "8 shared: outlier raises the season to CRF 20" "$SEL" "20/2/1"
 SERIES_CRF_SHARED=0 select_season 3.7 4.2 6.0 3.9 4.0 4.1
 eq    "8 (earlier rules, library only - no menu uses them: season 18 without the outlier)" "$SEL" "18/2/1"
+
+# ------------------------------------------------------------
+echo
+echo "== estimator: mixed-length season, the tightest fit decides"
+
+# High 2.5 GiB/h (project rate). SEP is per 45 min at CRF 18, so an
+# episode's estimate scales with its runtime; the per-minute rates
+# differ: E1 (22 min) is dense, E3 (95 min) light.
+sed -i 's/^SERIES_HIGH_VIDEO_GIB_PER_HOUR=.*/SERIES_HIGH_VIDEO_GIB_PER_HOUR=2.5/' "$COMPRESS_CONF"
+load_policy > /dev/null
+mixed_season() {   # DUR:GIB45...  ->  SEL "CRF/DECIDING EPISODE/OVER"
+    local n eb a
+    FILES=(); EP_VIDX=(); EP_DUR=(); CRF_SERIES_LABELS=()
+    n=0
+    for a in "$@"; do
+        ((n += 1))
+        FILES+=("/s/E$n.mkv"); EP_VIDX+=(0); EP_DUR+=("${a%%:*}"); SEP[$n]="${a#*:}"; CRF_SERIES_LABELS+=("E$n")
+    done
+    CRF_SERIES_SAMPLED=($(seq 0 $((n - 1))))
+    CRF_SERIES_FILTER=""
+    declare -gA CRF_SERIES_EP_BYTES=() CRF_SERIES_EP_FROM=() CRF_SERIES_RATES=() CRF_EP_EST=()
+    crf_tier_load series High
+    series_ep_ceilings High
+    crf_select "$CRF_MIN" "$CRF_MAX" "$CRF_CEILING_BYTES" crf_series_estimate "" series_crf_certify_over > /dev/null
+    read -ra eb <<< "${CRF_SERIES_EP_BYTES[$CRF_SELECTED]}"
+    series_batch_stats "$CRF_CEILING_BYTES" "${eb[@]}"
+    SEL="$CRF_SELECTED/$SB_DECIDE_IDX/$CRF_OVER_CEILING"
+}
+# estimates (GiB) = SEP x runtime/45 min x 0.88^(CRF-18):
+#   E1 22 min  SEP 2.4: 1.173 @18, 1.032 @19, 0.909 @20   ceiling 0.917
+#   E2 45 min  SEP 1.9: 1.900 @18, 1.672 @19              ceiling 1.875
+#   E3 95 min  SEP 1.6: 3.378 @18                         ceiling 3.958
+# The largest episode (E3) fits from CRF 18, E2 from 19; E1, the
+# smallest, needs CRF 20 and decides the shared season CRF.
+SERIES_CRF_SHARED=1 mixed_season 1320:2.4 2700:1.9 5700:1.6
+eq    "mixed lengths: the 22 min episode decides (CRF 20, E1)" "$SEL" "20/0/0"
+eq    "... the largest episode (E3) fits at 18 already: the smallest decides" \
+    "$(read -ra eb <<< "${CRF_SERIES_EP_BYTES[18]}"; (( eb[0] < eb[2] && eb[2] <= 4250228053 )) && echo largest-fits)" "largest-fits"
+# unreachable: E1 far too dense, still above its 0.92 GiB at CRF 21
+SERIES_CRF_SHARED=1 mixed_season 1320:4.0 2700:1.9 5700:1.6
+eq    "ceiling not reachable within 18-21: CRF_MAX, flagged" "$SEL" "21/0/1"
 
 echo
 echo "passed: $PASS  failed: $FAIL"
